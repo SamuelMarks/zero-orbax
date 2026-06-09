@@ -144,6 +144,7 @@ def test_merge_trees() -> None:
 
 
 def test_checkpoint_manager_options_validation() -> None:
+    """Test/Mock documentation."""
     with pytest.raises(ValueError, match="save_interval_steps must be positive"):
         CheckpointManagerOptions(save_interval_steps=0)
 
@@ -156,6 +157,7 @@ def test_checkpoint_manager_options_validation() -> None:
 
 
 def test_abstract_checkpoint_manager_methods() -> None:
+    """Test/Mock documentation."""
     manager = AbstractCheckpointManager()
     with pytest.raises(NotImplementedError):
         manager.save(1, {"a": 1})
@@ -168,6 +170,7 @@ def test_abstract_checkpoint_manager_methods() -> None:
 
 
 def test_checkpoint_manager_save_restore_and_latest() -> None:
+    """Test/Mock documentation."""
     opts = CheckpointManagerOptions(save_interval_steps=1, max_to_keep=2)
     manager = CheckpointManager(directory="fake_dir", options=opts, metadata=42)
 
@@ -196,6 +199,7 @@ def test_checkpoint_manager_save_restore_and_latest() -> None:
 
 
 def test_checkpoint_manager_read_only() -> None:
+    """Test/Mock documentation."""
     opts = CheckpointManagerOptions(read_only=True)
     manager = CheckpointManager(directory="fake_dir", options=opts)
 
@@ -204,6 +208,7 @@ def test_checkpoint_manager_read_only() -> None:
 
 
 def test_checkpoint_manager_save_interval() -> None:
+    """Test/Mock documentation."""
     opts = CheckpointManagerOptions(save_interval_steps=2)
     manager = CheckpointManager(directory="fake_dir", options=opts)
 
@@ -219,7 +224,10 @@ def test_checkpoint_manager_save_interval() -> None:
 
 
 def test_checkpoint_manager_should_save_fn() -> None:
+    """Test/Mock documentation."""
+
     def should_save(step, latest_step):
+        """Test/Mock documentation."""
         return step > 5
 
     opts = CheckpointManagerOptions(should_save_fn=should_save)
@@ -230,17 +238,23 @@ def test_checkpoint_manager_should_save_fn() -> None:
 
 
 class MockHandler:
+    """Test/Mock documentation."""
+
     def __init__(self):
+        """Test/Mock documentation."""
         self.saved = None
 
     def save(self, path, item, *args, **kwargs):
+        """Test/Mock documentation."""
         self.saved = (path, item)
 
     def restore(self, path, item=None, *args, **kwargs):
+        """Test/Mock documentation."""
         return {"restored_from": path, "item": item}
 
 
 def test_abstract_checkpointer_methods() -> None:
+    """Test/Mock documentation."""
     cp = AbstractCheckpointer()
     with pytest.raises(NotImplementedError):
         cp.save("path", {"a": 1})
@@ -249,6 +263,7 @@ def test_abstract_checkpointer_methods() -> None:
 
 
 def test_checkpointer_save_restore() -> None:
+    """Test/Mock documentation."""
     handler = MockHandler()
     cp = Checkpointer(handler=handler)
 
@@ -260,6 +275,7 @@ def test_checkpointer_save_restore() -> None:
 
 
 def test_checkpointer_no_handler_methods() -> None:
+    """Test/Mock documentation."""
     cp = Checkpointer(handler=EmptyHandler2())
     # Should not crash if handler lacks save/restore methods
     cp.save("path", {"x": 1})
@@ -268,6 +284,7 @@ def test_checkpointer_no_handler_methods() -> None:
 
 
 def test_pytree_checkpointer_save_restore() -> None:
+    """Test/Mock documentation."""
     cp = PyTreeCheckpointer()
     # Save is a pass-through
     cp.save("path", {"a": 1})
@@ -278,6 +295,7 @@ def test_pytree_checkpointer_save_restore() -> None:
 
 
 def test_standard_checkpointer_save_restore() -> None:
+    """Test/Mock documentation."""
     cp = StandardCheckpointer()
     # Save is a pass-through
     cp.save("path", {"a": 1})
@@ -288,21 +306,29 @@ def test_standard_checkpointer_save_restore() -> None:
 
 
 class MockAsyncHandler:
+    """Test/Mock documentation."""
+
     def __init__(self):
+        """Test/Mock documentation."""
         self.saved = None
 
     def save(self, path, item, *args, **kwargs):
+        """Test/Mock documentation."""
         self.saved = (path, item)
 
     def restore(self, path, item=None, *args, **kwargs):
+        """Test/Mock documentation."""
         return {"restored_from": path, "item": item}
 
 
 class EmptyHandler2:
+    """Test/Mock documentation."""
+
     pass
 
 
 def test_async_options_semantic() -> None:
+    """Test/Mock documentation."""
     opts = AsyncOptions(timeout_secs=100)
     assert opts.timeout_secs == 100
     assert opts.barrier_sync_fn is None
@@ -310,6 +336,7 @@ def test_async_options_semantic() -> None:
 
 
 def test_future_semantic() -> None:
+    """Test/Mock documentation."""
     f = Future(result=42)
     assert f.result() == 42
 
@@ -318,6 +345,7 @@ def test_future_semantic() -> None:
 
 
 def test_async_checkpointer_semantic() -> None:
+    """Test/Mock documentation."""
     handler = MockAsyncHandler()
     cp = AsyncCheckpointer(handler=handler)
 
@@ -333,6 +361,7 @@ def test_async_checkpointer_semantic() -> None:
 
 
 def test_async_checkpointer_no_handler_methods() -> None:
+    """Test/Mock documentation."""
     cp = AsyncCheckpointer(handler=EmptyHandler2())
     f_save = cp.save("path", {"x": 1})
     assert f_save.result() is None
@@ -342,6 +371,7 @@ def test_async_checkpointer_no_handler_methods() -> None:
 
 
 def test_checkpoint_manager_complex_pytree() -> None:
+    """Test/Mock documentation."""
     opts = CheckpointManagerOptions(save_interval_steps=1)
     manager = CheckpointManager(directory="fake_dir", options=opts)
 
@@ -361,6 +391,7 @@ def test_checkpoint_manager_complex_pytree() -> None:
 
 
 def test_checkpoint_manager_background_delete_mock() -> None:
+    """Test/Mock documentation."""
     # Just verify that passing the flag doesn't break initialization and state is kept
     opts = CheckpointManagerOptions(enable_background_delete=True, max_to_keep=1)
     manager = CheckpointManager(directory="fake_dir", options=opts)

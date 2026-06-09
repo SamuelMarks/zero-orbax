@@ -13,38 +13,58 @@ from typing import (
 
 
 class async_checkpoint_handler:
+    """Type hint wrapper."""
+
     AsyncCheckpointHandler = Any
 
 
 class orbax:
+    """Type hint wrapper."""
+
     class checkpoint:
+        """Type hint wrapper."""
+
         class options:
+            """Type hint wrapper."""
+
             MultiprocessingOptions = Any
             AsyncOptions = Any
             FileOptions = Any
 
 
 class atomicity:
+    """Type hint wrapper."""
+
     TemporaryPath = Any
 
 
 class checkpoint:
+    """Type hint wrapper."""
+
     CheckpointMetadataStore = Any
 
 
 class multihost:
+    """Type hint wrapper."""
+
     BarrierSyncFn = Any
 
 
 class epath:
+    """Type hint wrapper."""
+
     PathLike = Any
 
 
 class abstract_logger:
+    """Type hint wrapper."""
+
     AbstractLogger = Any
 
 
 class step_lib:
+    """Type hint wrapper."""
+
     Metadata = Any
     NameFormat = Any
 
@@ -53,6 +73,8 @@ CheckpointHandler = Any
 
 
 class checkpoint_handler:
+    """Type hint wrapper."""
+
     CheckpointHandler = Any
 
 

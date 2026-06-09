@@ -1,13 +1,20 @@
 [build-system]
-requires = ["setuptools>=61.0.0", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling", "hatch-requirements-txt"]
+build-backend = "hatchling.build"
 
 [project]
 name = "zero-orbax"
 version = "0.6.4"
 description = "Zero Orbax implementation"
-authors = [{ name = "Author Name" }]
+authors = [{ name = "SamuelMarks" }]
 requires-python = ">=3.8"
+dynamic = ["dependencies"]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.metadata.hooks.requirements_txt]
+files = ["requirements.txt"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zero_orbax"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
