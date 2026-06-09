@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zero-orbax"
+version = "0.6.4"
+description = "Zero Orbax implementation"
+authors = [{ name = "Author Name" }]
+requires-python = ">=3.8"
+
+[tool.setuptools.packages.find]
+where = ["src"]
