@@ -1,0 +1,9 @@
+pytest
+pytest-cov
+absl-py
+jax
+jaxlib
+flax
+numpy
+tensorstore
+etils

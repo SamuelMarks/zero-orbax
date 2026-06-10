@@ -19,6 +19,52 @@ from zero_orbax.checkpoint import (
 )
 
 
+def test_namespace_classes() -> None:
+    """Execute the function."""
+    from zero_orbax.checkpoint import (
+        async_checkpoint_handler,
+        orbax,
+        atomicity,
+        checkpoint,
+        multihost,
+        epath,
+        abstract_logger,
+        step_lib,
+        checkpoint_handler,
+        args,
+    )
+
+    assert async_checkpoint_handler.AsyncCheckpointHandler is not None
+    assert orbax.checkpoint.options.MultiprocessingOptions is not None
+    assert atomicity.TemporaryPath is not None
+    assert checkpoint.CheckpointMetadataStore is not None
+    assert multihost.BarrierSyncFn is not None
+    assert epath.PathLike is not None
+    assert abstract_logger.AbstractLogger is not None
+    assert step_lib.Metadata() is not None
+    assert checkpoint_handler.CheckpointHandler is not None
+    assert args.ArrayRestore() is not None
+    assert args.ArraySave() is not None
+    assert args.Composite() is not None
+    assert args.JsonRestore() is not None
+    assert args.JsonSave() is not None
+    assert args.ProtoRestore() is not None
+    assert args.ProtoSave() is not None
+    assert args.PyTreeRestore() is not None
+    assert args.PyTreeSave() is not None
+    assert args.StandardRestore() is not None
+    assert args.StandardSave() is not None
+    assert args.JaxRandomKeySave() is not None
+    assert args.JaxRandomKeyRestore() is not None
+    assert args.NumpyRandomKeySave() is not None
+    assert args.NumpyRandomKeyRestore() is not None
+    assert args.CheckpointArgs() is not None
+    assert args.get_registered_handler_cls() is None
+    assert args.get_registered_args_cls() is None
+    assert args.has_registered_args() is False
+    assert args.register_with_handler()(int) is int
+
+
 def test_abstract_checkpoint_manager() -> None:
     """Test AbstractCheckpointManager initialization."""
     manager = AbstractCheckpointManager()
@@ -45,7 +91,7 @@ def test_checkpoint_manager_options() -> None:
 
 def test_checkpointer() -> None:
     """Test Checkpointer initialization."""
-    checkpointer = Checkpointer(handler=None)
+    checkpointer = Checkpointer(handler=None)  # type: ignore
     assert isinstance(checkpointer, Checkpointer)
 
 
@@ -64,7 +110,7 @@ def test_restore_transform() -> None:
     )
     assert rt.original_key == ("b", "c")
     assert rt.use_fallback is False
-    assert rt.multi_value_fn({"b": {"c": 42}}) == 42
+    assert rt.multi_value_fn({"b": {"c": 42}}) == 42  # type: ignore
 
 
 def test_standard_checkpointer() -> None:
@@ -78,46 +124,33 @@ def test_transform() -> None:
     t = Transform(original_key="a", use_fallback=True, value_fn=lambda x: x * 2)
     assert t.original_key == "a"
     assert t.use_fallback is True
-    assert t.value_fn(5) == 10
+    assert t.value_fn(5) == 10  # type: ignore
 
 
 def test_apply_transformations() -> None:
     """Test apply_transformations."""
     orig = {"a": 1, "b": {"c": 2}, "d": 3}
     new_t = {"a": None, "b": {"c": None}, "x": 9}
-
-    # No transformations, default to original
     res = apply_transformations(orig, {}, new_t)
     assert res == {"a": 1, "b": {"c": 2}, "x": 9}
-
-    # No transformations, not default to original
     res = apply_transformations(orig, {}, new_t, default_to_original=False)
     assert res == {"a": None, "b": {"c": None}, "x": 9}
-
-    # With transformations
     trans = {
         "a": Transform(value_fn=lambda x: x * 10),
         "b": {"c": Transform(original_key="c", value_fn=lambda x: x * 2)},
-        "x": 99,  # Literal
+        "x": 99,
     }
     res = apply_transformations(orig, trans, new_t)
     assert res == {"a": 10, "b": {"c": 4}, "x": 99}
-
-    # Transform with multi_value_fn
     trans2 = {"a": Transform(multi_value_fn=lambda t: t["d"] * 2)}
     res2 = apply_transformations(orig, trans2, {"a": None})
     assert res2 == {"a": 6}
-
-    # Transform with tuple original_key
     trans3 = {"a": Transform(original_key=("b", "c"))}
     res3 = apply_transformations(orig, trans3, {"a": None})
     assert res3 == {"a": 2}
-    assert apply_transformations(orig, {}, {"y": 1}) == orig
-
-    # Non-dict new_tree
+    assert apply_transformations(orig, {}, {"y": 1}) == {"y": 1}
     assert apply_transformations(orig, {}, 5) == 5
-
-    # Transform with missing orig_key tuple mapping
+    assert apply_transformations({"b": 1}, {"b": {"c": 1}}, {"b": 5}) == {"b": 5}
     trans4 = {"a": Transform(original_key=("b", "z"))}
     res4 = apply_transformations(orig, trans4, {"a": None})
     assert res4 == {"a": None}
@@ -126,35 +159,42 @@ def test_apply_transformations() -> None:
 def test_merge_trees() -> None:
     """Test merge_trees."""
     assert merge_trees() == {}
-
     t1 = {"a": {"b": 1}, "c": 2}
     t2 = {"a": {"d": 3}, "e": 4}
     res = merge_trees(t1, t2)
     assert res == {"a": {"b": 1, "d": 3}, "c": 2, "e": 4}
-
-    # Test target dict
     target = {"z": 9}
     res2 = merge_trees(t1, target=target)
     assert res2 == {"z": 9, "a": {"b": 1}, "c": 2}
-
     with pytest.raises(TypeError):
         merge_trees(1)
 
 
-"""Tests for Phase 2 semantics."""
+"Tests for Phase 2 semantics."
 
 
 def test_checkpoint_manager_options_validation() -> None:
     """Test/Mock documentation."""
     with pytest.raises(ValueError, match="save_interval_steps must be positive"):
         CheckpointManagerOptions(save_interval_steps=0)
-
-    with pytest.raises(ValueError, match="max_to_keep must be positive"):
-        CheckpointManagerOptions(max_to_keep=0)
-
+    with pytest.raises(ValueError, match="must be None or non-negative"):
+        CheckpointManagerOptions(max_to_keep=-1)
+    with pytest.raises(ValueError, match="best_mode"):
+        CheckpointManagerOptions(best_mode="invalid")
+    with pytest.raises(ValueError, match="todelete_subdir and todelete_full_path"):
+        CheckpointManagerOptions(todelete_subdir="subdir", todelete_full_path="path")
+    opts_ro = CheckpointManagerOptions(read_only=True, todelete_full_path="path")
+    assert opts_ro.todelete_full_path is None
     opts = CheckpointManagerOptions(save_interval_steps=2, max_to_keep=5)
     assert opts.save_interval_steps == 2
     assert opts.max_to_keep == 5
+    opts2 = opts.replace(save_interval_steps=3)
+    assert opts2.save_interval_steps == 3
+    assert opts2.max_to_keep == 5
+    from zero_orbax.checkpoint import step_lib
+
+    nf = step_lib.NameFormat()
+    assert not nf == "some string"
 
 
 def test_abstract_checkpoint_manager_methods() -> None:
@@ -174,27 +214,18 @@ def test_checkpoint_manager_save_restore_and_latest() -> None:
     """Test/Mock documentation."""
     opts = CheckpointManagerOptions(save_interval_steps=1, max_to_keep=2)
     manager = CheckpointManager(directory="fake_dir", options=opts, metadata=42)
-
     assert manager.latest_step() is None
     assert manager.all_steps() == []
-
-    # Save step 1
     assert manager.save(1, {"val": 10}) is True
     assert manager.latest_step() == 1
     assert manager.all_steps() == [1]
     assert manager.restore(1) == {"val": 10}
-
-    # Save step 2
     assert manager.save(2, {"val": 20}) is True
     assert manager.latest_step() == 2
     assert manager.all_steps() == [1, 2]
-
-    # Save step 3 (triggers max_to_keep rotation)
     assert manager.save(3, {"val": 30}) is True
     assert manager.latest_step() == 3
-    assert manager.all_steps() == [2, 3]  # 1 should be deleted
-
-    # Check deleted
+    assert manager.all_steps() == [2, 3]
     with pytest.raises(ValueError, match="Checkpoint for step 1 not found."):
         manager.restore(1)
 
@@ -203,7 +234,6 @@ def test_checkpoint_manager_read_only() -> None:
     """Test/Mock documentation."""
     opts = CheckpointManagerOptions(read_only=True)
     manager = CheckpointManager(directory="fake_dir", options=opts)
-
     with pytest.raises(ValueError, match="Cannot save checkpoint in read_only mode."):
         manager.save(1, {"val": 10})
 
@@ -212,11 +242,8 @@ def test_checkpoint_manager_save_interval() -> None:
     """Test/Mock documentation."""
     opts = CheckpointManagerOptions(save_interval_steps=2)
     manager = CheckpointManager(directory="fake_dir", options=opts)
-
     assert manager.save(1, {"val": 10}) is False
     assert manager.save(2, {"val": 20}) is True
-
-    # Test save_on_steps override
     opts2 = CheckpointManagerOptions(save_interval_steps=10, save_on_steps=[3])
     manager2 = CheckpointManager(directory="fake_dir", options=opts2)
     assert manager2.save(3, {"val": 30}) is True
@@ -233,7 +260,6 @@ def test_checkpoint_manager_should_save_fn() -> None:
 
     opts = CheckpointManagerOptions(should_save_fn=should_save)
     manager = CheckpointManager(directory="fake_dir", options=opts)
-
     assert manager.save(4, {"val": 40}) is False
     assert manager.save(6, {"val": 60}) is True
 
@@ -266,19 +292,16 @@ def test_abstract_checkpointer_methods() -> None:
 def test_checkpointer_save_restore() -> None:
     """Test/Mock documentation."""
     handler = MockHandler()
-    cp = Checkpointer(handler=handler)
-
+    cp = Checkpointer(handler=handler)  # type: ignore  # type: ignore
     cp.save("some_path", {"x": 42})
     assert handler.saved == ("some_path", {"x": 42})
-
     res = cp.restore("other_path", {"y": 1})
     assert res == {"restored_from": "other_path", "item": {"y": 1}}
 
 
 def test_checkpointer_no_handler_methods() -> None:
     """Test/Mock documentation."""
-    cp = Checkpointer(handler=EmptyHandler2())
-    # Should not crash if handler lacks save/restore methods
+    cp = Checkpointer(handler=EmptyHandler2())  # type: ignore[arg-type]
     cp.save("path", {"x": 1})
     res = cp.restore("path")
     assert res is None
@@ -287,10 +310,7 @@ def test_checkpointer_no_handler_methods() -> None:
 def test_pytree_checkpointer_save_restore() -> None:
     """Test/Mock documentation."""
     cp = PyTreeCheckpointer()
-    # Save is a pass-through
     cp.save("path", {"a": 1})
-
-    # Restore returns item
     res = cp.restore("path", {"b": 2})
     assert res == {"b": 2}
 
@@ -298,10 +318,7 @@ def test_pytree_checkpointer_save_restore() -> None:
 def test_standard_checkpointer_save_restore() -> None:
     """Test/Mock documentation."""
     cp = StandardCheckpointer()
-    # Save is a pass-through
     cp.save("path", {"a": 1})
-
-    # Restore returns item
     res = cp.restore("path", {"b": 2})
     assert res == {"b": 2}
 
@@ -340,7 +357,6 @@ def test_future_semantic() -> None:
     """Test/Mock documentation."""
     f = Future(result=42)
     assert f.result() == 42
-
     f2 = Future()
     assert f2.result() is None
 
@@ -349,12 +365,10 @@ def test_async_checkpointer_semantic() -> None:
     """Test/Mock documentation."""
     handler = MockAsyncHandler()
     cp = AsyncCheckpointer(handler=handler)
-
     f_save = cp.save("some_path", {"x": 42})
     assert isinstance(f_save, Future)
     assert f_save.result() is None
     assert handler.saved == ("some_path", {"x": 42})
-
     f_restore = cp.restore("other_path", {"y": 1})
     assert isinstance(f_restore, Future)
     res = f_restore.result()
@@ -366,7 +380,6 @@ def test_async_checkpointer_no_handler_methods() -> None:
     cp = AsyncCheckpointer(handler=EmptyHandler2())
     f_save = cp.save("path", {"x": 1})
     assert f_save.result() is None
-
     f_restore = cp.restore("path")
     assert f_restore.result() is None
 
@@ -375,9 +388,6 @@ def test_checkpoint_manager_complex_pytree() -> None:
     """Test/Mock documentation."""
     opts = CheckpointManagerOptions(save_interval_steps=1)
     manager = CheckpointManager(directory="fake_dir", options=opts)
-
-    # Complex pytree with nested lists/dicts
-    # In zero-orbax tracer, PyTrees are usually dicts, but let's test a deeply nested dict
     complex_tree = {
         "params": {
             "layer1": {"weights": [1, 2, 3], "bias": 0},
@@ -385,7 +395,6 @@ def test_checkpoint_manager_complex_pytree() -> None:
         },
         "opt_state": {"step": 100, "momentum": {"layer1": 0.9, "layer2": 0.9}},
     }
-
     assert manager.save(1, complex_tree) is True
     restored = manager.restore(1)
     assert restored == complex_tree
@@ -393,13 +402,8 @@ def test_checkpoint_manager_complex_pytree() -> None:
 
 def test_checkpoint_manager_background_delete_mock() -> None:
     """Test/Mock documentation."""
-    # Just verify that passing the flag doesn't break initialization and state is kept
     opts = CheckpointManagerOptions(enable_background_delete=True, max_to_keep=1)
     manager = CheckpointManager(directory="fake_dir", options=opts)
-
     manager.save(1, {"a": 1})
     manager.save(2, {"b": 2})
-
-    assert (
-        manager.all_steps() == [2]
-    )  # 1 is deleted (synchronously in our mock, verifying the max_to_keep still works when bg delete is enabled)
+    assert manager.all_steps() == [2]

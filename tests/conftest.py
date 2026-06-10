@@ -1,3 +1,5 @@
+"""Provide module docstring."""
+
 import pytest
 import sys
 import os
@@ -8,11 +10,11 @@ sys.path.insert(
         os.path.join(os.path.dirname(__file__), "../../ml-switcheroo-compiler/src")
     ),
 )
-import ml_switcheroo
+import ml_switcheroo  # type: ignore[import-untyped]
 
 
 @pytest.fixture(autouse=True)
 def switcheroo_config():
-    # Unified pytest configuration that imports switcheroo config contexts
+    """Execute the function."""
     with ml_switcheroo.EagerMode():
         yield
