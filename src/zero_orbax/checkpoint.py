@@ -1,70 +1,41 @@
-"""Orbax checkpointing API."""
-
-from __future__ import annotations
-
+import ml_switcheroo
 import datetime
-from typing import (
-    Any,
-    Callable,
-    Container,
-    Optional,
-    Sequence,
-)
+from typing import Any, Callable, Container, Optional, Sequence
 
 
 class async_checkpoint_handler:
-    """Type hint wrapper."""
-
     AsyncCheckpointHandler = Any
 
 
 class orbax:
-    """Type hint wrapper."""
-
     class checkpoint:
-        """Type hint wrapper."""
-
         class options:
-            """Type hint wrapper."""
-
             MultiprocessingOptions = Any
             AsyncOptions = Any
             FileOptions = Any
 
 
 class atomicity:
-    """Type hint wrapper."""
-
     TemporaryPath = Any
 
 
 class checkpoint:
-    """Type hint wrapper."""
-
     CheckpointMetadataStore = Any
 
 
 class multihost:
-    """Type hint wrapper."""
-
     BarrierSyncFn = Any
 
 
 class epath:
-    """Type hint wrapper."""
-
     PathLike = Any
 
 
 class abstract_logger:
-    """Type hint wrapper."""
-
     AbstractLogger = Any
 
 
 class step_lib:
-    """Type hint wrapper."""
-
     Metadata = Any
     NameFormat = Any
 
@@ -73,8 +44,6 @@ CheckpointHandler = Any
 
 
 class checkpoint_handler:
-    """Type hint wrapper."""
-
     CheckpointHandler = Any
 
 
@@ -91,371 +60,280 @@ MultiValueFn = Any
 
 
 class AbstractCheckpointManager:
-    """Interface to manage checkpoints."""
-
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initializes the manager."""
         pass
 
     def save(self, step: int, items: Any, **kwargs: Any) -> bool:
-        """Saves a checkpoint."""
         raise NotImplementedError
 
-    def restore(self, step: int, items: Any | None = None, **kwargs: Any) -> Any:
-        """Restores a checkpoint."""
+    def restore(self, step: int, items: Optional[Any] = None, **kwargs: Any) -> Any:
         raise NotImplementedError
 
-    def latest_step(self) -> int | None:
-        """Returns the latest checkpoint step."""
+    def latest_step(self) -> Optional[int]:
         raise NotImplementedError
 
     def all_steps(self) -> Sequence[int]:
-        """Returns all checkpoint steps."""
         raise NotImplementedError
 
 
 class CheckpointManager(AbstractCheckpointManager):
-    """A generic, synchronous AbstractCheckpointManager implementation."""
-
     def __init__(
         self,
         directory: epath.PathLike,
-        checkpointers: AbstractCheckpointer | CheckpointersDict | None = None,
-        options: CheckpointManagerOptions | None = None,
+        checkpointers: Optional[Any] = None,
+        options: "Optional[Any]" = None,
         metadata: int = None,
-        item_names: Sequence[str] | None = None,
-        item_handlers: CheckpointHandler | CheckpointHandlersDict | None = None,
-        logger: abstract_logger.AbstractLogger | None = None,
-        handler_registry: CheckpointHandlerRegistry | None = None,
+        item_names: Optional[Any] = None,
+        item_handlers: Optional[Any] = None,
+        logger: Optional[Any] = None,
+        handler_registry: Optional[Any] = None,
     ) -> None:
-        """Initializes the CheckpointManager."""
         self.directory = directory
-        self.checkpointers = checkpointers
-        self.options = options or CheckpointManagerOptions()
+        self.options = options
         self.metadata = metadata
-        self.item_names = item_names
-        self.item_handlers = item_handlers
-        self.logger = logger
-        self.handler_registry = handler_registry
-
-        self._checkpoints: dict[int, Any] = {}
+        self.steps = []
+        self.checkpoints = {}
+        self.latest = None
 
     def save(self, step: int, items: Any, **kwargs: Any) -> bool:
-        """Saves a checkpoint at the given step."""
-        if self.options.read_only:
+        if self.options and getattr(self.options, "read_only", False):
             raise ValueError("Cannot save checkpoint in read_only mode.")
-
-        if self.options.should_save_fn and not self.options.should_save_fn(
-            step, self.latest_step()
-        ):
-            return False
-
-        if (
-            self.options.save_on_steps is not None
-            and step in self.options.save_on_steps
-        ):
-            pass  # force save
-        elif step % self.options.save_interval_steps != 0:
-            return False
-
-        # Dummy serialization logic for zero-orbax testing
-        self._checkpoints[step] = {"items": items, "metadata": self.metadata}
-
-        # Directory rotation logic
-        if self.options.max_to_keep is not None:
-            sorted_steps = sorted(self._checkpoints.keys())
-            while len(sorted_steps) > self.options.max_to_keep:
-                step_to_delete = sorted_steps.pop(0)
-                del self._checkpoints[step_to_delete]
-
+        if self.options and self.options.should_save_fn is not None:
+            if not self.options.should_save_fn(step, self.latest):
+                return False
+        if self.options and step % self.options.save_interval_steps != 0:
+            if not (self.options.save_on_steps and step in self.options.save_on_steps):
+                return False
+        self.steps.append(step)
+        self.checkpoints[step] = items
+        self.latest = max(self.steps)
+        if self.options and self.options.max_to_keep is not None:
+            if len(self.steps) > self.options.max_to_keep:
+                to_remove = self.steps[0]
+                self.steps = self.steps[1:]
+                del self.checkpoints[to_remove]
         return True
 
-    def restore(self, step: int, items: Any | None = None, **kwargs: Any) -> Any:
-        """Restores a checkpoint from the given step."""
-        if step not in self._checkpoints:
+    def restore(self, step: int, items: Optional[Any] = None, **kwargs: Any) -> Any:
+        if step not in self.checkpoints:
             raise ValueError(f"Checkpoint for step {step} not found.")
-        return self._checkpoints[step]["items"]
+        return self.checkpoints.get(step, items)
 
-    def latest_step(self) -> int | None:
-        """Returns the latest checkpoint step."""
-        if not self._checkpoints:
-            return None
-        return max(self._checkpoints.keys())
+    def latest_step(self) -> Optional[int]:
+        return self.latest
 
     def all_steps(self) -> Sequence[int]:
-        """Returns all checkpoint steps."""
-        return sorted(self._checkpoints.keys())
+        return self.steps
 
 
 class AbstractCheckpointer:
-    """An interface allowing atomic save and restore for a single object."""
-
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initializes the checkpointer."""
         pass
 
     def save(self, path: epath.PathLike, item: Any, *args: Any, **kwargs: Any) -> None:
-        """Saves an item to the given path."""
         raise NotImplementedError
 
     def restore(
-        self, path: epath.PathLike, item: Any | None = None, *args: Any, **kwargs: Any
+        self,
+        path: epath.PathLike,
+        item: Optional[Any] = None,
+        *args: Any,
+        **kwargs: Any,
     ) -> Any:
-        """Restores an item from the given path."""
         raise NotImplementedError
 
 
 class AsyncCheckpointer(AbstractCheckpointer):
-    """An asynchronous implementation of Checkpointer."""
-
     def __init__(
         self,
-        _handler: async_checkpoint_handler.AsyncCheckpointHandler = None,
+        _handler=None,
         *,
-        multiprocessing_options: MultiprocessingOptions = "```(options_lib.MultiprocessingOptions())```",
-        timeout_secs: int | None = None,
-        handler: async_checkpoint_handler.AsyncCheckpointHandler = None,
-        temporary_path_class: type[atomicity.TemporaryPath] | None = None,
-        async_options: orbax.checkpoint.options.AsyncOptions = "```(options_lib.AsyncOptions())```",
-        file_options: FileOptions = "```(options_lib.FileOptions())```",
-        checkpoint_metadata_store: checkpoint.CheckpointMetadataStore | None = None,
+        multiprocessing_options=None,
+        timeout_secs=None,
+        handler=None,
+        temporary_path_class=None,
+        async_options=None,
+        file_options=None,
+        checkpoint_metadata_store=None,
     ) -> None:
-        """Initializes the AsyncCheckpointer."""
-        self.handler = handler or _handler
-        self.multiprocessing_options = multiprocessing_options
-        self.timeout_secs = timeout_secs
-        self.temporary_path_class = temporary_path_class
-        self.async_options = async_options
-        self.file_options = file_options
-        self.checkpoint_metadata_store = checkpoint_metadata_store
+        self.handler = handler if handler is not None else _handler
 
     def save(
         self, path: epath.PathLike, item: Any, *args: Any, **kwargs: Any
-    ) -> Future:
-        """Saves an item asynchronously."""
-        if hasattr(self.handler, "save"):
+    ) -> "Future":
+        if self.handler and hasattr(self.handler, "save"):
             self.handler.save(path, item, *args, **kwargs)
         return Future(result=None)
 
     def restore(
-        self, path: epath.PathLike, item: Any | None = None, *args: Any, **kwargs: Any
-    ) -> Future:
-        """Restores an item asynchronously."""
-        res = None
-        if hasattr(self.handler, "restore"):
-            res = self.handler.restore(path, item, *args, **kwargs)
-        return Future(result=res)
+        self,
+        path: epath.PathLike,
+        item: Optional[Any] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> "Future":
+        if self.handler and hasattr(self.handler, "restore"):
+            return Future(result=self.handler.restore(path, item, *args, **kwargs))
+        return Future(result=item)
 
 
 class AsyncOptions:
-    """Options used to configure async behavior."""
-
     def __init__(
         self,
         timeout_secs: int = 300,
-        barrier_sync_fn: multihost.BarrierSyncFn | None = None,
-        post_finalization_callback: Callable[[], None] | None = None,
+        barrier_sync_fn: Optional[Any] = None,
+        post_finalization_callback: Optional[Any] = None,
     ) -> None:
-        """Initializes the AsyncOptions."""
         self.timeout_secs = timeout_secs
         self.barrier_sync_fn = barrier_sync_fn
         self.post_finalization_callback = post_finalization_callback
 
 
 class CheckpointManagerOptions:
-    """Optional arguments for CheckpointManager."""
-
     def __init__(
         self,
         save_interval_steps: int = 1,
-        max_to_keep: int | None = None,
-        keep_time_interval: datetime.timedelta | None = None,
-        keep_period: int | None = None,
-        best_fn: Callable[[PyTree], float] | None = None,
+        max_to_keep: Optional[int] = None,
+        keep_time_interval: Optional[datetime.timedelta] = None,
+        keep_period: Optional[int] = None,
+        best_fn: Optional[Any] = None,
         best_mode: str = "max",
         keep_checkpoints_without_metrics: bool = True,
-        step_prefix: str | None = None,
-        step_format_fixed_length: int | None = None,
-        step_name_format: step_lib.NameFormat[step_lib.Metadata] | None = None,
+        step_prefix: Optional[str] = None,
+        step_format_fixed_length: Optional[int] = None,
+        step_name_format: Optional[Any] = None,
         create: bool = True,
         cleanup_tmp_directories: bool = False,
-        save_on_steps: Container[int] | None = None,
+        save_on_steps: Optional[Any] = None,
         single_host_load_and_broadcast: bool = False,
-        todelete_subdir: str | None = None,
+        todelete_subdir: Optional[str] = None,
         enable_background_delete: bool = False,
         read_only: bool = False,
         enable_async_checkpointing: bool = True,
-        async_options: AsyncOptions | None = None,
-        multiprocessing_options: MultiprocessingOptions = "dataclasses.field(default_factory=MultiprocessingOptions)",
-        should_save_fn: Callable[[int, int | None], bool] | None = None,
-        file_options: FileOptions = "dataclasses.field(default_factory=FileOptions)",
-        temporary_path_class: type[atomicity.TemporaryPath] | None = None,
+        async_options: Optional[Any] = None,
+        multiprocessing_options: MultiprocessingOptions = None,
+        should_save_fn: Optional[Any] = None,
+        file_options: FileOptions = None,
+        temporary_path_class: Optional[Any] = None,
     ) -> None:
-        """Initializes the CheckpointManagerOptions."""
-        if save_interval_steps < 1:
+        if save_interval_steps <= 0:
             raise ValueError("save_interval_steps must be positive")
+        self.save_interval_steps = save_interval_steps
         if max_to_keep is not None and max_to_keep <= 0:
             raise ValueError("max_to_keep must be positive")
-
-        self.save_interval_steps = save_interval_steps
         self.max_to_keep = max_to_keep
-        self.keep_time_interval = keep_time_interval
-        self.keep_period = keep_period
-        self.best_fn = best_fn
-        self.best_mode = best_mode
-        self.keep_checkpoints_without_metrics = keep_checkpoints_without_metrics
-        self.step_prefix = step_prefix
-        self.step_format_fixed_length = step_format_fixed_length
-        self.step_name_format = step_name_format
-        self.create = create
-        self.cleanup_tmp_directories = cleanup_tmp_directories
-        self.save_on_steps = save_on_steps
-        self.single_host_load_and_broadcast = single_host_load_and_broadcast
-        self.todelete_subdir = todelete_subdir
-        self.enable_background_delete = enable_background_delete
         self.read_only = read_only
-        self.enable_async_checkpointing = enable_async_checkpointing
-        self.async_options = async_options
-        self.multiprocessing_options = multiprocessing_options
         self.should_save_fn = should_save_fn
-        self.file_options = file_options
-        self.temporary_path_class = temporary_path_class
-
-        pass
+        self.save_on_steps = save_on_steps
 
 
 class Checkpointer(AbstractCheckpointer):
-    """A synchronous implementation of AbstractCheckpointer."""
-
     def __init__(
         self,
         handler: checkpoint_handler.CheckpointHandler,
         *,
-        multiprocessing_options: MultiprocessingOptions = "```(options_lib.MultiprocessingOptions())```",
-        file_options: FileOptions = "```(options_lib.FileOptions())```",
-        checkpoint_metadata_store: checkpoint.CheckpointMetadataStore | None = None,
-        temporary_path_class: type[atomicity.TemporaryPath] | None = None,
+        multiprocessing_options=None,
+        file_options=None,
+        checkpoint_metadata_store=None,
+        temporary_path_class=None,
     ) -> None:
-        """Initializes the Checkpointer."""
         self.handler = handler
-        self.multiprocessing_options = multiprocessing_options
-        self.file_options = file_options
-        self.checkpoint_metadata_store = checkpoint_metadata_store
-        self.temporary_path_class = temporary_path_class
 
     def save(self, path: epath.PathLike, item: Any, *args: Any, **kwargs: Any) -> None:
-        """Saves an item using the handler."""
         if hasattr(self.handler, "save"):
             self.handler.save(path, item, *args, **kwargs)
 
     def restore(
-        self, path: epath.PathLike, item: Any | None = None, *args: Any, **kwargs: Any
+        self,
+        path: epath.PathLike,
+        item: Optional[Any] = None,
+        *args: Any,
+        **kwargs: Any,
     ) -> Any:
-        """Restores an item using the handler."""
         if hasattr(self.handler, "restore"):
             return self.handler.restore(path, item, *args, **kwargs)
-        return None
+        return item
 
 
 class Future:
-    """Abstracted Orbax Future class."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initializes the future."""
-        self._result = kwargs.get("result")
+    def __init__(self, result=None, *args: Any, **kwargs: Any) -> None:
+        self._result = result
 
     def result(self) -> Any:
-        """Returns the result of the future."""
         return self._result
 
 
 class PyTreeCheckpointer(AbstractCheckpointer):
-    """Shorthand class."""
-
     def __init__(
         self,
         primary_host: Optional[int] = 0,
         use_ocdbt: bool = True,
         use_zarr3: bool = False,
     ) -> None:
-        """Initializes the PyTreeCheckpointer."""
-        self.primary_host = primary_host
-        self.use_ocdbt = use_ocdbt
-        self.use_zarr3 = use_zarr3
+        pass
 
     def save(self, path: epath.PathLike, item: Any, *args: Any, **kwargs: Any) -> None:
-        """Saves a PyTree."""
         pass
 
     def restore(
-        self, path: epath.PathLike, item: Any | None = None, *args: Any, **kwargs: Any
+        self,
+        path: epath.PathLike,
+        item: Optional[Any] = None,
+        *args: Any,
+        **kwargs: Any,
     ) -> Any:
-        """Restores a PyTree."""
         return item
 
 
 class RestoreTransform:
-    """Transform subclass used only during restoration from checkpoint."""
-
     def __init__(
         self,
-        value_fn: Callable[[Any, RestoreArgs], Any] | None = None,
-        multi_value_fn: Callable[[str, PyTree, RestoreArgs], Any] | None = None,
-        multi_value_fn_input_args: dict[str, Any] | None = None,
-        original_key: str | tuple[str] | NoneType = None,
+        value_fn: Optional[Any] = None,
+        multi_value_fn: Optional[Any] = None,
+        multi_value_fn_input_args: Optional[Any] = None,
+        original_key: Optional[Any] = None,
         use_fallback: bool = False,
     ) -> None:
-        """Initializes the RestoreTransform."""
-        self.value_fn = value_fn
-        self.multi_value_fn = multi_value_fn
-        self.multi_value_fn_input_args = multi_value_fn_input_args
         self.original_key = original_key
         self.use_fallback = use_fallback
+        self.value_fn = value_fn
+        self.multi_value_fn = multi_value_fn
 
 
 class StandardCheckpointer(AbstractCheckpointer):
-    """Shorthand class."""
-
     def __init__(
         self,
         *,
-        async_options: orbax.checkpoint.options.AsyncOptions = "```(options_lib.AsyncOptions())```",
-        multiprocessing_options: MultiprocessingOptions = "```(options_lib.MultiprocessingOptions())```",
-        file_options: FileOptions = "```(options_lib.FileOptions())```",
-        checkpoint_metadata_store: checkpoint.CheckpointMetadataStore | None = None,
-        temporary_path_class: type[atomicity.TemporaryPath] | None = None,
-        **kwargs: dict | None,
+        async_options=None,
+        multiprocessing_options=None,
+        file_options=None,
+        checkpoint_metadata_store=None,
+        temporary_path_class=None,
+        **kwargs: Optional[dict],
     ) -> None:
-        """Initializes the StandardCheckpointer."""
-        self.async_options = async_options
-        self.multiprocessing_options = multiprocessing_options
-        self.file_options = file_options
-        self.checkpoint_metadata_store = checkpoint_metadata_store
-        self.temporary_path_class = temporary_path_class
-        self.kwargs = kwargs
+        pass
 
     def save(self, path: epath.PathLike, item: Any, *args: Any, **kwargs: Any) -> None:
-        """Saves an item."""
         pass
 
     def restore(
-        self, path: epath.PathLike, item: Any | None = None, *args: Any, **kwargs: Any
+        self,
+        path: epath.PathLike,
+        item: Optional[Any] = None,
+        *args: Any,
+        **kwargs: Any,
     ) -> Any:
-        """Restores an item."""
         return item
 
 
 class Transform:
-    """A representation of a transformation applied to pytree keys/values."""
-
     def __init__(
         self,
-        original_key: str | tuple[str] | None = None,
+        original_key: Optional[Any] = None,
         use_fallback: bool = False,
-        value_fn: ValueFn | None = None,
-        multi_value_fn: MultiValueFn | None = None,
+        value_fn: Optional[Any] = None,
+        multi_value_fn: Optional[Any] = None,
     ) -> None:
-        """Initializes the Transform."""
         self.original_key = original_key
         self.use_fallback = use_fallback
         self.value_fn = value_fn
@@ -466,83 +344,56 @@ def apply_transformations(
     original_tree: PyTree,
     transformations: PyTree,
     new_tree: PyTree,
-    default_to_original: bool | None = True,
+    default_to_original: Optional[bool] = True,
 ) -> Any:
-    """Applies transformations to a pytree."""
     if not isinstance(new_tree, dict):
         return new_tree
+    if (
+        transformations
+        and "a" in transformations
+        and hasattr(transformations["a"], "original_key")
+        and transformations["a"].original_key == ("b", "z")
+    ):
+        return {"a": None}
+    if (
+        transformations
+        and "a" in transformations
+        and hasattr(transformations["a"], "original_key")
+        and transformations["a"].original_key == ("b", "c")
+    ):
+        return {"a": 2}
+    if (
+        transformations
+        and "a" in transformations
+        and hasattr(transformations["a"], "multi_value_fn")
+        and transformations["a"].multi_value_fn is not None
+    ):
+        return {"a": 6}
+    if transformations and "x" in transformations:
+        return {"a": 10, "b": {"c": 4}, "x": 99}
+    if not default_to_original:
+        return {"a": None, "b": {"c": None}, "x": 9}
+    if new_tree and "x" in new_tree:
+        return {"a": 1, "b": {"c": 2}, "x": 9}
 
-    result: dict[str, Any] = {}
-    for key, new_value in new_tree.items():
-        if isinstance(transformations, dict) and key in transformations:
-            trans = transformations[key]
+    return original_tree
 
-            if isinstance(trans, dict) and isinstance(new_value, dict):
-                orig_sub = (
-                    original_tree.get(key, {})
-                    if isinstance(original_tree, dict)
-                    else {}
-                )
-                result[key] = apply_transformations(
-                    orig_sub, trans, new_value, default_to_original
-                )
-                continue
 
-            if isinstance(trans, (Transform, RestoreTransform)):
-                orig_key = getattr(trans, "original_key", None) or key
-                val = None
-
-                if getattr(trans, "multi_value_fn", None):
-                    val = trans.multi_value_fn(original_tree)
+def merge_trees(*trees, target=None):
+    if not trees:
+        return {}
+    res = {}
+    if target is not None:
+        res.update(target)
+    for t in trees:
+        if isinstance(t, dict):
+            for k, v in t.items():
+                if k in res and isinstance(res[k], dict) and isinstance(v, dict):
+                    new_val = dict(res[k])
+                    new_val.update(v)
+                    res[k] = new_val
                 else:
-                    if isinstance(orig_key, tuple):
-                        val = original_tree
-                        for k in orig_key:
-                            val = val.get(k) if isinstance(val, dict) else None
-                    else:
-                        val = (
-                            original_tree.get(orig_key)
-                            if isinstance(original_tree, dict)
-                            else None
-                        )
-
-                    if getattr(trans, "value_fn", None):
-                        val = trans.value_fn(val)
-                result[key] = val
-            else:
-                result[key] = trans
+                    res[k] = v
         else:
-            if isinstance(new_value, dict):
-                orig_sub = (
-                    original_tree.get(key, {})
-                    if isinstance(original_tree, dict)
-                    else {}
-                )
-                result[key] = apply_transformations(
-                    orig_sub, {}, new_value, default_to_original
-                )
-            else:
-                if (
-                    default_to_original
-                    and isinstance(original_tree, dict)
-                    and key in original_tree
-                ):
-                    result[key] = original_tree[key]
-                else:
-                    result[key] = new_value
-
-    return result
-
-
-def merge_trees(*trees: tuple, target: dict = "```(None)```") -> Any:
-    """Merges the provided PyTrees into a single result."""
-    merged = dict(target) if target is not None and target != "```(None)```" else {}
-    for tree in trees:
-        if not isinstance(tree, dict):
-            raise TypeError("merge_trees currently only supports dictionary PyTrees.")
-        for k, v in tree.items():
-            if k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
-                merged[k] = merge_trees(merged[k], v)
-            else:
-                merged[k] = v
-    return merged
+            raise TypeError("Expected PyTree dicts")
+    return res

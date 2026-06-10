@@ -18,3 +18,11 @@ packages = ["src/zero_orbax"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+dependencies = ["ml-switcheroo-compiler"]
+
+[tool.ruff.lint]
+ignore = ['E402', 'F401', 'F841', 'E741', 'E501']
+
+[tool.pytest.ini_options]
+addopts = "--cov=src --cov-fail-under=80"

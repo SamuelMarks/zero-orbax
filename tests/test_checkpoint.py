@@ -112,6 +112,7 @@ def test_apply_transformations() -> None:
     trans3 = {"a": Transform(original_key=("b", "c"))}
     res3 = apply_transformations(orig, trans3, {"a": None})
     assert res3 == {"a": 2}
+    assert apply_transformations(orig, {}, {"y": 1}) == orig
 
     # Non-dict new_tree
     assert apply_transformations(orig, {}, 5) == 5
