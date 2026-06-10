@@ -621,7 +621,17 @@ def apply_transformations(
     if not isinstance(new_tree, dict):
         return new_tree
 
-    def process(orig, trans, new):
+    def get_by_path(tree, path, default_val):
+        if isinstance(path, str):
+            res = tree.get(path)
+            return res if res is not None else default_val
+        for k in path:
+            if not isinstance(tree, dict):
+                return default_val
+            tree = tree.get(k)
+        return tree
+
+    def process(orig, trans, new, orig_full):
         """Execute the function."""
         if not isinstance(new, dict):
             return new
@@ -631,31 +641,25 @@ def apply_transformations(
             o = orig.get(k) if isinstance(orig, dict) else None
             if t is not None:
                 if isinstance(t, dict):
-                    res[k] = process(o, t, new[k])
-                elif hasattr(t, "value_fn") and getattr(t, "value_fn"):
-                    val = t.value_fn(o)
-                    res[k] = val
+                    res[k] = process(o if o is not None else {}, t, new[k], orig_full)
                 elif hasattr(t, "multi_value_fn") and getattr(t, "multi_value_fn"):
-                    res[k] = 6
-                elif hasattr(t, "original_key") and getattr(t, "original_key") == (
-                    "b",
-                    "z",
-                ):
-                    res[k] = None
-                elif hasattr(t, "original_key") and getattr(t, "original_key") == (
-                    "b",
-                    "c",
-                ):
-                    res[k] = 2
+                    res[k] = t.multi_value_fn(orig_full)
+                elif type(t).__name__ == "Transform":
+                    if hasattr(t, "original_key") and getattr(t, "original_key"):
+                        o = get_by_path(orig_full, t.original_key, o)
+                    if hasattr(t, "value_fn") and getattr(t, "value_fn"):
+                        res[k] = t.value_fn(o)
+                    else:
+                        res[k] = o
                 else:
-                    res[k] = 99 if k == "x" else new[k]
+                    res[k] = t
             elif not default_to_original:
                 res[k] = new[k]
             else:
                 res[k] = o if o is not None else new[k]
         return res
 
-    return process(original_tree, transformations, new_tree)
+    return process(original_tree, transformations, new_tree, original_tree)
 
 
 def merge_trees(*trees, target=None):

@@ -19,7 +19,7 @@ packages = ["src/zero_orbax"]
 [tool.hatch.metadata]
 allow-direct-references = true
 
-dependencies = ["ml-switcheroo-compiler"]
+dependencies = ["ml-switcheroo-compiler", "zero-jax @ file://localhost/Users/samuel/repos/zero-jax"]
 
 [tool.ruff.lint]
 ignore = ['E402', 'F401', 'F841', 'E741', 'E501']

@@ -407,3 +407,12 @@ def test_checkpoint_manager_background_delete_mock() -> None:
     manager.save(1, {"a": 1})
     manager.save(2, {"b": 2})
     assert manager.all_steps() == [2]
+
+
+def test_apply_transformations_invalid_path() -> None:
+    from zero_orbax.checkpoint import apply_transformations, Transform
+
+    orig = {"a": 1, "b": 2}
+    trans = {"a": Transform(original_key=("b", "c"))}
+    res = apply_transformations(orig, trans, {"a": None})
+    assert res == {"a": 1}
