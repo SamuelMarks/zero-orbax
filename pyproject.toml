@@ -7,7 +7,7 @@ name = "zero-orbax"
 version = "0.6.4"
 description = "Zero Orbax implementation"
 authors = [{ name = "SamuelMarks" }]
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dynamic = ["dependencies"]
 
 [tool.hatch.metadata.hooks.requirements_txt]
@@ -23,4 +23,4 @@ allow-direct-references = true
 ignore = ['E402', 'F401', 'F841', 'E741', 'E501']
 
 [tool.pytest.ini_options]
-addopts = "--cov=src --cov-fail-under=80"
+addopts = "--cov=src --cov-fail-under=100"

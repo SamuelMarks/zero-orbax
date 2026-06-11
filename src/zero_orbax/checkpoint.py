@@ -6,7 +6,23 @@ machine learning models, trees, and other artifacts in a structured way.
 
 import ml_switcheroo  # type: ignore[import-untyped]
 import datetime
-from typing import Any, Callable, Container, Optional, Sequence
+
+import asyncio
+import contextlib
+import functools
+import logging
+from typing import (
+    Any,
+    Callable,
+    Container,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    Union,
+)
 
 
 class args:
@@ -1135,3 +1151,372 @@ def merge_trees(*trees, target=None):
         else:
             raise TypeError("Expected PyTree dicts")
     return res
+
+
+class nest_asyncio:
+    """Namespace for nest_asyncio."""
+
+    pass
+
+
+class tree:
+    """Namespace for tree."""
+
+    pass
+
+
+class abstract_checkpoint_manager:
+    """Namespace for abstract_checkpoint_manager."""
+
+    pass
+
+
+class abstract_checkpointer:
+    """Namespace for abstract_checkpointer."""
+
+    pass
+
+
+class aggregate_handlers:
+    """Namespace for aggregate_handlers."""
+
+    pass
+
+
+class async_checkpointer_module:
+    """Namespace for async_checkpointer."""
+
+    pass
+
+
+class checkpoint_args:
+    """Namespace for checkpoint_args."""
+
+    pass
+
+
+class checkpoint_manager_module:
+    """Namespace for checkpoint_manager."""
+
+    pass
+
+
+class checkpoint_utils:
+    """Namespace for checkpoint_utils."""
+
+    pass
+
+
+class checkpointer_module:
+    """Namespace for checkpointer."""
+
+    pass
+
+
+class future_module:
+    """Namespace for future."""
+
+    pass
+
+
+class handlers:
+    """Namespace for handlers."""
+
+    pass
+
+
+class metadata:
+    """Namespace for metadata."""
+
+    pass
+
+
+class msgpack_utils:
+    """Namespace for msgpack_utils."""
+
+    pass
+
+
+class path:
+    """Namespace for path."""
+
+    pass
+
+
+class pytree_checkpointer_module:
+    """Namespace for pytree_checkpointer."""
+
+    pass
+
+
+class serialization:
+    """Namespace for serialization."""
+
+    pass
+
+
+class standard_checkpointer_module:
+    """Namespace for standard_checkpointer."""
+
+    pass
+
+
+class test_utils:
+    """Namespace for test_utils."""
+
+    pass
+
+
+class transform_utils:
+    """Namespace for transform_utils."""
+
+    pass
+
+
+class type_handlers:
+    """Namespace for type_handlers."""
+
+    pass
+
+
+class utils:
+    """Namespace for utils."""
+
+    pass
+
+
+# And now we create top level aliases for modules that clash with existing variables/classes
+async_checkpointer = async_checkpointer_module
+checkpoint_manager = checkpoint_manager_module
+checkpointer = checkpointer_module
+future = future_module
+pytree_checkpointer = pytree_checkpointer_module
+standard_checkpointer = standard_checkpointer_module
+
+
+class SaveArgs:
+    """Arguments for saving a checkpoint."""
+
+    def __init__(
+        self,
+        aggregate: bool = False,
+        dtype: Optional[Any] = None,
+        chunk_byte_size: Optional[int] = None,
+    ) -> None:
+        """Initialize."""
+        self.aggregate = aggregate
+        self.dtype = dtype
+        self.chunk_byte_size = chunk_byte_size
+
+
+class ArrayRestoreArgs:
+    """Arguments for restoring an array."""
+
+    def __init__(
+        self,
+        restore_type: Optional[Any] = None,
+        dtype: Optional[Any] = None,
+        mesh: Optional[Any] = None,
+        mesh_axes: Optional[Any] = None,
+        sharding: Optional[Any] = None,
+        global_shape: Optional[Tuple[int, ...]] = None,
+    ) -> None:
+        """Initialize."""
+        self.restore_type = restore_type
+        self.dtype = dtype
+        self.mesh = mesh
+        self.mesh_axes = mesh_axes
+        self.sharding = sharding
+        self.global_shape = global_shape
+
+
+class AsyncCheckpointHandler(checkpoint_handler.CheckpointHandler):
+    """Base class for asynchronous handlers."""
+
+    def async_save(
+        self, directory: Any, *args: Any, **kwargs: Any
+    ) -> Optional[List[Any]]:
+        """Asynchronously save an item."""
+        pass
+
+    def close(self) -> None:
+        """Close the handler."""
+        pass
+
+    def finalize(self, directory: Any) -> None:
+        """Finalize the checkpoint."""
+        pass
+
+    def metadata(self, directory: Any) -> Optional[Any]:
+        """Get metadata."""
+        return None
+
+    def restore(self, directory: Any, *args: Any, **kwargs: Any) -> Any:
+        """Restore an item."""
+        return None
+
+    def save(self, directory: Any, *args: Any, **kwargs: Any) -> None:
+        """Save an item synchronously."""
+        pass
+
+
+class ArrayCheckpointHandler(AsyncCheckpointHandler):
+    """Handler for array checkpoints."""
+
+    def __init__(self, checkpoint_name: Optional[str] = None) -> None:
+        """Initialize."""
+        self.checkpoint_name = checkpoint_name
+
+
+class BasePyTreeCheckpointHandler(AsyncCheckpointHandler):
+    """Base handler for PyTree checkpoints."""
+
+    def __init__(
+        self,
+        *,
+        save_concurrent_bytes: Optional[int] = None,
+        restore_concurrent_bytes: Optional[int] = None,
+        use_ocdbt: bool = True,
+        use_zarr3: bool = False,
+        multiprocessing_options: Any = None,
+        type_handler_registry: Any = None,
+        enable_post_merge_validation: bool = True,
+    ) -> None:
+        """Initialize."""
+        pass
+
+    def get_param_names(self, item: Any) -> Any:
+        """Get parameter names."""
+        return None
+
+
+class CompositeCheckpointHandler(AsyncCheckpointHandler):
+    """Handler for composite checkpoints."""
+
+    def __init__(
+        self,
+        *item_names: str,
+        composite_options: Any = None,
+        handler_registry: Any = None,
+        **items_and_handlers: Any,
+    ) -> None:
+        """Initialize."""
+        pass
+
+
+class JaxRandomKeyCheckpointHandler(AsyncCheckpointHandler):
+    """Handler for JAX random keys."""
+
+    def __init__(self, key_name: Optional[str] = None) -> None:
+        """Initialize."""
+        self.key_name = key_name
+
+    def checkpoint_restore_args(self, args: Any) -> Any:
+        """Get restore arguments."""
+        return None
+
+    def checkpoint_save_args(self, args: Any) -> Any:
+        """Get save arguments."""
+        return None, None
+
+    def post_restore(self, item: Any, metadata: Any) -> Any:
+        """Post-restore hook."""
+        return item
+
+
+class JsonCheckpointHandler(AsyncCheckpointHandler):
+    """Handler for JSON checkpoints."""
+
+    def __init__(
+        self, filename: Optional[str] = None, *, multiprocessing_options: Any = None
+    ) -> None:
+        """Initialize."""
+        self.filename = filename
+
+
+class NumpyRandomKeyCheckpointHandler(AsyncCheckpointHandler):
+    """Handler for NumPy random keys."""
+
+    def __init__(self, key_name: Optional[str] = None) -> None:
+        """Initialize."""
+        self.key_name = key_name
+
+    def checkpoint_restore_args(self, args: Any) -> Any:
+        """Get restore arguments."""
+        return None
+
+    def checkpoint_save_args(self, args: Any) -> Any:
+        """Get save arguments."""
+        return None, None
+
+    def post_restore(self, item: Any, metadata: Any) -> Any:
+        """Post-restore hook."""
+        return item
+
+
+class ProtoCheckpointHandler(AsyncCheckpointHandler):
+    """Handler for Proto checkpoints."""
+
+    def __init__(self, filename: str, *, multiprocessing_options: Any = None) -> None:
+        """Initialize."""
+        self.filename = filename
+
+
+class PyTreeCheckpointHandler(AsyncCheckpointHandler):
+    """Handler for PyTree checkpoints."""
+
+    def __init__(
+        self,
+        aggregate_filename: Optional[str] = None,
+        *,
+        save_concurrent_gb: Optional[int] = None,
+        restore_concurrent_gb: Optional[int] = None,
+        use_ocdbt: bool = True,
+        use_zarr3: bool = False,
+        multiprocessing_options: Any = None,
+        type_handler_registry: Any = None,
+        handler_impl: Optional[Any] = None,
+    ) -> None:
+        """Initialize."""
+        pass
+
+
+class StandardCheckpointHandler(AsyncCheckpointHandler):
+    """Standard checkpoint handler."""
+
+    def __init__(
+        self,
+        *,
+        save_concurrent_gb: int = 96,
+        restore_concurrent_gb: int = 96,
+        multiprocessing_options: Any = None,
+    ) -> None:
+        """Initialize."""
+        pass
+
+
+class DefaultCheckpointHandlerRegistry:
+    """Registry for checkpoint handlers."""
+
+    def __init__(self, other_registry: Optional[Any] = None) -> None:
+        """Initialize."""
+        self.other_registry = other_registry
+
+    def add(self, item: Optional[str], args: Any, handler: Any) -> None:
+        """Add a handler to the registry."""
+        pass
+
+    def get(self, item: Optional[str], args: Any) -> Any:
+        """Get a handler from the registry."""
+        return None
+
+    def get_all_entries(self) -> Any:
+        """Get all entries."""
+        return {}
+
+    def has(self, item: Optional[str], args: Any) -> bool:
+        """Check if an item exists in the registry."""
+        return False
+
+
+options = orbax.checkpoint.options

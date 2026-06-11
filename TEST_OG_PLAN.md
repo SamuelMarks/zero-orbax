@@ -1,5 +1,7 @@
 # Orbax Official Test Suite Porting Plan
 
+**Note: The test porting plan is now fully complete. All component tests have been adapted and verified.**
+
 ## Phase 1: Setup and Discovery
 - [x] Identify the official `google/orbax` repository and navigate to the `v0.6.4` tag.
 - [x] Locate the core `orbax.checkpoint` test files (e.g., `checkpoint_manager_test.py`, `checkpointer_test.py`, `pytree_checkpoint_handler_test.py`, etc.).

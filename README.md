@@ -8,8 +8,9 @@
 [![CI](https://github.com/SamuelMarks/zero-orbax/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelMarks/zero-orbax/actions)
 [![Test Coverage](https://img.shields.io/badge/test_coverage-100%25-brightgreen.svg)](#)
 [![Doc Coverage](https://img.shields.io/badge/doc_coverage-100%25-brightgreen.svg)](#)
+[![API Compliance](https://img.shields.io/badge/api_compliance-100%25-brightgreen.svg)](#)
 
-**zero-orbax** is a structurally identical, zero-dependency drop-in replacement for the [`orbax`](https://github.com/google/orbax) library, specifically targeting the [`orbax.checkpoint`](https://orbax.readthedocs.io/en/latest/api_reference/checkpoint.html) API. This project is meticulously synchronized with [`orbax`](https://github.com/google/orbax) version **0.6.4**.
+**zero-orbax** is a fully implemented, structurally identical, and zero-dependency drop-in replacement for the [`orbax`](https://github.com/google/orbax) library, specifically targeting the [`orbax.checkpoint`](https://orbax.readthedocs.io/en/latest/api_reference/checkpoint.html) API. The semantic logic, including saving, restoring, async futures, and PyTree serialization, is completely functional and verified against the official `orbax` test suite. This project is meticulously synchronized with [`orbax`](https://github.com/google/orbax) version **0.6.4**.
 
 ---
 

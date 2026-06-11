@@ -118,3 +118,4 @@ Temporary Items
 patch_*.py
 dummy*.py
 fix_*.py
+doc_coverage.json
