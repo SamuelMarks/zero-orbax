@@ -20,7 +20,11 @@ from zero_orbax.checkpoint import (
 
 
 def test_namespace_classes() -> None:
-    """Execute the function."""
+    """Test that all namespace classes and their properties are correctly initialized.
+
+    Returns:
+        None
+    """
     from zero_orbax.checkpoint import (
         async_checkpoint_handler,
         orbax,
@@ -410,6 +414,11 @@ def test_checkpoint_manager_background_delete_mock() -> None:
 
 
 def test_apply_transformations_invalid_path() -> None:
+    """Test that applying transformations handles invalid paths gracefully.
+
+    Returns:
+        None
+    """
     from zero_orbax.checkpoint import apply_transformations, Transform
 
     orig = {"a": 1, "b": 2}

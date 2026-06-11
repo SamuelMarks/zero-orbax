@@ -7,15 +7,23 @@ import numpy as np
 
 
 class CheckpointManagerTest(parameterized.TestCase):
-    """Represent the class."""
+    """Test suite for the CheckpointManager."""
 
     def setUp(self):
-        """Execute the function."""
+        """Set up the mock directory for checkpoint tests.
+
+        Returns:
+            None
+        """
         super().setUp()
         self.directory = "/tmp/mock_ckpt_dir"
 
     def test_save_and_restore(self):
-        """Execute the function."""
+        """Test full save and restore workflows over multiple steps.
+
+        Returns:
+            None
+        """
         options = ocp.CheckpointManagerOptions(max_to_keep=2)
         manager = ocp.CheckpointManager(self.directory, options=options)
         saved = manager.save(1, {"a": 1, "b": 2})

@@ -12,7 +12,7 @@ MOCK_STEP_NAME_FORMAT = mock.create_autospec(ocp.step.NameFormat)
 
 
 class CheckpointManagerOptionsTest(parameterized.TestCase):
-    """Represent the class."""
+    """Test suite for validating the CheckpointManagerOptions dataclass."""
 
     @parameterized.parameters(
         ({"save_interval_steps": 1},),
@@ -52,7 +52,14 @@ class CheckpointManagerOptionsTest(parameterized.TestCase):
         ),
     )
     def test_side_effect_options_update_for_read_only(self, kwargs):
-        """Execute the function."""
+        """Test that read_only flag correctly nullifies other incompatible options.
+
+        Args:
+            kwargs (dict): The configuration options to initialize with.
+
+        Returns:
+            None
+        """
         kwargs.update({"read_only": True})
         options = ocp.CheckpointManagerOptions(**kwargs)
         self.assertEqual(options.save_interval_steps, 0)
@@ -67,7 +74,11 @@ class CheckpointManagerOptionsTest(parameterized.TestCase):
         self.assertIsNone(options.should_keep_fn)
 
     def test_replace_for_read_only(self):
-        """Execute the function."""
+        """Test the replace method correctly preserves states for read-only options.
+
+        Returns:
+            None
+        """
         options = ocp.CheckpointManagerOptions(
             read_only=True, create=False, save_interval_steps=0
         )
@@ -76,7 +87,11 @@ class CheckpointManagerOptionsTest(parameterized.TestCase):
         self.assertEmpty(updated_options.save_on_steps)
 
     def test_replace_for_should_keep_fn(self):
-        """Execute the function."""
+        """Test that keep_period is nulled when should_keep_fn is set on initialization.
+
+        Returns:
+            None
+        """
         options = ocp.CheckpointManagerOptions(
             keep_period=1, should_keep_fn=lambda step: True
         )
@@ -160,7 +175,17 @@ class CheckpointManagerOptionsTest(parameterized.TestCase):
         expected_single_host_load_and_broadcast: bool | None,
         expected_step_name_format: ocp.step.NameFormat | None,
     ):
-        """Execute the function."""
+        """Test single_host_load_and_broadcast interplay with step_name_format.
+
+        Args:
+            single_host_load_and_broadcast (bool): Input for manager options.
+            step_name_format (ocp.step.NameFormat | None): Format instance to use.
+            expected_single_host_load_and_broadcast (bool | None): Expected value, or None if error.
+            expected_step_name_format (ocp.step.NameFormat | None): Expected format, or None if error.
+
+        Returns:
+            None
+        """
         if (
             expected_single_host_load_and_broadcast is None
             and expected_step_name_format is None

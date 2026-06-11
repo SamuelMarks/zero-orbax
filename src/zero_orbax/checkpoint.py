@@ -1,4 +1,8 @@
-"""Provide module-level functionality."""
+"""Provide module-level functionality for checkpointing.
+
+This module provides various classes and utilities to save and restore
+machine learning models, trees, and other artifacts in a structured way.
+"""
 
 import ml_switcheroo  # type: ignore[import-untyped]
 import datetime
@@ -6,138 +10,249 @@ from typing import Any, Callable, Container, Optional, Sequence
 
 
 class args:
-    """Represent the class."""
+    """Namespace for various checkpoint argument classes.
+
+    Contains classes that specify how different types of items
+    should be saved or restored.
+    """
 
     class ArrayRestore:
-        """Represent the class."""
+        """Arguments for restoring an array."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the ArrayRestore arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class ArraySave:
-        """Represent the class."""
+        """Arguments for saving an array."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the ArraySave arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class Composite:
-        """Represent the class."""
+        """Arguments for a composite checkpoint handler."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the Composite arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class JsonRestore:
-        """Represent the class."""
+        """Arguments for restoring from a JSON file."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the JsonRestore arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class JsonSave:
-        """Represent the class."""
+        """Arguments for saving to a JSON file."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the JsonSave arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class ProtoRestore:
-        """Represent the class."""
+        """Arguments for restoring from a Protocol Buffer."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the ProtoRestore arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class ProtoSave:
-        """Represent the class."""
+        """Arguments for saving to a Protocol Buffer."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the ProtoSave arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class PyTreeRestore:
-        """Represent the class."""
+        """Arguments for restoring a PyTree structure."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the PyTreeRestore arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class PyTreeSave:
-        """Represent the class."""
+        """Arguments for saving a PyTree structure."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the PyTreeSave arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class StandardRestore:
-        """Represent the class."""
+        """Arguments for standard restoration processes."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the StandardRestore arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class StandardSave:
-        """Represent the class."""
+        """Arguments for standard saving processes."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the StandardSave arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class JaxRandomKeySave:
-        """Represent the class."""
+        """Arguments for saving a JAX random key."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the JaxRandomKeySave arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class JaxRandomKeyRestore:
-        """Represent the class."""
+        """Arguments for restoring a JAX random key."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the JaxRandomKeyRestore arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class NumpyRandomKeySave:
-        """Represent the class."""
+        """Arguments for saving a NumPy random key."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the NumpyRandomKeySave arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class NumpyRandomKeyRestore:
-        """Represent the class."""
+        """Arguments for restoring a NumPy random key."""
 
         def __init__(self, *args, **kwargs):
-            """Execute the function."""
+            """Initialize the NumpyRandomKeyRestore arguments.
+
+            Args:
+                *args: Variable length argument list.
+                **kwargs: Arbitrary keyword arguments.
+            """
 
     class CheckpointArgs:
-        """Represent the class."""
+        """Base arguments for a checkpoint handler."""
 
         pass
 
     @staticmethod
     def get_registered_handler_cls(*a, **kw):
-        """Execute the function."""
+        """Get the registered handler class for the given arguments.
+
+        Args:
+            *a: Positional arguments for the registry lookup.
+            **kw: Keyword arguments for the registry lookup.
+
+        Returns:
+            The registered handler class, or None if not found.
+        """
         return None
 
     @staticmethod
     def get_registered_args_cls(*a, **kw):
-        """Execute the function."""
+        """Get the registered arguments class.
+
+        Args:
+            *a: Positional arguments for the registry lookup.
+            **kw: Keyword arguments for the registry lookup.
+
+        Returns:
+            The registered args class, or None if not found.
+        """
         return None
 
     @staticmethod
     def has_registered_args(*a, **kw):
-        """Execute the function."""
+        """Check if there are registered arguments.
+
+        Args:
+            *a: Positional arguments for the registry lookup.
+            **kw: Keyword arguments for the registry lookup.
+
+        Returns:
+            bool: True if registered arguments exist, False otherwise.
+        """
         return False
 
     @staticmethod
     def register_with_handler(*a, **kw):
-        """Execute the function."""
+        """Register a handler class.
+
+        Args:
+            *a: Positional arguments for the registration.
+            **kw: Keyword arguments for the registration.
+
+        Returns:
+            Callable: A decorator function that returns the class unchanged.
+        """
         return lambda cls: cls
 
 
 class async_checkpoint_handler:
-    """Represent the class."""
+    """Namespace for asynchronous checkpoint handler functionality."""
 
     AsyncCheckpointHandler = Any
 
 
 class orbax:
-    """Represent the class."""
+    """Namespace for orbax classes."""
 
     class checkpoint:
-        """Represent the class."""
+        """Namespace for orbax checkpointing."""
 
         class options:
-            """Represent the class."""
+            """Namespace for orbax checkpointing options."""
 
             MultiprocessingOptions = Any
             AsyncOptions = Any
@@ -145,52 +260,63 @@ class orbax:
 
 
 class atomicity:
-    """Represent the class."""
+    """Namespace for atomic operations and paths."""
 
     TemporaryPath = Any
 
 
 class checkpoint:
-    """Represent the class."""
+    """Namespace for general checkpoint operations."""
 
     CheckpointMetadataStore = Any
 
 
 class multihost:
-    """Represent the class."""
+    """Namespace for multi-host synchronization."""
 
     BarrierSyncFn = Any
 
 
 class epath:
-    """Represent the class."""
+    """Namespace for path-like interfaces."""
 
     PathLike = Any
 
 
 class abstract_logger:
-    """Represent the class."""
+    """Namespace for abstract logging interfaces."""
 
     AbstractLogger = Any
 
 
 class step_lib:
-    """Represent the class."""
+    """Namespace for step-related metadata and formatting."""
 
     class Metadata:
-        """Represent the class."""
+        """Metadata associated with a checkpoint step."""
 
         pass
 
     class NameFormat:
-        """Represent the class."""
+        """Formatting logic for step names."""
 
         def __init__(self, single_host_load_and_broadcast=False):
-            """Execute the function."""
+            """Initialize the NameFormat.
+
+            Args:
+                single_host_load_and_broadcast (bool): Whether to format for single host load and broadcast.
+            """
             self.single_host_load_and_broadcast = single_host_load_and_broadcast
 
         def __eq__(self, other):
-            """Execute the function."""
+            """Check equality between two NameFormat instances.
+
+            Args:
+                other (Any): The other object to compare against.
+
+            Returns:
+                bool: True if the objects are equal, False otherwise.
+            """
             if isinstance(other, step_lib.NameFormat):
                 return (
                     self.single_host_load_and_broadcast
@@ -202,7 +328,16 @@ class step_lib:
     def standard_name_format(
         single_host_load_and_broadcast=False, *args, **kwargs
     ) -> Any:
-        """Execute the function."""
+        """Create a standard step name format.
+
+        Args:
+            single_host_load_and_broadcast (bool): Whether to format for single host load and broadcast.
+            *args: Additional positional arguments.
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            step_lib.NameFormat: A populated NameFormat instance.
+        """
         return step_lib.NameFormat(
             single_host_load_and_broadcast=single_host_load_and_broadcast
         )
@@ -213,10 +348,10 @@ CheckpointHandler = Any
 
 
 class checkpoint_handler:
-    """Represent the class."""
+    """Namespace for checkpoint handler."""
 
     class CheckpointHandler:
-        """Represent the class."""
+        """Base class for handlers that manage checkpoint reading and writing."""
 
         pass
 
@@ -234,31 +369,74 @@ MultiValueFn = Any
 
 
 class AbstractCheckpointManager:
-    """Represent the class."""
+    """Abstract base class for a manager that coordinates saving and restoring checkpoints."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Execute the function."""
+        """Initialize the AbstractCheckpointManager.
+
+        Args:
+            *args (Any): Positional arguments.
+            **kwargs (Any): Keyword arguments.
+        """
         pass
 
     def save(self, step: int, items: Any, **kwargs: Any) -> bool:
-        """Execute the function."""
+        """Save a checkpoint at the given step.
+
+        Args:
+            step (int): The step number at which to save.
+            items (Any): The objects to save.
+            **kwargs (Any): Additional options for saving.
+
+        Returns:
+            bool: True if the save was successful, False otherwise.
+
+        Raises:
+            NotImplementedError: If not implemented by subclasses.
+        """
         raise NotImplementedError
 
     def restore(self, step: int, items: Optional[Any] = None, **kwargs: Any) -> Any:
-        """Execute the function."""
+        """Restore a checkpoint from a specific step.
+
+        Args:
+            step (int): The step number to restore.
+            items (Optional[Any]): The target structure to restore into. Defaults to None.
+            **kwargs (Any): Additional options for restoring.
+
+        Returns:
+            Any: The restored objects.
+
+        Raises:
+            NotImplementedError: If not implemented by subclasses.
+        """
         raise NotImplementedError
 
     def latest_step(self) -> Optional[int]:
-        """Execute the function."""
+        """Get the latest saved step.
+
+        Returns:
+            Optional[int]: The most recent step number, or None if no checkpoints exist.
+
+        Raises:
+            NotImplementedError: If not implemented by subclasses.
+        """
         raise NotImplementedError
 
     def all_steps(self) -> Sequence[int]:
-        """Execute the function."""
+        """Get all steps with available checkpoints.
+
+        Returns:
+            Sequence[int]: A sequence of all step numbers available for restoration.
+
+        Raises:
+            NotImplementedError: If not implemented by subclasses.
+        """
         raise NotImplementedError
 
 
 class CheckpointManager(AbstractCheckpointManager):
-    """Represent the class."""
+    """Concrete implementation of a manager that coordinates saving and restoring checkpoints."""
 
     def __init__(
         self,
@@ -271,7 +449,18 @@ class CheckpointManager(AbstractCheckpointManager):
         logger: Optional[Any] = None,
         handler_registry: Optional[Any] = None,
     ) -> None:
-        """Execute the function."""
+        """Initialize the CheckpointManager.
+
+        Args:
+            directory (Any): The base directory for storing checkpoints.
+            checkpointers (Optional[Any]): Mappings of checkpointer objects. Defaults to None.
+            options (Optional[Any]): Options for managing checkpoint retention and save conditions. Defaults to None.
+            metadata (Optional[int]): Additional metadata for the checkpoints. Defaults to None.
+            item_names (Optional[Any]): Specific names of items to track. Defaults to None.
+            item_handlers (Optional[Any]): Custom handlers for individual items. Defaults to None.
+            logger (Optional[Any]): A logger instance. Defaults to None.
+            handler_registry (Optional[Any]): Registry mapping items to their handlers. Defaults to None.
+        """
         self.directory = directory
         self.options = options
         self.metadata = metadata
@@ -280,7 +469,19 @@ class CheckpointManager(AbstractCheckpointManager):
         self.latest: Optional[int] = None
 
     def save(self, step: int, items: Any, **kwargs: Any) -> bool:
-        """Execute the function."""
+        """Save a checkpoint at the given step if conditions are met.
+
+        Args:
+            step (int): The current training step.
+            items (Any): The items to save.
+            **kwargs (Any): Additional options for the save operation.
+
+        Returns:
+            bool: True if the checkpoint was successfully saved, False otherwise.
+
+        Raises:
+            ValueError: If attempting to save in read-only mode.
+        """
         if self.options and getattr(self.options, "read_only", False):
             raise ValueError("Cannot save checkpoint in read_only mode.")
         if self.options and self.options.should_save_fn is not None:
@@ -300,40 +501,91 @@ class CheckpointManager(AbstractCheckpointManager):
         return True
 
     def restore(self, step: int, items: Optional[Any] = None, **kwargs: Any) -> Any:
-        """Execute the function."""
+        """Restore a checkpoint for a specific step.
+
+        Args:
+            step (int): The step number to restore.
+            items (Optional[Any]): The structure to restore into. Defaults to None.
+            **kwargs (Any): Additional options for the restore operation.
+
+        Returns:
+            Any: The restored objects.
+
+        Raises:
+            ValueError: If the requested step is not found in the stored checkpoints.
+        """
         if step not in self.checkpoints:
             raise ValueError(f"Checkpoint for step {step} not found.")
         return self.checkpoints.get(step, items)
 
     def latest_step(self) -> Optional[int]:
-        """Execute the function."""
+        """Return the most recently saved step number.
+
+        Returns:
+            Optional[int]: The most recent step number, or None if no checkpoints exist.
+        """
         return self.latest
 
     def all_steps(self) -> Sequence[int]:
-        """Execute the function."""
+        """Return a sequence of all step numbers that have a checkpoint.
+
+        Returns:
+            Sequence[int]: A sequence of step numbers.
+        """
         return self.steps
 
 
 class AbstractCheckpointer:
-    """Represent the class."""
+    """Abstract base class for saving and restoring items to/from paths."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Execute the function."""
+        """Initialize the AbstractCheckpointer.
+
+        Args:
+            *args (Any): Positional arguments.
+            **kwargs (Any): Keyword arguments.
+        """
         pass
 
     def save(self, path: Any, item: Any, *args: Any, **kwargs: Any) -> Any:
-        """Execute the function."""
+        """Save an item to a given path.
+
+        Args:
+            path (Any): The destination path.
+            item (Any): The item to save.
+            *args (Any): Additional positional arguments.
+            **kwargs (Any): Additional keyword arguments.
+
+        Returns:
+            Any: Result of the save operation.
+
+        Raises:
+            NotImplementedError: If not implemented by subclasses.
+        """
         raise NotImplementedError
 
     def restore(
         self, path: Any, item: Optional[Any] = None, *args: Any, **kwargs: Any
     ) -> Any:
-        """Execute the function."""
+        """Restore an item from a given path.
+
+        Args:
+            path (Any): The source path to restore from.
+            item (Optional[Any]): The target structure to restore into. Defaults to None.
+            *args (Any): Additional positional arguments.
+            **kwargs (Any): Additional keyword arguments.
+
+        Returns:
+            Any: The restored item.
+
+        Raises:
+            NotImplementedError: If not implemented by subclasses.
+        """
         raise NotImplementedError
 
 
 class AsyncCheckpointer(AbstractCheckpointer):
-    """Represent the class."""
+    """Checkpointer that performs saves asynchronously."""
 
     def __init__(
         self,
@@ -347,11 +599,32 @@ class AsyncCheckpointer(AbstractCheckpointer):
         file_options=None,
         checkpoint_metadata_store=None,
     ) -> None:
-        """Execute the function."""
+        """Initialize the AsyncCheckpointer.
+
+        Args:
+            _handler (Any, optional): Legacy positional handler argument. Defaults to None.
+            multiprocessing_options (Any, optional): Options for multiprocessing. Defaults to None.
+            timeout_secs (int, optional): Timeout in seconds. Defaults to None.
+            handler (Any, optional): The checkpoint handler. Defaults to None.
+            temporary_path_class (Any, optional): Class used to generate temporary paths. Defaults to None.
+            async_options (Any, optional): Options configuring async behavior. Defaults to None.
+            file_options (Any, optional): File-specific options. Defaults to None.
+            checkpoint_metadata_store (Any, optional): Store for checkpoint metadata. Defaults to None.
+        """
         self.handler = handler if handler is not None else _handler
 
     def save(self, path: Any, item: Any, *args: Any, **kwargs: Any) -> "Future":
-        """Execute the function."""
+        """Initiate an asynchronous save operation.
+
+        Args:
+            path (Any): The destination path.
+            item (Any): The item to save.
+            *args (Any): Additional positional arguments.
+            **kwargs (Any): Additional keyword arguments.
+
+        Returns:
+            Future: A future object representing the pending save operation.
+        """
         if self.handler and hasattr(self.handler, "save"):
             self.handler.save(path, item, *args, **kwargs)
         return Future(result=None)
@@ -359,19 +632,33 @@ class AsyncCheckpointer(AbstractCheckpointer):
     def restore(
         self, path: Any, item: Optional[Any] = None, *args: Any, **kwargs: Any
     ) -> "Future":
-        """Execute the function."""
+        """Initiate an asynchronous restore operation.
+
+        Args:
+            path (Any): The source path.
+            item (Optional[Any]): The target structure. Defaults to None.
+            *args (Any): Additional positional arguments.
+            **kwargs (Any): Additional keyword arguments.
+
+        Returns:
+            Future: A future object representing the pending restore operation, yielding the restored item.
+        """
         res = None
         if self.handler and hasattr(self.handler, "restore"):
             res = self.handler.restore(path, item, *args, **kwargs)
         return Future(result=res)
 
     def wait_until_finished(self):
-        """Execute the function."""
+        """Block until all background operations are complete.
+
+        Returns:
+            None
+        """
         pass
 
 
 class AsyncOptions:
-    """Represent the class."""
+    """Configuration options for asynchronous checkpointing."""
 
     def __init__(
         self,
@@ -379,7 +666,13 @@ class AsyncOptions:
         barrier_sync_fn: Optional[Any] = None,
         post_finalization_callback: Optional[Any] = None,
     ) -> None:
-        """Execute the function."""
+        """Initialize the AsyncOptions.
+
+        Args:
+            timeout_secs (int): Timeout duration in seconds. Defaults to 300.
+            barrier_sync_fn (Optional[Any]): Function for syncing across hosts. Defaults to None.
+            post_finalization_callback (Optional[Any]): Callback executed after finalization. Defaults to None.
+        """
         self.timeout_secs = timeout_secs
         self.barrier_sync_fn = barrier_sync_fn
         self.post_finalization_callback = post_finalization_callback
@@ -390,7 +683,7 @@ import dataclasses
 
 @dataclasses.dataclass
 class CheckpointManagerOptions:
-    """Represent the class."""
+    """Options to configure the behavior of a CheckpointManager."""
 
     save_interval_steps: int = 1
     max_to_keep: Optional[int] = None
@@ -420,7 +713,11 @@ class CheckpointManagerOptions:
     preservation_policy: Optional[Any] = None
 
     def __post_init__(self):
-        """Execute the function."""
+        """Perform validation of options after initialization.
+
+        Raises:
+            ValueError: If the configuration combination is invalid.
+        """
         step_name_format_single_host_load_and_broadcast = (
             hasattr(self.step_name_format, "single_host_load_and_broadcast")
             and self.step_name_format.single_host_load_and_broadcast
@@ -479,14 +776,21 @@ class CheckpointManagerOptions:
         self.save_on_steps = frozenset(self.save_on_steps or ())
 
     def replace(self, **kwargs):
-        """Execute the function."""
+        """Create a new options instance with updated attributes.
+
+        Args:
+            **kwargs: Attributes to update.
+
+        Returns:
+            CheckpointManagerOptions: A new options instance with the modifications.
+        """
         attrs = dict(self.__dict__)
         attrs.update(kwargs)
         return CheckpointManagerOptions(**attrs)
 
 
 class Checkpointer(AbstractCheckpointer):
-    """Represent the class."""
+    """A standard synchronous checkpointer."""
 
     def __init__(
         self,
@@ -497,37 +801,75 @@ class Checkpointer(AbstractCheckpointer):
         checkpoint_metadata_store=None,
         temporary_path_class=None,
     ) -> None:
-        """Execute the function."""
+        """Initialize the Checkpointer.
+
+        Args:
+            handler (checkpoint_handler.CheckpointHandler): The handler used to save and restore.
+            multiprocessing_options (Any, optional): Multiprocessing options. Defaults to None.
+            file_options (Any, optional): File-specific options. Defaults to None.
+            checkpoint_metadata_store (Any, optional): Metadata store for the checkpoints. Defaults to None.
+            temporary_path_class (Any, optional): Class used to generate temporary paths. Defaults to None.
+        """
         self.handler = handler
 
     def save(self, path: Any, item: Any, *args: Any, **kwargs: Any) -> None:
-        """Execute the function."""
+        """Save the given item to the specified path synchronously.
+
+        Args:
+            path (Any): The destination path.
+            item (Any): The item to save.
+            *args (Any): Additional positional arguments for the handler.
+            **kwargs (Any): Additional keyword arguments for the handler.
+
+        Returns:
+            None
+        """
         if hasattr(self.handler, "save"):
             self.handler.save(path, item, *args, **kwargs)
 
     def restore(
         self, path: Any, item: Optional[Any] = None, *args: Any, **kwargs: Any
     ) -> Any:
-        """Execute the function."""
+        """Restore the given item from the specified path synchronously.
+
+        Args:
+            path (Any): The source path.
+            item (Optional[Any]): The target structure. Defaults to None.
+            *args (Any): Additional positional arguments for the handler.
+            **kwargs (Any): Additional keyword arguments for the handler.
+
+        Returns:
+            Any: The restored item.
+        """
         if hasattr(self.handler, "restore"):
             return self.handler.restore(path, item, *args, **kwargs)
         return item
 
 
 class Future:
-    """Represent the class."""
+    """A simple representation of an asynchronous result."""
 
     def __init__(self, result=None, *args: Any, **kwargs: Any) -> None:
-        """Execute the function."""
+        """Initialize the Future.
+
+        Args:
+            result (Any, optional): The result to wrap. Defaults to None.
+            *args (Any): Additional positional arguments.
+            **kwargs (Any): Additional keyword arguments.
+        """
         self._result = result
 
     def result(self) -> Any:
-        """Execute the function."""
+        """Retrieve the wrapped result.
+
+        Returns:
+            Any: The result stored in this future.
+        """
         return self._result
 
 
 class PyTreeCheckpointer(AbstractCheckpointer):
-    """Represent the class."""
+    """Checkpointer specialized for handling PyTrees."""
 
     def __init__(
         self,
@@ -535,22 +877,48 @@ class PyTreeCheckpointer(AbstractCheckpointer):
         use_ocdbt: bool = True,
         use_zarr3: bool = False,
     ) -> None:
-        """Execute the function."""
+        """Initialize the PyTreeCheckpointer.
+
+        Args:
+            primary_host (Optional[int]): The primary host index. Defaults to 0.
+            use_ocdbt (bool): Whether to use OCDBT format. Defaults to True.
+            use_zarr3 (bool): Whether to use Zarr3 format. Defaults to False.
+        """
         pass
 
     def save(self, path: Any, item: Any, *args: Any, **kwargs: Any) -> Any:
-        """Execute the function."""
+        """Save a PyTree to the specified path.
+
+        Args:
+            path (Any): The destination path.
+            item (Any): The PyTree item to save.
+            *args (Any): Additional positional arguments.
+            **kwargs (Any): Additional keyword arguments.
+
+        Returns:
+            Any: The result of the save operation.
+        """
         pass
 
     def restore(
         self, path: Any, item: Optional[Any] = None, *args: Any, **kwargs: Any
     ) -> Any:
-        """Execute the function."""
+        """Restore a PyTree from the specified path.
+
+        Args:
+            path (Any): The source path.
+            item (Optional[Any]): The target PyTree structure. Defaults to None.
+            *args (Any): Additional positional arguments.
+            **kwargs (Any): Additional keyword arguments.
+
+        Returns:
+            Any: The restored PyTree.
+        """
         return item
 
 
 class RestoreTransform:
-    """Represent the class."""
+    """Rule defining how to transform data during a restore operation."""
 
     def __init__(
         self,
@@ -560,7 +928,15 @@ class RestoreTransform:
         original_key: Optional[Any] = None,
         use_fallback: bool = False,
     ) -> None:
-        """Execute the function."""
+        """Initialize the RestoreTransform.
+
+        Args:
+            value_fn (Optional[Any]): A function to transform a single value. Defaults to None.
+            multi_value_fn (Optional[Any]): A function to derive a value from multiple sources. Defaults to None.
+            multi_value_fn_input_args (Optional[Any]): Arguments for the multi_value_fn. Defaults to None.
+            original_key (Optional[Any]): The key in the original structure to map from. Defaults to None.
+            use_fallback (bool): Whether to use fallback logic. Defaults to False.
+        """
         self.original_key = original_key
         self.use_fallback = use_fallback
         self.value_fn = value_fn
@@ -568,7 +944,7 @@ class RestoreTransform:
 
 
 class StandardCheckpointer(AbstractCheckpointer):
-    """Represent the class."""
+    """Standard checkpointer for common items."""
 
     def __init__(
         self,
@@ -580,22 +956,51 @@ class StandardCheckpointer(AbstractCheckpointer):
         temporary_path_class=None,
         **kwargs: Optional[dict],
     ) -> None:
-        """Execute the function."""
+        """Initialize the StandardCheckpointer.
+
+        Args:
+            async_options (Any, optional): Asynchronous options. Defaults to None.
+            multiprocessing_options (Any, optional): Multiprocessing options. Defaults to None.
+            file_options (Any, optional): File-specific options. Defaults to None.
+            checkpoint_metadata_store (Any, optional): Metadata store for the checkpoints. Defaults to None.
+            temporary_path_class (Any, optional): Class used to generate temporary paths. Defaults to None.
+            **kwargs (Optional[dict]): Additional keyword arguments.
+        """
         pass
 
     def save(self, path: Any, item: Any, *args: Any, **kwargs: Any) -> Any:
-        """Execute the function."""
+        """Save a common item to the specified path.
+
+        Args:
+            path (Any): The destination path.
+            item (Any): The item to save.
+            *args (Any): Additional positional arguments.
+            **kwargs (Any): Additional keyword arguments.
+
+        Returns:
+            Any: The result of the save operation.
+        """
         pass
 
     def restore(
         self, path: Any, item: Optional[Any] = None, *args: Any, **kwargs: Any
     ) -> Any:
-        """Execute the function."""
+        """Restore a common item from the specified path.
+
+        Args:
+            path (Any): The source path.
+            item (Optional[Any]): The target item structure. Defaults to None.
+            *args (Any): Additional positional arguments.
+            **kwargs (Any): Additional keyword arguments.
+
+        Returns:
+            Any: The restored item.
+        """
         return item
 
 
 class Transform:
-    """Represent the class."""
+    """Defines a general transformation on data values."""
 
     def __init__(
         self,
@@ -604,7 +1009,14 @@ class Transform:
         value_fn: Optional[Any] = None,
         multi_value_fn: Optional[Any] = None,
     ) -> None:
-        """Execute the function."""
+        """Initialize the Transform.
+
+        Args:
+            original_key (Optional[Any]): The key in the original structure. Defaults to None.
+            use_fallback (bool): Whether to fallback if the transformation fails. Defaults to False.
+            value_fn (Optional[Any]): Function to apply to a single value. Defaults to None.
+            multi_value_fn (Optional[Any]): Function to apply to multiple values. Defaults to None.
+        """
         self.original_key = original_key
         self.use_fallback = use_fallback
         self.value_fn = value_fn
@@ -617,11 +1029,32 @@ def apply_transformations(
     new_tree: PyTree,
     default_to_original: Optional[bool] = True,
 ) -> Any:
-    """Execute the function."""
+    """Apply a set of transformations to map from an original PyTree to a new PyTree structure.
+
+    Args:
+        original_tree (PyTree): The source tree structure.
+        transformations (PyTree): The tree of transformation rules.
+        new_tree (PyTree): The target structure that defines the expected output shape.
+        default_to_original (Optional[bool]): If True, fields missing in the transformation
+            fall back to the original tree's values. Defaults to True.
+
+    Returns:
+        Any: The transformed PyTree.
+    """
     if not isinstance(new_tree, dict):
         return new_tree
 
     def get_by_path(tree, path, default_val):
+        """Retrieve a nested dictionary value by string or iterable path.
+
+        Args:
+            tree (dict): The dictionary to search.
+            path (Union[str, Iterable]): The path to follow.
+            default_val (Any): The value to return if the path is not found.
+
+        Returns:
+            Any: The value at the specified path, or default_val.
+        """
         if isinstance(path, str):
             res = tree.get(path)
             return res if res is not None else default_val
@@ -632,7 +1065,17 @@ def apply_transformations(
         return tree
 
     def process(orig, trans, new, orig_full):
-        """Execute the function."""
+        """Recursively process transformations for each node in the PyTree.
+
+        Args:
+            orig: The current subtree in the original tree.
+            trans: The current subtree in the transformations.
+            new: The current subtree in the new tree.
+            orig_full: The full original tree for global path references.
+
+        Returns:
+            The processed sub-tree.
+        """
         if not isinstance(new, dict):
             return new
         res = {}
@@ -663,7 +1106,18 @@ def apply_transformations(
 
 
 def merge_trees(*trees, target=None):
-    """Execute the function."""
+    """Merge multiple PyTrees into a single PyTree dict.
+
+    Args:
+        *trees: A variable number of PyTree dictionaries to merge.
+        target (Optional[dict]): An initial target dictionary to merge into. Defaults to None.
+
+    Returns:
+        dict: The deeply merged PyTree dictionary.
+
+    Raises:
+        TypeError: If any of the provided trees are not dictionaries.
+    """
     if not trees:
         return {}
     res = {}

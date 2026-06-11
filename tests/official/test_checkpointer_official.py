@@ -7,16 +7,24 @@ from unittest import mock
 
 
 class CheckpointerTest(parameterized.TestCase):
-    """Represent the class."""
+    """Test suite for the Checkpointer class and its variants."""
 
     def setUp(self):
-        """Execute the function."""
+        """Set up the mock checkpoint directory and handler for tests.
+
+        Returns:
+            None
+        """
         super().setUp()
         self.directory = "/tmp/mock_checkpointer_dir"
         self.mock_handler = mock.MagicMock()
 
     def test_checkpointer_save_and_restore(self):
-        """Execute the function."""
+        """Test synchronous saving and restoring using Checkpointer.
+
+        Returns:
+            None
+        """
         checkpointer = ocp.Checkpointer(self.mock_handler)
         checkpointer.save(self.directory, {"item": 1}, force=True)
         self.mock_handler.save.assert_called_once_with(
@@ -30,7 +38,11 @@ class CheckpointerTest(parameterized.TestCase):
         self.assertEqual(restored, {"item": 1})
 
     def test_async_checkpointer_save_and_restore(self):
-        """Execute the function."""
+        """Test asynchronous saving and restoring using AsyncCheckpointer.
+
+        Returns:
+            None
+        """
         checkpointer = ocp.AsyncCheckpointer(self.mock_handler)
         future = checkpointer.save(self.directory, {"item": 1})
         self.mock_handler.save.assert_called_once_with(self.directory, {"item": 1})
@@ -40,11 +52,19 @@ class CheckpointerTest(parameterized.TestCase):
         self.assertEqual(restored.result(), {"item": 1})
 
     def test_pytree_checkpointer(self):
-        """Execute the function."""
+        """Test initialization of PyTreeCheckpointer.
+
+        Returns:
+            None
+        """
         checkpointer = ocp.PyTreeCheckpointer()
         self.assertIsInstance(checkpointer, ocp.PyTreeCheckpointer)
 
     def test_standard_checkpointer(self):
-        """Execute the function."""
+        """Test initialization of StandardCheckpointer.
+
+        Returns:
+            None
+        """
         checkpointer = ocp.StandardCheckpointer()
         self.assertIsInstance(checkpointer, ocp.StandardCheckpointer)

@@ -6,22 +6,34 @@ import zero_orbax.checkpoint as ocp
 
 
 class PyTreeCheckpointHandlerTest(parameterized.TestCase):
-    """Represent the class."""
+    """Test suite for handling and transforming PyTree structures during checkpointing."""
 
     def test_handler_initialization(self):
-        """Execute the function."""
+        """Test basic initialization of the PyTree checkpoint handler.
+
+        Returns:
+            None
+        """
         handler = ocp.checkpoint_handler.CheckpointHandler()
         self.assertIsNotNone(handler)
 
     def test_merge_trees(self):
-        """Execute the function."""
+        """Test merging multiple overlapping PyTree dictionaries.
+
+        Returns:
+            None
+        """
         tree1 = {"a": 1, "b": {"c": 2}}
         tree2 = {"b": {"d": 3}, "e": 4}
         merged = ocp.merge_trees(tree1, tree2)
         self.assertEqual(merged, {"a": 1, "b": {"c": 2, "d": 3}, "e": 4})
 
     def test_apply_transformations(self):
-        """Execute the function."""
+        """Test applying a set of transformation rules to a PyTree.
+
+        Returns:
+            None
+        """
         orig = {"a": 1, "b": {"c": 2}}
         transformations = {
             "a": ocp.Transform(original_key="a", value_fn=lambda x: x * 10),

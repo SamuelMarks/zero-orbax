@@ -19,6 +19,10 @@ import ml_switcheroo  # type: ignore[import-untyped]
 
 @pytest.fixture(autouse=True)
 def switcheroo_config():
-    """Execute the function."""
+    """Configure the ML switcheroo library to run in eager mode during testing.
+
+    Yields:
+        None: Yields control back to the test function while keeping eager mode active.
+    """
     with ml_switcheroo.EagerMode():
         yield
