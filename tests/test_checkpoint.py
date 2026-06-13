@@ -108,11 +108,11 @@ def test_pytree_checkpointer() -> None:
 def test_restore_transform() -> None:
     """Test RestoreTransform initialization."""
     rt = RestoreTransform(
-        original_key=("b", "c"),
+        original_key="b/c",
         use_fallback=False,
         multi_value_fn=lambda t: t.get("b", {}).get("c"),
     )
-    assert rt.original_key == ("b", "c")
+    assert rt.original_key == "b/c"
     assert rt.use_fallback is False
     assert rt.multi_value_fn({"b": {"c": 42}}) == 42  # type: ignore
 
@@ -155,7 +155,7 @@ def test_apply_transformations() -> None:
     assert apply_transformations(orig, {}, {"y": 1}) == {"y": 1}
     assert apply_transformations(orig, {}, 5) == 5
     assert apply_transformations({"b": 1}, {"b": {"c": 1}}, {"b": 5}) == {"b": 5}
-    trans4 = {"a": Transform(original_key=("b", "z"))}
+    trans4 = {"a": Transform(original_key="b/z")}
     res4 = apply_transformations(orig, trans4, {"a": None})
     assert res4 == {"a": None}
 

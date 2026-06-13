@@ -19,7 +19,7 @@ def check_file(path):
             total += 1
             if not ast.get_docstring(node):
                 missing.append(
-                    f"{type(node).__name__} '{getattr(node, 'name', 'module')}' at line {node.lineno}"
+                    f"{type(node).__name__} '{getattr(node, 'name', 'module')}' at line {getattr(node, 'lineno', 1)}"
                 )
             elif "Represent the class." in ast.get_docstring(
                 node

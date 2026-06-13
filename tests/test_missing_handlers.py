@@ -14,7 +14,7 @@ def test_save_args():
 def test_array_restore_args():
     """Test function."""
     args = zcp.ArrayRestoreArgs(restore_type=int)
-    assert args.restore_type is int
+    assert args._restore_type is int
 
 
 def test_async_checkpoint_handler():

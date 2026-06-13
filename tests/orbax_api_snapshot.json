@@ -1,0 +1,381 @@
+{
+  "AbstractCheckpointManager": {
+    "type": "class",
+    "methods": [
+      "all_steps",
+      "best_step",
+      "check_for_errors",
+      "close",
+      "delete",
+      "item_metadata",
+      "latest_step",
+      "metadata",
+      "metrics",
+      "reached_preemption",
+      "reload",
+      "restore",
+      "save",
+      "should_save",
+      "wait_until_finished"
+    ]
+  },
+  "AbstractCheckpointer": {
+    "type": "class",
+    "methods": [
+      "close",
+      "metadata",
+      "restore",
+      "save",
+      "structure"
+    ]
+  },
+  "ArrayCheckpointHandler": {
+    "type": "class",
+    "methods": [
+      "async_save",
+      "close",
+      "finalize",
+      "metadata",
+      "restore",
+      "save"
+    ]
+  },
+  "ArrayRestoreArgs": {
+    "type": "class",
+    "methods": [
+      "restore_type"
+    ]
+  },
+  "AsyncCheckpointHandler": {
+    "type": "class",
+    "methods": [
+      "async_save",
+      "close",
+      "finalize",
+      "metadata",
+      "restore",
+      "save"
+    ]
+  },
+  "AsyncCheckpointer": {
+    "type": "class",
+    "methods": [
+      "check_for_errors",
+      "close",
+      "create_temporary_path",
+      "metadata",
+      "restore",
+      "save",
+      "structure",
+      "wait_until_finished"
+    ]
+  },
+  "AsyncOptions": {
+    "type": "class",
+    "methods": []
+  },
+  "BasePyTreeCheckpointHandler": {
+    "type": "class",
+    "methods": [
+      "async_save",
+      "close",
+      "finalize",
+      "get_param_names",
+      "metadata",
+      "restore",
+      "save"
+    ]
+  },
+  "CheckpointHandler": {
+    "type": "class",
+    "methods": [
+      "close",
+      "finalize",
+      "metadata",
+      "restore",
+      "save"
+    ]
+  },
+  "CheckpointHandlerRegistry": {
+    "type": "class",
+    "methods": [
+      "add",
+      "get",
+      "get_all_entries",
+      "has"
+    ]
+  },
+  "CheckpointManager": {
+    "type": "class",
+    "methods": [
+      "all_steps",
+      "best_step",
+      "check_for_errors",
+      "close",
+      "delete",
+      "is_saving_in_progress",
+      "item_metadata",
+      "latest_step",
+      "metadata",
+      "metrics",
+      "reached_preemption",
+      "reload",
+      "restore",
+      "save",
+      "should_save",
+      "wait_until_finished"
+    ]
+  },
+  "CheckpointManagerOptions": {
+    "type": "class",
+    "methods": []
+  },
+  "Checkpointer": {
+    "type": "class",
+    "methods": [
+      "close",
+      "create_temporary_path",
+      "metadata",
+      "restore",
+      "save",
+      "structure"
+    ]
+  },
+  "CompositeCheckpointHandler": {
+    "type": "class",
+    "methods": [
+      "async_save",
+      "close",
+      "finalize",
+      "metadata",
+      "restore",
+      "save"
+    ]
+  },
+  "DefaultCheckpointHandlerRegistry": {
+    "type": "class",
+    "methods": [
+      "add",
+      "get",
+      "get_all_entries",
+      "has"
+    ]
+  },
+  "Future": {
+    "type": "class",
+    "methods": [
+      "result"
+    ]
+  },
+  "JaxRandomKeyCheckpointHandler": {
+    "type": "class",
+    "methods": [
+      "async_save",
+      "checkpoint_restore_args",
+      "checkpoint_save_args",
+      "close",
+      "finalize",
+      "metadata",
+      "post_restore",
+      "restore",
+      "save"
+    ]
+  },
+  "JsonCheckpointHandler": {
+    "type": "class",
+    "methods": [
+      "async_save",
+      "close",
+      "finalize",
+      "metadata",
+      "restore",
+      "save"
+    ]
+  },
+  "NumpyRandomKeyCheckpointHandler": {
+    "type": "class",
+    "methods": [
+      "async_save",
+      "checkpoint_restore_args",
+      "checkpoint_save_args",
+      "close",
+      "finalize",
+      "metadata",
+      "post_restore",
+      "restore",
+      "save"
+    ]
+  },
+  "ProtoCheckpointHandler": {
+    "type": "class",
+    "methods": [
+      "async_save",
+      "close",
+      "finalize",
+      "metadata",
+      "restore",
+      "save"
+    ]
+  },
+  "PyTreeCheckpointHandler": {
+    "type": "class",
+    "methods": [
+      "async_save",
+      "close",
+      "finalize",
+      "metadata",
+      "restore",
+      "save"
+    ]
+  },
+  "PyTreeCheckpointer": {
+    "type": "class",
+    "methods": [
+      "close",
+      "create_temporary_path",
+      "metadata",
+      "restore",
+      "save",
+      "structure"
+    ]
+  },
+  "RestoreArgs": {
+    "type": "class",
+    "methods": []
+  },
+  "RestoreTransform": {
+    "type": "class",
+    "methods": []
+  },
+  "SaveArgs": {
+    "type": "class",
+    "methods": []
+  },
+  "StandardCheckpointHandler": {
+    "type": "class",
+    "methods": [
+      "async_save",
+      "close",
+      "finalize",
+      "metadata",
+      "restore",
+      "save"
+    ]
+  },
+  "StandardCheckpointer": {
+    "type": "class",
+    "methods": [
+      "check_for_errors",
+      "close",
+      "create_temporary_path",
+      "metadata",
+      "restore",
+      "save",
+      "structure",
+      "wait_until_finished"
+    ]
+  },
+  "Transform": {
+    "type": "class",
+    "methods": []
+  },
+  "__version__": {
+    "type": "other"
+  },
+  "abstract_checkpoint_manager": {
+    "type": "namespace"
+  },
+  "abstract_checkpointer": {
+    "type": "namespace"
+  },
+  "aggregate_handlers": {
+    "type": "namespace"
+  },
+  "apply_transformations": {
+    "type": "function"
+  },
+  "args": {
+    "type": "namespace"
+  },
+  "async_checkpointer": {
+    "type": "namespace"
+  },
+  "asyncio": {
+    "type": "namespace"
+  },
+  "checkpoint_args": {
+    "type": "namespace"
+  },
+  "checkpoint_manager": {
+    "type": "namespace"
+  },
+  "checkpoint_utils": {
+    "type": "namespace"
+  },
+  "checkpointer": {
+    "type": "namespace"
+  },
+  "contextlib": {
+    "type": "namespace"
+  },
+  "functools": {
+    "type": "namespace"
+  },
+  "future": {
+    "type": "namespace"
+  },
+  "handlers": {
+    "type": "namespace"
+  },
+  "logging": {
+    "type": "namespace"
+  },
+  "merge_trees": {
+    "type": "function"
+  },
+  "metadata": {
+    "type": "namespace"
+  },
+  "msgpack_utils": {
+    "type": "namespace"
+  },
+  "multihost": {
+    "type": "namespace"
+  },
+  "nest_asyncio": {
+    "type": "namespace"
+  },
+  "options": {
+    "type": "namespace"
+  },
+  "path": {
+    "type": "namespace"
+  },
+  "pytree_checkpointer": {
+    "type": "namespace"
+  },
+  "serialization": {
+    "type": "namespace"
+  },
+  "standard_checkpointer": {
+    "type": "namespace"
+  },
+  "step": {
+    "type": "namespace"
+  },
+  "test_utils": {
+    "type": "namespace"
+  },
+  "transform_utils": {
+    "type": "namespace"
+  },
+  "tree": {
+    "type": "namespace"
+  },
+  "type_handlers": {
+    "type": "namespace"
+  },
+  "utils": {
+    "type": "namespace"
+  }
+}
