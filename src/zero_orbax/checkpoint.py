@@ -4,7 +4,6 @@ This module provides various classes and utilities to save and restore
 machine learning models, trees, and other artifacts in a structured way.
 """
 
-import ml_switcheroo  # type: ignore[import-untyped]
 import datetime
 
 import asyncio

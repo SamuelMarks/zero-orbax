@@ -4,9 +4,8 @@ import ast
 import sys
 import os
 
-ALLOWED_3RD_PARTY = {"numpy", "pydantic"}
+ALLOWED_3RD_PARTY = {"pydantic"}
 ALLOWED_INTERNAL = {
-    "ml_switcheroo",
     "cdd",
     "ml_switcheroo_ir",
     "ml_switcheroo_compiler",

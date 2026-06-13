@@ -36,7 +36,7 @@ def get_test_coverage():
 
 def get_doc_coverage():
     try:
-        subprocess.run(["python3", "check_docs.py"], check=False)
+        subprocess.run(["python3", "scripts/check_docs.py"], check=False)
         with open("doc_coverage.json", "r") as f:
             data = json.load(f)
             return data["doc_coverage"]

@@ -5,8 +5,6 @@ which provides functionality for saving and restoring machine learning models
 and their associated states.
 """
 
-import ml_switcheroo  # type: ignore[import-untyped]
-
 from zero_orbax import checkpoint
 
 __all__ = ["checkpoint"]
