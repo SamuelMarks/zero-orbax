@@ -1,155 +1,658 @@
-"""Provide test coverage for missing methods."""
+"""Tests verifying method behavior across managers, checkpointers, handlers, and registries."""
 
-import pytest
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+import pathlib
+
 from zero_orbax.checkpoint import (
     AbstractCheckpointManager,
     AbstractCheckpointer,
-    args,
-    AsyncCheckpointer,
-    checkpoint_handler,
-    CheckpointManager,
-    Checkpointer,
-    PyTreeCheckpointer,
-    StandardCheckpointer,
-    CheckpointHandlerRegistry,
-    CheckpointHandler,
-    RestoreArgs,
+    ArrayCheckpointHandler,
     ArrayRestoreArgs,
+    AsyncCheckpointHandler,
+    AsyncCheckpointer,
+    AsyncOptions,
+    BasePyTreeCheckpointHandler,
+    CheckpointHandler,
+    CheckpointHandlerRegistry,
+    CheckpointManager,
+    CheckpointManagerOptions,
+    Checkpointer,
+    CompositeCheckpointHandler,
+    Future,
+    JsonCheckpointHandler,
+    PyTreeCheckpointHandler,
+    RestoreArgs,
+    RestoreTransform,
+    StandardCheckpointHandler,
+    StandardCheckpointer,
+    args,
+    checkpoint_utils,
+    merge_trees,
+    nest_asyncio,
+    step_lib,
+    test_utils,
+)
+from zero_orbax.types import (
+    AbstractLoggerProtocol,
+    CheckpointMetadataStoreProtocol,
+    FileOptions,
+    JsonValue,
+    PathLike,
+    PreservationPolicyProtocol,
+    PyTree,
+    SaveDecisionPolicyProtocol,
+    TypeHandlerProtocol,
+    TypeHandlerRegistryProtocol,
 )
 
 
-def test_abstract_checkpoint_manager_coverage():
-    """Test AbstractCheckpointManager coverage."""
+class CustomSavePolicy(SaveDecisionPolicyProtocol):
+    """Test implementation of SaveDecisionPolicyProtocol."""
+
+    def should_save(self, step: int, latest_step: int | None) -> bool:
+        """Save only on step 42.
+
+        Args:
+            step: Candidate step.
+            latest_step: Previous step.
+
+        Returns:
+            bool: True if step == 42.
+        """
+        return step == 42 and latest_step != 42
+
+
+class CustomPreservationPolicy(PreservationPolicyProtocol):
+    """Test implementation of PreservationPolicyProtocol."""
+
+    def should_preserve(self, steps: Sequence[int]) -> Sequence[int]:
+        """Preserve step 1 always.
+
+        Args:
+            steps: Existing steps.
+
+        Returns:
+            Sequence[int]: Preserved steps.
+        """
+        return [s for s in steps if s == 1]
+
+
+class CustomLogger(AbstractLoggerProtocol):
+    """Test implementation of AbstractLoggerProtocol."""
+
+    def __init__(self) -> None:
+        """Initialize the logger with an empty entries list."""
+        self.entries: list[tuple[str, int | None]] = []
+
+    def log_entry(self, msg: str, step: int | None = None) -> None:
+        """Append a log entry.
+
+        Args:
+            msg: Message string.
+            step: Step number.
+        """
+        self.entries.append((msg, step))
+
+
+class InMemoryMetadataStore(CheckpointMetadataStoreProtocol):
+    """Concrete test implementation of CheckpointMetadataStoreProtocol."""
+
+    def __init__(self) -> None:
+        """Initialize the metadata store."""
+        self.store: dict[str, dict[str, JsonValue]] = {}
+        self.closed: bool = False
+
+    def write(self, path: PathLike, metadata: Mapping[str, JsonValue]) -> None:
+        """Write metadata for ``path``.
+
+        Args:
+            path: Target path.
+            metadata: Metadata mapping.
+        """
+        self.store[str(path)] = dict(metadata)
+
+    def read(self, path: PathLike) -> dict[str, JsonValue] | None:
+        """Read metadata for ``path``.
+
+        Args:
+            path: Source path.
+
+        Returns:
+            dict[str, JsonValue] | None: Stored metadata or None.
+        """
+        return self.store.get(str(path))
+
+    def close(self) -> None:
+        """Mark store as closed."""
+        self.closed = True
+
+
+class IntTypeHandler(TypeHandlerProtocol):
+    """Custom TypeHandlerProtocol for integers."""
+
+    def typestr(self) -> str:
+        """Return type identifier.
+
+        Returns:
+            str: Type string.
+        """
+        return "custom_int"
+
+    def serialize(self, value: PyTree) -> bytes:
+        """Serialize integer to ASCII bytes.
+
+        Args:
+            value: Value to serialize.
+
+        Returns:
+            bytes: Encoded bytes.
+        """
+        return str(value).encode("utf-8")
+
+    def deserialize(self, data: bytes) -> PyTree:
+        """Deserialize ASCII bytes to integer.
+
+        Args:
+            data: Raw bytes.
+
+        Returns:
+            PyTree: Integer value.
+        """
+        return int(data.decode("utf-8"))
+
+
+class SimpleTypeHandlerRegistry(TypeHandlerRegistryProtocol):
+    """Concrete implementation of TypeHandlerRegistryProtocol."""
+
+    def __init__(self) -> None:
+        """Initialize registry."""
+        self._map: dict[type, TypeHandlerProtocol] = {}
+
+    def add(self, ty: type, handler: TypeHandlerProtocol, override: bool = False) -> None:
+        """Register a type handler.
+
+        Args:
+            ty: Python type.
+            handler: Handler instance.
+            override: Whether to override.
+        """
+        if ty not in self._map or override:
+            self._map[ty] = handler
+
+    def get(self, ty: type) -> TypeHandlerProtocol | None:
+        """Get a registered type handler.
+
+        Args:
+            ty: Python type.
+
+        Returns:
+            TypeHandlerProtocol | None: Handler or None.
+        """
+        return self._map.get(ty)
+
+    def has(self, ty: type) -> bool:
+        """Check if ``ty`` is registered.
+
+        Args:
+            ty: Python type.
+
+        Returns:
+            bool: True if registered.
+        """
+        return ty in self._map
+
+
+class SyncOnlyHandler(CheckpointHandler):
+    """Non-async CheckpointHandler for testing synchronous fallback branches."""
+
+
+def test_abstract_checkpoint_manager_methods() -> None:
+    """Test default methods on AbstractCheckpointManager."""
     mgr = AbstractCheckpointManager()
-    for method in [
-        "reached_preemption",
-        "check_for_errors",
-        "metadata",
-        "best_step",
-        "close",
-        "metrics",
-        "reload",
-        "wait_until_finished",
-        "should_save",
-        "delete",
-        "item_metadata",
-    ]:
-        getattr(mgr, method)()
+    assert mgr.best_step() is None
+    assert mgr.should_save(0) is False
+    mgr.delete(0)
+    assert mgr.reached_preemption(0) is False
+    mgr.check_for_errors()
+    mgr.wait_until_finished()
+    assert mgr.metadata() is None
+    assert mgr.item_metadata() is None
+    assert mgr.metrics() is None
+    mgr.reload()
+    mgr.close()
 
 
-def test_abstract_checkpointer_coverage():
-    """Test AbstractCheckpointer coverage."""
-    cp = AbstractCheckpointer()
-    for method in ["close", "metadata", "structure"]:
-        getattr(cp, method)()
+def test_abstract_checkpointer_methods() -> None:
+    """Test default methods and context manager on AbstractCheckpointer."""
+    with AbstractCheckpointer() as cp:
+        assert cp.metadata() is None
+        assert cp.structure() is None
 
 
-def test_array_restore_args_coverage():
-    """Test ArrayRestoreArgs coverage."""
-    ar = args.ArrayRestore()
-    try:
-        ar.restore_type()
-    except Exception:
-        pass
+def test_array_checkpoint_handler_methods(tmp_path: pathlib.Path) -> None:
+    """Test ArrayCheckpointHandler async_save, finalize, metadata, structure, and close.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    h = ArrayCheckpointHandler()
+    assert h.async_save(None) is None
+    futs = h.async_save(tmp_path, [10, 20])
+    assert futs is not None and len(futs) == 1
+    futs[0].result()
+    assert h.metadata(tmp_path) == {"finalized": True, "directory": str(tmp_path)}
+    assert h.structure(tmp_path) == [10, 20]
+    h.close()
 
 
-def test_async_checkpointer_coverage():
-    """Test AsyncCheckpointer coverage."""
-    cp = AsyncCheckpointer(handler=None)
-    for method in [
-        "check_for_errors",
-        "metadata",
-        "close",
-        "create_temporary_path",
-        "structure",
-    ]:
-        try:
-            getattr(cp, method)()
-        except Exception:
-            pass
+def test_array_restore_args_methods() -> None:
+    """Test ArrayRestoreArgs.restore_type()."""
+    ara = ArrayRestoreArgs(restore_type=int)
+    assert ara.restore_type() is int
 
 
-def test_checkpoint_handler_coverage():
-    """Test CheckpointHandler coverage."""
-    ch = CheckpointHandler()
-    for method in ["metadata", "finalize", "restore", "close", "save"]:
-        try:
-            getattr(ch, method)()
-        except Exception:
-            pass
+def test_async_checkpoint_handler_methods(tmp_path: pathlib.Path) -> None:
+    """Test AsyncCheckpointHandler methods.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    h = AsyncCheckpointHandler()
+    h.save(tmp_path, {"k": 1})
+    assert h.restore(tmp_path) == {"k": 1}
+    assert h.metadata(tmp_path) == {"directory": str(tmp_path)}
+    assert h.structure(tmp_path) == {"k": 1}
+    h.finalize(tmp_path)
+    assert h.metadata() == {"finalized": True, "directory": str(tmp_path)}
+    h.close()
 
 
-def test_checkpoint_handler_registry_coverage():
-    """Test CheckpointHandlerRegistry coverage."""
-    reg = CheckpointHandlerRegistry()
-    for method in ["get_all_entries", "get", "has", "add"]:
-        try:
-            getattr(reg, method)()
-        except Exception:
-            pass
+def test_async_checkpointer_methods(tmp_path: pathlib.Path) -> None:
+    """Test AsyncCheckpointer check_for_errors, wait_until_finished, create_temporary_path, and callbacks.
 
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    barrier_called: list[tuple[str, int]] = []
+    post_called: list[bool] = []
 
-def test_restore_args_coverage():
-    """Test RestoreArgs coverage."""
-
-    ra = RestoreArgs()
-    ar = ArrayRestoreArgs(
-        restore_type=None,
-        dtype=None,
-        global_shape=None,
-        mesh=None,
-        mesh_axes=None,
-        sharding=None,
+    opts = AsyncOptions(
+        timeout_secs=60,
+        barrier_sync_fn=lambda key, t: barrier_called.append((key, t)),
+        post_finalization_callback=lambda: post_called.append(True),
     )
-    try:
-        ar.restore_type()
-    except Exception:
-        pass
+    meta_store = InMemoryMetadataStore()
+    cp = AsyncCheckpointer(
+        handler=StandardCheckpointHandler(),
+        async_options=opts,
+        checkpoint_metadata_store=meta_store,
+    )
+    fut = cp.save(tmp_path, {"x": 1})
+    assert isinstance(fut, Future)
+    cp.check_for_errors()
+    cp.wait_until_finished()
+    assert len(barrier_called) == 1
+    assert post_called == [True]
+    assert (
+        cp.create_temporary_path(tmp_path)
+        == tmp_path.parent / f"{tmp_path.name}.orbax-checkpoint-tmp"
+    )
+    assert cp.create_temporary_path(None) is None
+    assert cp.structure(tmp_path) == {"x": 1}
+    cp.close()
+    assert meta_store.closed is True
+
+    # Test AsyncCheckpointer with synchronous handler
+    sync_cp = AsyncCheckpointer(handler=SyncOnlyHandler())
+    sync_fut = sync_cp.save(tmp_path / "sync_dir", {"s": 2})
+    assert sync_fut.done() is True
 
 
-def test_checkpoint_manager_coverage():
-    """Test CheckpointManager coverage."""
-    mgr = CheckpointManager(directory=".")
-    for method in [
-        "reached_preemption",
-        "check_for_errors",
-        "metadata",
-        "best_step",
-        "close",
-        "is_saving_in_progress",
-        "metrics",
-        "reload",
-        "wait_until_finished",
-        "should_save",
-        "delete",
-        "item_metadata",
-    ]:
-        getattr(mgr, method)()
+def test_base_pytree_checkpoint_handler_methods() -> None:
+    """Test BasePyTreeCheckpointHandler.get_param_names and base methods."""
+    h = BasePyTreeCheckpointHandler()
+    assert h.get_param_names(None) is None
+    names = h.get_param_names({"layer1": {"w": [1, 2], "b": 0}, "step": 1})
+    assert names == {"layer1": {"w": "layer1.w", "b": "layer1.b"}, "step": "step"}
+    h.finalize(None)
+    assert h.metadata(None) is None
+    assert h.structure(None) is None
+    h.close()
 
 
-def test_checkpointer_coverage():
-    """Test Checkpointer coverage."""
-    cp = Checkpointer(handler=None)
-    for method in ["close", "metadata", "structure", "create_temporary_path"]:
-        getattr(cp, method)()
+def test_checkpoint_handler_methods(tmp_path: pathlib.Path) -> None:
+    """Test CheckpointHandler disk fallback when restoring from msgpack.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    h = CheckpointHandler()
+    h.save(tmp_path, args=args.StandardSave({"disk_key": 99}))
+    assert h.restore(tmp_path) == {"disk_key": 99}
+    assert h.restore(tmp_path / "empty_sub", item={"fallback": 1}) == {"fallback": 1}
+    assert h.restore(None, item={"default": 0}) == {"default": 0}
 
 
-def test_pytree_checkpointer_coverage():
-    """Test PyTreeCheckpointer coverage."""
-    cp = PyTreeCheckpointer()
-    for method in ["close", "metadata", "structure", "create_temporary_path"]:
-        getattr(cp, method)()
+def test_checkpoint_handler_registry_methods() -> None:
+    """Test CheckpointHandlerRegistry add, get, has, and get_all_entries."""
+    reg = CheckpointHandlerRegistry()
+    h = CheckpointHandler()
+    reg.add("item_a", args.StandardSave, h)
+    assert reg.has("item_a", args.StandardSave) is True
+    assert reg.get("item_a", args.StandardSave()) is h
+    assert len(reg.get_all_entries()) == 1
+
+    # Wildcard item=None or args_ty=None lookups
+    reg.add("item_only", None, h)
+    assert reg.get("item_only", args.StandardSave) is h
+    reg.add(None, args.JsonSave, h)
+    assert reg.get("any_item", args.JsonSave) is h
+    assert reg.get("unregistered", args.ArraySave) is None
 
 
-def test_standard_checkpointer_coverage():
-    """Test StandardCheckpointer coverage."""
+def test_checkpoint_manager_advanced_features(tmp_path: pathlib.Path) -> None:
+    """Test CheckpointManager custom policies, logger, todelete_subdir, single/mapping handlers, and reload.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    logger = CustomLogger()
+    opts = CheckpointManagerOptions(
+        save_decision_policy=CustomSavePolicy(),
+        preservation_policy=CustomPreservationPolicy(),
+        best_fn=lambda m: m.get("loss", 0.0),
+        best_mode="min",
+        max_to_keep=1,
+        file_options=FileOptions(path_permission_mode=0o755),
+        todelete_subdir="trash",
+    )
+    cp = Checkpointer(StandardCheckpointHandler())
+    with CheckpointManager(
+        tmp_path,
+        checkpointers=cp,
+        options=opts,
+        metadata={"exp": "test"},
+        logger=logger,
+    ) as mgr:
+        assert mgr.should_save(1) is False
+        assert mgr.should_save(42) is True
+        assert mgr.save(1, {"v": 1}, metrics={"loss": 0.5}, force=True) is True
+        assert mgr.save(42, {"v": 42}, metrics={"loss": 0.1}) is True
+        assert mgr.save(43, {"v": 43}, metrics={"loss": 0.9}, force=True) is True
+        # Step 1 preserved by CustomPreservationPolicy, Step 42 preserved as best_step (min loss=0.1), Step 43 moved to trash
+        assert (tmp_path / "trash" / "43").exists()
+        assert mgr.best_step() == 42
+        assert mgr.metrics(42) == {"loss": 0.1}
+        assert mgr.metrics() == {"loss": 0.1}
+        assert mgr.metadata() == {"exp": "test"}
+        assert mgr.item_metadata(42) == {"v": 42}
+        assert mgr.item_metadata() == {"v": 42}
+        assert mgr.is_saving_in_progress() is False
+        assert len(logger.entries) == 3
+
+        # Reload into a fresh manager
+        mgr2 = CheckpointManager(tmp_path)
+        assert mgr2.metrics() is None
+        assert mgr2.item_metadata() is None
+        assert mgr2.best_step() is None
+        assert mgr2.all_steps(read=True) == [1, 42]
+        assert mgr2.metadata() == {"exp": "test"}
+        assert mgr2.metrics(42) == {"loss": 0.1}
+        mgr2.delete(1)
+        assert mgr2.all_steps() == [42]
+
+    # Test CheckpointManager with todelete_full_path and item_handlers mapping/single
+    trash_full = tmp_path / "external_trash"
+    h_map_dir = tmp_path / "h_map_dir"
+    opts_trash = CheckpointManagerOptions(
+        max_to_keep=1,
+        todelete_full_path=str(trash_full),
+        should_keep_fn=lambda s, ts: s == 10,
+        enable_should_save_is_saving_in_progress_check=True,
+    )
+    with CheckpointManager(
+        h_map_dir,
+        item_handlers={"a": StandardCheckpointHandler(), "b": JsonCheckpointHandler()},
+        options=opts_trash,
+    ) as mgr_h:
+        mgr_h._saving_in_progress = True
+        assert mgr_h.should_save(10) is False
+        mgr_h._saving_in_progress = False
+        mgr_h.save(10, {"a": {"x": 1}, "b": {"y": 2}})
+        mgr_h.save(11, {"a": {"x": 3}, "b": {"y": 4}})
+        mgr_h.save(12, {"a": {"x": 5}, "b": {"y": 6}})
+        assert (trash_full / "11").exists()
+        # Trigger overwrite in trash
+        mgr_h.steps.append(11)
+        mgr_h.save(11, {"a": {"x": 3}, "b": {"y": 4}})
+        mgr_h.delete(11)
+        assert mgr_h.restore(10) == {"a": {"x": 1}, "b": {"y": 2}}
+
+    # Test single item_handler and directory override on restore
+    single_h_dir = tmp_path / "single_h"
+    with CheckpointManager(
+        single_h_dir,
+        item_handlers=StandardCheckpointHandler(),
+    ) as mgr_single:
+        mgr_single.save(1, {"s": 10})
+        assert mgr_single.restore(1, directory=single_h_dir) == {"s": 10}
+
+    # Test Composite args with CheckpointManager
+    comp_mgr_dir = tmp_path / "comp_mgr"
+    with CheckpointManager(
+        comp_mgr_dir,
+        item_names=("state", "cfg"),
+        item_handlers={"state": StandardCheckpointHandler(), "cfg": JsonCheckpointHandler()},
+    ) as mgr_comp:
+        mgr_comp.save(
+            1,
+            args=args.Composite(
+                state=args.StandardSave({"w": 1}),
+                cfg=args.JsonSave({"lr": 0.01}),
+            ),
+        )
+        restored_comp = mgr_comp.restore(
+            1,
+            args=args.Composite(
+                state=args.StandardRestore(),
+                cfg=args.JsonRestore(),
+            ),
+        )
+        assert restored_comp == {"state": {"w": 1}, "cfg": {"lr": 0.01}}
+
+    # Test CheckpointManager with registered and unregistered args class directly, directory=None, step_name_format, should_save_fn
+    reg_mgr_dir = tmp_path / "reg_mgr"
+    with CheckpointManager(
+        reg_mgr_dir,
+        options=CheckpointManagerOptions(
+            step_name_format=step_lib.standard_name_format(step_prefix="s"),
+            should_save_fn=lambda s, latest: s == 1,
+        ),
+    ) as mgr_reg:
+        assert mgr_reg.should_save(1) is True
+        mgr_reg.save(1, args=args.JsonSave({"direct_json": True}))
+        assert mgr_reg.restore(1, args=args.JsonRestore()) == {"direct_json": True}
+        # Unregistered CheckpointArgs fallback
+        mgr_reg.save(2, args=args.CheckpointArgs({"unreg": 1}), force=True)
+        assert mgr_reg.restore(2, args=args.CheckpointArgs()) == {"unreg": 1}
+
+    # Test CheckpointManager with directory=None, read_only should_save, best_fn without metrics
+    mem_mgr = CheckpointManager(
+        None,
+        options=CheckpointManagerOptions(
+            max_to_keep=1,
+            best_fn=lambda m: m.get("score", 0),
+            keep_checkpoints_without_metrics=True,
+        ),
+    )
+    mem_mgr.reload()
+    mem_mgr.save(1, {"a": 1})
+    mem_mgr.save(2, {"a": 2})
+    assert mem_mgr.best_step() == 2
+    mem_mgr.delete(1)
+
+    ro_mgr = CheckpointManager(
+        None,
+        options=CheckpointManagerOptions(read_only=True),
+    )
+    assert ro_mgr.should_save(1) is False
+
+    # Test Composite args on manager without item_handlers mapping
+    comp_no_h_dir = tmp_path / "comp_no_h"
+    with CheckpointManager(comp_no_h_dir) as mgr_c2:
+        mgr_c2.save(1, args=args.Composite(a=args.StandardSave({"v": 1})))
+        assert mgr_c2.best_step() == 1
+        assert mgr_c2.restore(1, args=args.Composite(a=args.StandardRestore())) == {"a": {"v": 1}}
+        # Restore when disk file is missing falls back to self.checkpoints[step]
+        (comp_no_h_dir / "1" / "checkpoint.msgpack").unlink(missing_ok=True)
+        assert mgr_c2.restore(1, directory=comp_no_h_dir) == {"a": {"v": 1}}
+
+
+def test_checkpoint_manager_options_methods() -> None:
+    """Test CheckpointManagerOptions.replace()."""
+    opts = CheckpointManagerOptions(save_interval_steps=2, max_to_keep=3)
+    opts2 = opts.replace(save_interval_steps=5, max_to_keep=10, best_mode="min")
+    assert opts2.save_interval_steps == 5
+    assert opts2.max_to_keep == 10
+    assert opts2.best_mode == "min"
+
+
+def test_checkpointer_methods(tmp_path: pathlib.Path) -> None:
+    """Test Checkpointer without handler (disk fallback) and with metadata store.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    cp = Checkpointer()
+    assert cp.save(tmp_path, {"no_handler": 1}) is None
+    assert cp.restore(tmp_path) == {"no_handler": 1}
+    assert cp.restore(tmp_path / "missing", item={"default": 2}) == {"default": 2}
+    assert cp.metadata(tmp_path) is None
+    assert cp.structure(tmp_path) is None
+    cp.close()
+
+    meta_store = InMemoryMetadataStore()
+    cp_meta = Checkpointer(StandardCheckpointHandler(), checkpoint_metadata_store=meta_store)
+    cp_meta.save(tmp_path / "with_meta", {"m": 1})
+    assert cp_meta.metadata(tmp_path / "with_meta") == {"path": str(tmp_path / "with_meta")}
+    cp_meta.close()
+
+
+def test_composite_checkpoint_handler_extra_branches(tmp_path: pathlib.Path) -> None:
+    """Test CompositeCheckpointHandler with sync sub-handler, None handler, dict item, and metadata branches.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    comp = CompositeCheckpointHandler(sync_item=SyncOnlyHandler(), ignored_item=None)
+    assert comp.metadata(tmp_path) is None
+    comp.finalize(None)
+    futs = comp.async_save(tmp_path, {"sync_item": {"v": 1}})
+    assert futs == []
+    assert comp.restore(tmp_path) == {"sync_item": {"v": 1}, "ignored_item": None}
+    # Test unregistered CheckpointArgs subclass inside Composite
+    comp.save(tmp_path, args.Composite(unreg=args.CheckpointArgs({"u": 2})))
+    comp.close()
+
+
+def test_pytree_checkpoint_handler_custom_impl_and_type_registry(tmp_path: pathlib.Path) -> None:
+    """Test PyTreeCheckpointHandler with handler_impl, type_handler_registry, and RestoreArgs.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    custom_impl = BasePyTreeCheckpointHandler()
+    pt_with_impl = PyTreeCheckpointHandler(handler_impl=custom_impl)
+    pt_with_impl.save(tmp_path / "impl", {"a": 1})
+    assert pt_with_impl.restore(tmp_path / "impl") == {"a": 1}
+
+    th_reg = SimpleTypeHandlerRegistry()
+    th_reg.add(int, IntTypeHandler())
+    pt_th = PyTreeCheckpointHandler(type_handler_registry=th_reg)
+    pt_th.save(tmp_path / "th", {"num": 42})
+    restored_th = pt_th.restore(tmp_path / "th")
+    assert restored_th == {"num": {"__custom_type__": "custom_int", "__custom_hex__": b"42".hex()}}
+
+    # Test _apply_restore_args_tree for float, str, list, tuple, and unknown restore_type
+    pt_plain = PyTreeCheckpointHandler()
+    pt_plain.save(
+        tmp_path / "coercions",
+        {"f": 1, "s": 123, "lst": (1, 2), "tup": [3, 4], "keep": "ok", "other": 5},
+    )
+    coerced = pt_plain.restore(
+        tmp_path / "coercions",
+        restore_args={
+            "f": RestoreArgs(restore_type=float),
+            "s": RestoreArgs(restore_type=str),
+            "lst": RestoreArgs(restore_type=list),
+            "tup": ArrayRestoreArgs(restore_type=tuple),
+            "keep": None,
+            "other": RestoreArgs(restore_type=bool),
+        },
+    )
+    assert coerced == {
+        "f": 1.0,
+        "s": "123",
+        "lst": [1, 2],
+        "tup": (3, 4),
+        "keep": "ok",
+        "other": 5,
+    }
+
+    # Test PyTreeCheckpointHandler aggregate_filename missing on disk fallback and unregistered leaf in type_handler_registry
+    pt_agg_missing = PyTreeCheckpointHandler(
+        aggregate_filename="missing_agg.msgpack",
+        type_handler_registry=th_reg,
+    )
+    pt_agg_missing.save(None, {"num": 1, "str_unregistered": "hello"})
+    assert pt_agg_missing.restore(tmp_path / "coercions") is not None
+
+
+def test_standard_checkpointer_methods() -> None:
+    """Test StandardCheckpointer check_for_errors, metadata, create_temporary_path, wait, and close."""
     cp = StandardCheckpointer()
-    for method in [
-        "check_for_errors",
-        "metadata",
-        "close",
-        "create_temporary_path",
-        "wait_until_finished",
-        "structure",
-    ]:
-        getattr(cp, method)()
+    cp.check_for_errors()
+    assert cp.metadata() is None
+    assert cp.create_temporary_path() is None
+    cp.wait_until_finished()
+    assert cp.structure() is None
+    cp.close()
+
+
+def test_utils_and_submodules(tmp_path: pathlib.Path) -> None:
+    """Test test_utils, checkpoint_utils, nest_asyncio, step_lib, and RestoreTransform.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    nest_asyncio.apply()
+
+    nf = step_lib.standard_name_format(step_prefix="ckpt", step_format_fixed_length=4)
+    assert nf.build_name(7) == "ckpt_0007"
+    assert nf.parse_step("ckpt_0007") == 7
+    assert nf.parse_step("other_0007") is None
+    assert nf.parse_step("ckpt_abc") is None
+
+    nf_plain = step_lib.standard_name_format()
+    assert nf_plain.build_name(7) == "7"
+    assert nf_plain.parse_step("7") == 7
+
+    target_dir = tmp_path / "iter_dir"
+    test_utils.erase_and_create_empty(target_dir)
+    (target_dir / "1").mkdir()
+    (target_dir / "3").mkdir()
+    (target_dir / "not_a_step").mkdir()
+    assert list(checkpoint_utils.checkpoints_iterator(target_dir)) == [1, 3]
+    assert list(checkpoint_utils.checkpoints_iterator(target_dir, min_interval_secs=-1)) == []
+
+    rt = RestoreTransform(
+        value_fn=lambda x: x,
+        original_key="a",
+        use_fallback=True,
+        multi_value_fn_input_args={"a": RestoreArgs(restore_type=int)},
+    )
+    assert rt.original_key == "a"
+    assert rt.use_fallback is True
+    assert merge_trees({"a": 1}, target={"b": 2}) == {"a": 1, "b": 2}

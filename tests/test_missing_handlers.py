@@ -1,95 +1,202 @@
-"""Tests for missing handlers."""
+"""Tests for concrete CheckpointHandler subclasses and DefaultCheckpointHandlerRegistry."""
+
+from __future__ import annotations
+
+import pathlib
 
 import pytest
+
 import zero_orbax.checkpoint as zcp
 
 
-def test_save_args():
-    """Test function."""
-    args = zcp.SaveArgs(aggregate=True, chunk_byte_size=1024)
-    assert args.aggregate is True
-    assert args.chunk_byte_size == 1024
+def test_save_args() -> None:
+    """Test SaveArgs initialization and attributes."""
+    sa = zcp.SaveArgs(aggregate=True, dtype="float32", chunk_byte_size=1024, shard_axes=(0, 1))
+    assert sa.aggregate is True
+    assert sa.dtype == "float32"
+    assert sa.chunk_byte_size == 1024
+    assert sa.shard_axes == (0, 1)
 
 
-def test_array_restore_args():
-    """Test function."""
-    args = zcp.ArrayRestoreArgs(restore_type=int)
-    assert args._restore_type is int
+def test_restore_args() -> None:
+    """Test RestoreArgs and ArrayRestoreArgs initialization and methods."""
+    ra = zcp.RestoreArgs(restore_type=int, dtype="int32")
+    assert ra.restore_type is int
+    assert ra.dtype == "int32"
+
+    ara = zcp.ArrayRestoreArgs(
+        restore_type=list,
+        global_shape=(4, 4),
+        shape=(2, 4),
+        strict=False,
+        dtype="float32",
+    )
+    assert ara.restore_type() is list
+    assert ara.global_shape == (4, 4)
+    assert ara.shape == (2, 4)
+    assert ara.strict is False
 
 
-def test_async_checkpoint_handler():
-    """Test function."""
-    handler = zcp.AsyncCheckpointHandler()
-    assert handler.async_save("dir") is None
+def test_array_checkpoint_handler(tmp_path: pathlib.Path) -> None:
+    """Test ArrayCheckpointHandler save and restore with TensorStoreDriver on disk.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    handler = zcp.ArrayCheckpointHandler(checkpoint_name="my_arr")
+    handler.save(tmp_path, zcp.args.ArraySave(item=[1, 2, 3]))
+    assert (tmp_path / "my_arr.ts").exists()
+    assert handler.restore(tmp_path) == [1, 2, 3]
+    assert handler.restore(
+        tmp_path,
+        restore_args=zcp.ArrayRestoreArgs(restore_type=tuple),
+    ) == (1, 2, 3)
+    assert handler.restore(
+        tmp_path,
+        restore_args=zcp.ArrayRestoreArgs(restore_type=list),
+    ) == [1, 2, 3]
+
+    # Fallback when .ts file does not exist on disk
+    empty_dir = tmp_path / "empty_arr"
+    empty_dir.mkdir()
+    assert handler.restore(empty_dir, item=[9, 9]) == [9, 9]
+    assert handler.restore(None, item=[7]) == [7]
+    handler.save(None, [1])
     handler.close()
-    handler.finalize("dir")
-    assert handler.metadata("dir") is None
-    assert handler.restore("dir") is None
-    handler.save("dir")
 
 
-def test_array_checkpoint_handler():
-    """Test function."""
-    handler = zcp.ArrayCheckpointHandler(checkpoint_name="test")
-    assert handler.checkpoint_name == "test"
+def test_json_checkpoint_handler(tmp_path: pathlib.Path) -> None:
+    """Test JsonCheckpointHandler save and restore from disk JSON files.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    handler = zcp.JsonCheckpointHandler(filename="config.json")
+    handler.save(tmp_path, zcp.args.JsonSave(item={"lr": 0.01, "epochs": 10}))
+    assert (tmp_path / "config.json").exists()
+    assert not (tmp_path / "checkpoint.msgpack").exists()
+    assert handler.restore(tmp_path) == {"lr": 0.01, "epochs": 10}
+    assert handler.restore(tmp_path / "nonexistent", item={"default": 1}) == {"default": 1}
+    assert handler.restore(None, item={"none_dir": 2}) == {"none_dir": 2}
+    handler.save(None, {"a": 1})
+    handler.close()
 
 
-def test_base_pytree_checkpoint_handler():
-    """Test function."""
-    handler = zcp.BasePyTreeCheckpointHandler(use_zarr3=True)
-    assert handler.get_param_names(None) is None
+def test_proto_checkpoint_handler(tmp_path: pathlib.Path) -> None:
+    """Test ProtoCheckpointHandler save and restore on disk.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    handler = zcp.ProtoCheckpointHandler(filename="model.pb")
+    assert handler.filename == "model.pb"
+    handler.save(tmp_path, zcp.args.ProtoSave(item={"proto_field": "v1"}))
+    assert (tmp_path / "model.pb").exists()
+    assert handler.restore(tmp_path) == {"proto_field": "v1"}
+    assert (
+        handler.restore(
+            tmp_path,
+            zcp.args.ProtoRestore(item_type=str),
+        )
+        == "{'proto_field': 'v1'}"
+    )
+    assert handler.restore(tmp_path / "missing", item="fallback") == "fallback"
+    assert handler.restore(None, item="none_fb") == "none_fb"
+    handler.save(None, "ignored")
+    handler.close()
 
 
-def test_composite_checkpoint_handler():
-    """Test function."""
-    handler = zcp.CompositeCheckpointHandler("item")
-    assert handler
+def test_random_key_handlers(tmp_path: pathlib.Path) -> None:
+    """Test JaxRandomKeyCheckpointHandler and NumpyRandomKeyCheckpointHandler on disk.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    jax_h = zcp.JaxRandomKeyCheckpointHandler(key_name="jax_key")
+    assert jax_h.checkpoint_save_args(None) == (None, None)
+    item, s_args = jax_h.checkpoint_save_args([0, 42])
+    assert item == [0, 42]
+    assert isinstance(s_args, zcp.SaveArgs)
+    ra = zcp.RestoreArgs(dtype="uint32")
+    assert jax_h.checkpoint_restore_args([0, 42], ra) is ra
+    assert jax_h.post_restore([0, 42]) == [0, 42]
+
+    jax_dir = tmp_path / "jax_rng"
+    jax_h.save(jax_dir, zcp.args.JaxRandomKeySave(item=[0, 42]))
+    assert (jax_dir / "jax_key.msgpack").exists()
+    assert jax_h.restore(jax_dir, zcp.args.JaxRandomKeyRestore()) == [0, 42]
+    assert jax_h.restore(tmp_path / "missing_jax", item=[1, 1]) == [1, 1]
+    assert jax_h.restore(None, item=[2, 2]) == [2, 2]
+    jax_h.save(None, [0, 0])
+
+    np_h = zcp.NumpyRandomKeyCheckpointHandler(key_name="np_key")
+    assert np_h.checkpoint_save_args(None) == (None, None)
+    np_item, np_s_args = np_h.checkpoint_save_args([1, 2, 3])
+    assert np_item == [1, 2, 3]
+    assert isinstance(np_s_args, zcp.SaveArgs)
+    assert np_h.checkpoint_restore_args([1, 2, 3], ra) is ra
+    assert np_h.post_restore([1, 2, 3]) == [1, 2, 3]
+
+    np_dir = tmp_path / "np_rng"
+    np_h.save(np_dir, zcp.args.NumpyRandomKeySave(item=[7, 8, 9]))
+    assert (np_dir / "np_key.msgpack").exists()
+    assert np_h.restore(np_dir, zcp.args.NumpyRandomKeyRestore()) == [7, 8, 9]
+    assert np_h.restore(tmp_path / "missing_np", item=[9]) == [9]
+    assert np_h.restore(None, item=[8]) == [8]
+    np_h.save(None, [0])
 
 
-def test_jax_random_key_checkpoint_handler():
-    """Test function."""
-    handler = zcp.JaxRandomKeyCheckpointHandler(key_name="key")
-    assert handler.checkpoint_restore_args(None) is None
-    assert handler.checkpoint_save_args(None) == (None, None)
-    assert handler.post_restore("item", None) == "item"
+def test_composite_checkpoint_handler_and_registry(tmp_path: pathlib.Path) -> None:
+    """Test CompositeCheckpointHandler and DefaultCheckpointHandlerRegistry on disk.
 
-
-def test_json_checkpoint_handler():
-    """Test function."""
-    handler = zcp.JsonCheckpointHandler(filename="test.json")
-    assert handler.filename == "test.json"
-
-
-def test_numpy_random_key_checkpoint_handler():
-    """Test function."""
-    handler = zcp.NumpyRandomKeyCheckpointHandler(key_name="key")
-    assert handler.checkpoint_restore_args(None) is None
-    assert handler.checkpoint_save_args(None) == (None, None)
-    assert handler.post_restore("item", None) == "item"
-
-
-def test_proto_checkpoint_handler():
-    """Test function."""
-    handler = zcp.ProtoCheckpointHandler(filename="test.proto")
-    assert handler.filename == "test.proto"
-
-
-def test_pytree_checkpoint_handler():
-    """Test function."""
-    handler = zcp.PyTreeCheckpointHandler(aggregate_filename="agg")
-    assert handler
-
-
-def test_standard_checkpoint_handler():
-    """Test function."""
-    handler = zcp.StandardCheckpointHandler(save_concurrent_gb=10)
-    assert handler
-
-
-def test_default_checkpoint_handler_registry():
-    """Test function."""
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
     registry = zcp.DefaultCheckpointHandlerRegistry()
-    registry.add("item", None, None)
-    assert registry.get("item", None) is None
-    assert registry.get_all_entries() == {}
-    assert registry.has("item", None) is False
+    h = zcp.StandardCheckpointHandler()
+    registry.add("state", zcp.args.StandardSave, h)
+    registry.add("state", zcp.args.StandardRestore, h)
+    registry.add("unused", zcp.args.StandardSave, None)
+    assert registry.has("state", zcp.args.StandardSave) is True
+    assert registry.get("state", zcp.args.StandardSave) is h
+
+    with pytest.raises(ValueError, match="already registered"):
+        registry.add("state", zcp.args.StandardSave, h, override=False)
+    registry.add("state", zcp.args.StandardSave, zcp.StandardCheckpointHandler, override=True)
+
+    copied = zcp.DefaultCheckpointHandlerRegistry(other_registry=registry)
+    assert copied.has("state", zcp.args.StandardSave) is True
+
+    comp = zcp.CompositeCheckpointHandler(
+        "state",
+        handler_registry=copied,
+        meta=zcp.JsonCheckpointHandler(),
+    )
+    assert "state" in comp.item_names
+    assert "meta" in comp.item_names
+
+    comp.save(None, {"state": {"x": 1}})
+    assert comp.async_save(None, {"state": {"x": 1}}) is None
+    assert comp.restore(None) is None
+    assert comp.structure(None) is None
+    assert comp.metadata(None) is None
+
+    futs = comp.async_save(
+        tmp_path,
+        zcp.args.Composite(
+            state=zcp.args.StandardSave({"w": [1, 2]}),
+            meta=zcp.args.JsonSave({"version": 3}),
+            extra={"raw": 99},
+        ),
+    )
+    assert futs is not None
+    for f in futs:
+        f.result()
+    comp.finalize(tmp_path)
+    assert comp.metadata(tmp_path) is not None
+    assert comp.structure(tmp_path) == {
+        "state": {"w": [1, 2]},
+        "meta": {"version": 3},
+        "extra": {"raw": 99},
+    }
+    comp.close()

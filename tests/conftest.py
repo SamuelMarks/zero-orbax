@@ -1,16 +1,19 @@
-"""Provide module docstring."""
+"""Pytest configuration and path setup for the zero-orbax test suite."""
 
-import pytest
-import sys
+from __future__ import annotations
+
 import os
+import sys
 
-sys.path.insert(
-    0,
-    os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "../../ml-switcheroo-compiler/src")
-    ),
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_SIBLING_PATHS = (
+    os.path.join(_REPO_ROOT, "src"),
+    os.path.join(_REPO_ROOT, "..", "ml-switcheroo-ir", "src"),
+    os.path.join(_REPO_ROOT, "..", "ml-ecosystem-snapshots", "src"),
+    os.path.join(_REPO_ROOT, "..", "ml-switcheroo-compiler", "src"),
+    os.path.join(_REPO_ROOT, "..", "zero-jax", "src"),
 )
-sys.path.insert(
-    0,
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "../../zero-jax/src")),
-)
+
+for _path in reversed(_SIBLING_PATHS):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)

@@ -1,10 +1,12 @@
 """zero_orbax framework root module.
 
-This module exports the main public APIs, such as the `checkpoint` submodule,
-which provides functionality for saving and restoring machine learning models
-and their associated states.
+This module exports the main public APIs, including the ``checkpoint`` submodule,
+``core`` storage and synchronization primitives, and ``types`` protocols for
+saving and restoring machine learning models and their associated states.
 """
 
-from zero_orbax import checkpoint
+from __future__ import annotations
 
-__all__ = ["checkpoint"]
+from zero_orbax import checkpoint, core, types
+
+__all__ = ["checkpoint", "core", "types"]

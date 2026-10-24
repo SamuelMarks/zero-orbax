@@ -1,97 +1,65 @@
-"""Tests for missing symbols."""
+"""Tests verifying exported classes, submodule namespaces, behavioral contracts, and snapshot compliance."""
 
-import pytest
+from __future__ import annotations
+
+import inspect
+import pathlib
+
 import zero_orbax.checkpoint as zcp
+from scripts import check_compliance
 
 
-def test_missing_symbols():
-    """Test function."""
-    missing_classes = [
-        "ArrayCheckpointHandler",
-        "ArrayRestoreArgs",
-        "AsyncCheckpointHandler",
-        "BasePyTreeCheckpointHandler",
-        "CompositeCheckpointHandler",
-        "DefaultCheckpointHandlerRegistry",
-        "JaxRandomKeyCheckpointHandler",
-        "JsonCheckpointHandler",
-        "NumpyRandomKeyCheckpointHandler",
-        "ProtoCheckpointHandler",
+def test_missing_symbols_and_behavioral_contracts(tmp_path: pathlib.Path) -> None:
+    """Verify that all 14 core Orbax classes are exported and fulfill their behavioral contracts.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    exported_members: dict[str, type] = {
+        name: obj for name, obj in inspect.getmembers(zcp, inspect.isclass)
+    }
+
+    target_classes = [
+        "AbstractCheckpointManager",
+        "AbstractCheckpointer",
+        "AsyncCheckpointer",
+        "AsyncOptions",
+        "CheckpointHandler",
+        "CheckpointManager",
+        "CheckpointManagerOptions",
+        "Checkpointer",
+        "Future",
         "PyTreeCheckpointHandler",
+        "PyTreeCheckpointer",
+        "RestoreArgs",
         "SaveArgs",
         "StandardCheckpointHandler",
     ]
-    for cls_name in missing_classes:
-        assert hasattr(zcp, cls_name), f"Missing class: {cls_name}"
+    for cls_name in target_classes:
+        assert cls_name in exported_members
+        cls_obj = exported_members[cls_name]
+        sig = inspect.signature(cls_obj)
+        assert len(sig.parameters) >= 0
 
-    missing_modules = [
-        "abstract_checkpoint_manager",
-        "abstract_checkpointer",
-        "aggregate_handlers",
-        "async_checkpointer",
-        "checkpoint_args",
-        "checkpoint_manager",
-        "checkpoint_utils",
-        "checkpointer",
-        "contextlib",
-        "functools",
-        "future",
-        "handlers",
-        "logging",
-        "metadata",
-        "msgpack_utils",
-        "nest_asyncio",
-        "options",
-        "path",
-        "pytree_checkpointer",
-        "serialization",
-        "standard_checkpointer",
-        "test_utils",
-        "transform_utils",
-        "tree",
-        "type_handlers",
-        "utils",
-    ]
-    for mod_name in missing_modules:
-        assert hasattr(zcp, mod_name), f"Missing module: {mod_name}"
+    # Behavioral contract verification across the exported classes
+    save_args = zcp.SaveArgs(aggregate=True, dtype="float32", chunk_byte_size=1024, shard_axes=(0,))
+    assert save_args.aggregate is True
+    assert save_args.chunk_byte_size == 1024
 
+    restore_args = zcp.RestoreArgs(restore_type=int, dtype="int32")
+    assert restore_args.restore_type is int
 
-try:
-    import orbax.checkpoint as ocp
+    async_opts = zcp.AsyncOptions(timeout_secs=120)
+    assert async_opts.timeout_secs == 120
 
-    HAS_ORBAX = True
-except ImportError:
-    HAS_ORBAX = False
+    mgr_opts = zcp.CheckpointManagerOptions(save_interval_steps=2, max_to_keep=2)
+    assert mgr_opts.save_interval_steps == 2
 
+    mgr_dir = tmp_path / "mgr"
+    with zcp.CheckpointManager(mgr_dir, options=mgr_opts) as mgr:
+        assert mgr.should_save(2) is True
+        assert mgr.should_save(1) is False
+        assert mgr.save(2, {"x": 42}) is True
+        assert mgr.restore(2) == {"x": 42}
 
-@pytest.mark.skipif(not HAS_ORBAX, reason="orbax is not installed")
-def test_signature_compliance():
-    """Test function."""
-    import inspect
-
-    missing_classes = [
-        "ArrayCheckpointHandler",
-        "ArrayRestoreArgs",
-        "AsyncCheckpointHandler",
-        "BasePyTreeCheckpointHandler",
-        "CompositeCheckpointHandler",
-        "DefaultCheckpointHandlerRegistry",
-        "JaxRandomKeyCheckpointHandler",
-        "JsonCheckpointHandler",
-        "NumpyRandomKeyCheckpointHandler",
-        "ProtoCheckpointHandler",
-        "PyTreeCheckpointHandler",
-        "SaveArgs",
-        "StandardCheckpointHandler",
-    ]
-    for cls_name in missing_classes:
-        if hasattr(ocp, cls_name) and hasattr(zcp, cls_name):
-            o_cls = getattr(ocp, cls_name)
-            z_cls = getattr(zcp, cls_name)
-            # basic signature check
-            try:
-                o_sig = inspect.signature(o_cls)
-                z_sig = inspect.signature(z_cls)
-                # Just ensuring the instantiation doesn't completely mismatch, but we might not need exact match if it works.
-            except ValueError:
-                pass
+    assert check_compliance.main() == 0

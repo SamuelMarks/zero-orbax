@@ -1,29 +1,107 @@
-"""AST parser to ensure no disallowed 3rd party imports."""
+"""AST parser to ensure no disallowed 3rd party imports exist in zero-orbax source files."""
+
+from __future__ import annotations
 
 import ast
+import pkgutil
 import sys
-import os
+from collections.abc import Sequence
 
-ALLOWED_3RD_PARTY = {"pydantic"}
-ALLOWED_INTERNAL = {
-    "cdd",
-    "ml_switcheroo_ir",
-    "ml_switcheroo_compiler",
-    "zero_jax",
-    "zero_orbax",
-}
+ALLOWED_3RD_PARTY: frozenset[str] = frozenset({"pydantic", "typing_extensions"})
+ALLOWED_INTERNAL: frozenset[str] = frozenset(
+    {
+        "cdd",
+        "ml_switcheroo_ir",
+        "ml_switcheroo_compiler",
+        "ml_ecosystem_snapshots",
+        "zero_jax",
+        "zero_orbax",
+    }
+)
 
 
-def check_file(filepath: str) -> bool:
-    """Check a file for disallowed imports.
-
-    Args:
-        filepath (str): The file to check.
+def _default_stdlib_names() -> frozenset[str]:
+    """Build the set of standard library module names across Python versions.
 
     Returns:
-        bool: True if clean, False otherwise.
+        frozenset[str]: Standard library module names.
     """
-    with open(filepath, "r", encoding="utf-8") as f:
+    names: set[str] = set(sys.builtin_module_names)
+    for mod in pkgutil.iter_modules():
+        if "site-packages" not in str(mod.module_finder):
+            names.add(mod.name)
+    names.update(
+        {
+            "abc",
+            "argparse",
+            "ast",
+            "asyncio",
+            "collections",
+            "contextlib",
+            "copy",
+            "dataclasses",
+            "datetime",
+            "enum",
+            "functools",
+            "inspect",
+            "io",
+            "itertools",
+            "json",
+            "logging",
+            "math",
+            "os",
+            "pathlib",
+            "pkgutil",
+            "re",
+            "shutil",
+            "struct",
+            "subprocess",
+            "sys",
+            "tempfile",
+            "threading",
+            "time",
+            "types",
+            "typing",
+            "unittest",
+            "uuid",
+            "warnings",
+        }
+    )
+    return frozenset(names)
+
+
+DEFAULT_STDLIB_NAMES: frozenset[str] = _default_stdlib_names()
+
+
+def _is_allowed_module(base_module: str, stdlib_names: frozenset[str]) -> bool:
+    """Check whether an imported root module name is permitted.
+
+    Args:
+        base_module: Top-level package name extracted from an import node.
+        stdlib_names: Set of standard library module names.
+
+    Returns:
+        bool: True if the module is allowed, False otherwise.
+    """
+    return (
+        base_module in ALLOWED_3RD_PARTY
+        or base_module in ALLOWED_INTERNAL
+        or base_module in stdlib_names
+    )
+
+
+def check_file(filepath: str, stdlib_names: frozenset[str] | None = None) -> bool:
+    """Check a Python source file for disallowed third-party imports.
+
+    Args:
+        filepath: Path to the Python file to inspect.
+        stdlib_names: Optional override set of standard library module names. Defaults to None.
+
+    Returns:
+        bool: True if the file contains only allowed imports, False if violations or syntax errors occur.
+    """
+    active_stdlib = stdlib_names if stdlib_names is not None else DEFAULT_STDLIB_NAMES
+    with open(filepath, encoding="utf-8") as f:
         source = f.read()
 
     try:
@@ -32,69 +110,42 @@ def check_file(filepath: str) -> bool:
         print(f"Syntax error in {filepath}")
         return False
 
-    errors = []
+    errors: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 base_module = alias.name.split(".")[0]
-                if (
-                    base_module not in ALLOWED_3RD_PARTY
-                    and base_module not in ALLOWED_INTERNAL
-                    and base_module not in sys.stdlib_module_names
-                ):
+                if not _is_allowed_module(base_module, active_stdlib):
                     errors.append((node.lineno, base_module))
         elif isinstance(node, ast.ImportFrom):
-            if node.level > 0:  # Relative import
-                continue
-            if node.module:
+            if node.level == 0 and node.module:
                 base_module = node.module.split(".")[0]
-                if (
-                    base_module not in ALLOWED_3RD_PARTY
-                    and base_module not in ALLOWED_INTERNAL
-                    and base_module not in sys.stdlib_module_names
-                ):
+                if not _is_allowed_module(base_module, active_stdlib):
                     errors.append((node.lineno, base_module))
 
     if errors:
         for lineno, module in errors:
-            print(
-                f"{filepath}:{lineno}: Disallowed 3rd party import detected: '{module}'"
-            )
+            print(f"{filepath}:{lineno}: Disallowed 3rd party import detected: '{module}'")
         return False
     return True
 
 
-if __name__ == "__main__":
-    if not hasattr(sys, "stdlib_module_names"):
-        # Polyfill for python < 3.10
-        import sysconfig
-        import pathlib
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the allowed-imports check across CLI file arguments.
 
-        try:
-            from stdlib_list import stdlib_list
+    Args:
+        argv: Optional sequence of file paths to inspect. Defaults to ``sys.argv[1:]``.
 
-            names = set(stdlib_list(".".join(map(str, sys.version_info[:2]))))
-        except ImportError:
-            # Fallback
-            import distutils.sysconfig as ds
-
-            stdlib_paths = [ds.get_python_lib(standard_lib=True)]
-            names = set(sys.builtin_module_names)
-            for p in stdlib_paths:
-                path = pathlib.Path(p)
-                if path.exists():
-                    for item in path.iterdir():
-                        if item.is_file() and item.suffix == ".py":
-                            names.add(item.stem)
-                        elif item.is_dir():
-                            names.add(item.name)
-        sys.stdlib_module_names = frozenset(names)
-
+    Returns:
+        int: Exit code (0 if all files pass, 1 if any file fails).
+    """
+    args_list = list(argv) if argv is not None else sys.argv[1:]
     success = True
-    for arg in sys.argv[1:]:
-        if arg.endswith(".py"):
-            if not check_file(arg):
-                success = False
+    for arg in args_list:
+        if arg.endswith(".py") and not check_file(arg):
+            success = False
+    return 0 if success else 1
 
-    if not success:
-        sys.exit(1)
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,33 +1,48 @@
+"""Generate the structural API snapshot JSON for orbax.checkpoint / zero_orbax.checkpoint."""
+
+from __future__ import annotations
+
 import json
-import inspect
+import sys
 import types
-import orbax.checkpoint as ocp
+
+from scripts.check_compliance import dump_api
 
 
-def dump_api(module):
-    api = {}
-    for name in dir(module):
-        if name.startswith("_") and name not in ("__version__",):
-            continue
-        obj = getattr(module, name)
+def generate_snapshot_to_file(
+    module: types.ModuleType,
+    output_path: str = "tests/orbax_api_snapshot.json",
+) -> dict[str, dict[str, str | list[str]]]:
+    """Introspect ``module`` and write its API snapshot dictionary to ``output_path``.
 
-        if inspect.isclass(obj):
-            methods = []
-            for m_name in dir(obj):
-                if not m_name.startswith("_") and callable(getattr(obj, m_name)):
-                    methods.append(m_name)
-            api[name] = {"type": "class", "methods": methods}
-        elif isinstance(obj, types.ModuleType):
-            api[name] = {"type": "namespace"}
-        elif inspect.isfunction(obj) or inspect.isbuiltin(obj):
-            api[name] = {"type": "function"}
-        else:
-            api[name] = {"type": "other"}
-    return api
+    Args:
+        module: Module to introspect (e.g. ``zero_orbax.checkpoint`` or ``orbax.checkpoint``).
+        output_path: Destination JSON file path. Defaults to ``"tests/orbax_api_snapshot.json"``.
+
+    Returns:
+        dict[str, dict[str, str | list[str]]]: The generated snapshot dictionary.
+    """
+    snapshot = dump_api(module)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(snapshot, f, indent=2, sort_keys=True)
+    print("Snapshot generated.")
+    return snapshot
 
 
-snapshot = dump_api(ocp)
-with open("tests/orbax_api_snapshot.json", "w") as f:
-    json.dump(snapshot, f, indent=2)
+def main(output_path: str = "tests/orbax_api_snapshot.json") -> int:
+    """Generate the API snapshot from ``zero_orbax.checkpoint`` and write to disk.
 
-print("Snapshot generated.")
+    Args:
+        output_path: Destination JSON file path. Defaults to ``"tests/orbax_api_snapshot.json"``.
+
+    Returns:
+        int: Process exit code (always 0).
+    """
+    import zero_orbax.checkpoint as ocp
+
+    generate_snapshot_to_file(ocp, output_path=output_path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

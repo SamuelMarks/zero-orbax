@@ -152,6 +152,10 @@
       "save"
     ]
   },
+  "CompositeOptions": {
+    "type": "class",
+    "methods": []
+  },
   "DefaultCheckpointHandlerRegistry": {
     "type": "class",
     "methods": [

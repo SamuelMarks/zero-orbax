@@ -9,51 +9,63 @@ repos:
         pass_filenames: false
 
       - id: ruff-check
-        name: Ruff Check (Fix)
+        name: Ruff Check
         entry: ruff check --fix .
         language: system
         types: [python]
         pass_filenames: false
 
-      - id: pytest-coverage
-        name: Run Pytest Coverage
-        entry: env PYTHONPATH=src pytest --cov=src --cov-report=term-missing
+      - id: mypy
+        name: Mypy Strict Type Check
+        entry: mypy --strict src tests scripts
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      - id: lint-typing
+        name: Lint Strict Typing and Reflection
+        entry: python3 scripts/lint_typing.py
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      - id: interrogate
+        name: Interrogate Docstring Coverage
+        entry: interrogate -vv -f 100 -M -i -c pyproject.toml src scripts tests
         language: system
         types: [python]
         pass_filenames: false
 
       - id: check-docs
-        name: Check Documentation Coverage
+        name: Check 100% Granular Docstrings
         entry: python3 scripts/check_docs.py
         language: system
         types: [python]
         pass_filenames: false
 
-      - id: update-badges
-        name: Update Coverage Shields
-        entry: python3 scripts/update_badges.py
+      - id: check-allowed-imports
+        name: Check Allowed 3rd Party Imports
+        entry: python3 scripts/check_allowed_imports.py src/zero_orbax/__init__.py src/zero_orbax/types.py src/zero_orbax/core.py src/zero_orbax/checkpoint.py
         language: system
         types: [python]
         pass_filenames: false
-
-      - id: check-allowed-imports
-        name: Check Disallowed 3rd Party Imports
-        entry: python3 scripts/check_allowed_imports.py
-        language: system
-        types: [python]
-        exclude: ^(tests/|scripts/)
-        pass_filenames: true
-
 
       - id: check-api-compliance
-        name: Check API Conformance
-        entry: env PYTHONPATH=src:../ml-switcheroo-compiler/src python3 scripts/check_compliance.py
+        name: Check API Compliance
+        entry: python3 scripts/check_compliance.py
         language: system
-        files: ^(SEMANTIC_PLAN\.md|src/.*\.py)$
+        types: [python]
         pass_filenames: false
 
-      - id: build
-        name: Build Package
-        entry: python3 -m build
+      - id: pytest-coverage
+        name: Run Tests with 100% Line and Branch Coverage
+        entry: pytest --cov=src/zero_orbax --cov=scripts --cov-branch --cov-report=term-missing --cov-fail-under=100
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      - id: update-badges
+        name: Update Coverage Badges
+        entry: python3 scripts/update_badges.py
         language: system
         pass_filenames: false

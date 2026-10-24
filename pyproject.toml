@@ -7,11 +7,14 @@ name = "zero-orbax"
 version = "0.6.4"
 description = "Zero Orbax implementation"
 authors = [{ name = "SamuelMarks" }]
-requires-python = ">=3.9"
-dynamic = ["dependencies"]
+requires-python = ">=3.10"
+dynamic = ["dependencies", "optional-dependencies"]
 
 [tool.hatch.metadata.hooks.requirements_txt]
 files = ["requirements.txt"]
+
+[tool.hatch.metadata.hooks.requirements_txt.optional-dependencies]
+test = ["requirements-test.txt"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zero_orbax"]
@@ -19,8 +22,91 @@ packages = ["src/zero_orbax"]
 [tool.hatch.metadata]
 allow-direct-references = true
 
-[tool.ruff.lint]
-ignore = ['E402', 'F401', 'F841', 'E741', 'E501']
+[tool.coverage.run]
+branch = true
+source = ["src/zero_orbax", "scripts"]
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+exclude_lines = [
+    'pragma: no cover',
+    'if __name__ == .__main__.:',
+    'if TYPE_CHECKING:',
+    '\.\.\.',
+]
 
 [tool.pytest.ini_options]
-addopts = "--cov=src --cov-fail-under=100"
+addopts = "--cov=src/zero_orbax --cov=scripts --cov-branch --cov-report=term-missing --cov-fail-under=100"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "D"]
+ignore = ["E501", "D203", "D213"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.interrogate]
+ignore-init-method = false
+ignore-init-module = false
+ignore-magic = false
+ignore-module = false
+ignore-private = false
+ignore-semiprivate = false
+ignore-nested-classes = false
+ignore-overloaded-functions = true
+fail-under = 100
+verbose = 2
+
+[tool.mypy]
+python_version = "3.10"
+mypy_path = "src"
+files = ["src", "tests", "scripts"]
+plugins = ["pydantic.mypy"]
+strict = true
+disallow_any_explicit = true
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+warn_unreachable = true
+strict_equality = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[[tool.mypy.overrides]]
+module = ["tests", "tests.*"]
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+module = ["tests.official.*"]
+disallow_subclassing_any = false
+
+[[tool.mypy.overrides]]
+module = [
+    "absl.*",
+    "ml_switcheroo_ir.*",
+    "ml_switcheroo_compiler.*",
+    "ml_ecosystem_snapshots.*",
+    "orbax.*",
+    "pytest",
+    "_pytest.*",
+]
+ignore_missing_imports = true
+follow_imports = "skip"
+follow_imports_for_stubs = true
+disable_error_code = ["import-untyped"]

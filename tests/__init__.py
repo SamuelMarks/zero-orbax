@@ -1,1 +1,1 @@
-"""Provide module docstring."""
+"""Test package initialization for zero-orbax."""

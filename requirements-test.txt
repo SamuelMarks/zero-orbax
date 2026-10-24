@@ -1,9 +1,7 @@
 pytest
 pytest-cov
+mypy
+ruff
+interrogate
+pydantic
 absl-py
-jax
-jaxlib
-flax
-numpy
-tensorstore
-etils
