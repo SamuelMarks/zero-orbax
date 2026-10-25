@@ -1,5 +1,7 @@
 pydantic
 ml-switcheroo-ir @ git+https://github.com/SamuelMarks/ml-switcheroo-ir.git@master
 ml-switcheroo-compiler @ git+https://github.com/SamuelMarks/ml-switcheroo-compiler.git@master
+griffelib @ git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffelib
+griffecli @ git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffecli
 ml-ecosystem-snapshots @ https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.4/ml_ecosystem_snapshots-0.0.4-py3-none-any.whl
 zero-jax @ git+https://github.com/SamuelMarks/zero-jax.git@master

@@ -11,11 +11,13 @@ import dataclasses
 import datetime
 import os
 import pathlib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Optional, Protocol, Union, runtime_checkable
 from typing_extensions import TypeAlias, TypeGuard
 
+from ml_switcheroo_compiler.core.tensor import Tensor as CompilerTensor
 from ml_switcheroo_ir import AttributeValue, DType, LogicalGraph, LogicalMesh, PartitionSpec
+from zero_grain._types import CheckpointStateDict
 
 
 @runtime_checkable
@@ -69,7 +71,25 @@ class ArrayProtocol(Protocol):
         """
         ...
 
+
+@runtime_checkable
+class ToListProtocol(Protocol):
+    """Protocol for array objects providing a ``tolist()`` conversion method."""
+
     def tolist(self) -> PyTree:
+        """Convert the array into nested Python lists or a scalar leaf.
+
+        Returns:
+            PyTree: Nested list or scalar representation.
+        """
+        ...
+
+
+@runtime_checkable
+class ToUnderscoreListProtocol(Protocol):
+    """Protocol for array objects providing a ``to_list()`` conversion method."""
+
+    def to_list(self) -> PyTree:
         """Convert the array into nested Python lists or a scalar leaf.
 
         Returns:
@@ -100,12 +120,159 @@ class GraphProtocol(Protocol):
     outputs: list[str]
 
 
-PyTreeLeaf: TypeAlias = Union[ScalarLeaf, ArrayProtocol, LogicalGraph, GraphProtocol]
+@runtime_checkable
+class FlaxVariableProtocol(Protocol):
+    """Protocol matching ``zero_flax.nnx.Variable`` containers."""
+
+    value: PyTree
+
+    @property
+    def metadata(self) -> Mapping[str, PyTree]:
+        """Return the variable metadata mapping.
+
+        Returns:
+            Mapping[str, PyTree]: Metadata dictionary attached to the variable.
+        """
+        ...
+
+    def copy(self) -> FlaxVariableProtocol:
+        """Return a shallow copy of the variable container.
+
+        Returns:
+            FlaxVariableProtocol: Copied variable instance.
+        """
+        ...
+
+    def replace(self, value: PyTree = None, **kwargs: PyTree) -> FlaxVariableProtocol:
+        """Return a new variable container with updated value or metadata.
+
+        Args:
+            value: Replacement value. Defaults to None.
+            **kwargs: Additional metadata key-value overrides.
+
+        Returns:
+            FlaxVariableProtocol: Updated variable instance.
+        """
+        ...
+
+
+@runtime_checkable
+class FlaxStateProtocol(Protocol):
+    """Protocol matching ``zero_flax.nnx.State`` hierarchical mappings."""
+
+    def flat_state(self) -> Mapping[str, PyTree]:
+        """Flatten nested state dictionaries into a dot-separated path mapping.
+
+        Returns:
+            Mapping[str, PyTree]: Flattened state dictionary.
+        """
+        ...
+
+    def items(self) -> Iterable[tuple[str, PyTree]]:
+        """Return an iterable of ``(key, value)`` state entries.
+
+        Returns:
+            Iterable[tuple[str, PyTree]]: Key-value pairs in the state.
+        """
+        ...
+
+
+@runtime_checkable
+class FrozenDictProtocol(Protocol):
+    """Protocol matching ``zero_flax.core.FrozenDict`` immutable mappings."""
+
+    def unfreeze(self) -> Mapping[str, PyTree]:
+        """Return a mutable dictionary copy of this frozen mapping.
+
+        Returns:
+            Mapping[str, PyTree]: Mutable dictionary copy.
+        """
+        ...
+
+    def items(self) -> Iterable[tuple[str, PyTree]]:
+        """Return an iterable of ``(key, value)`` entries.
+
+        Returns:
+            Iterable[tuple[str, PyTree]]: Key-value pairs.
+        """
+        ...
+
+
+@runtime_checkable
+class NamedTupleProtocol(Protocol):
+    """Protocol matching ``NamedTuple`` and ``zero_optax`` optimizer state containers."""
+
+    @property
+    def _fields(self) -> tuple[str, ...]:
+        """Return the ordered tuple of field names.
+
+        Returns:
+            tuple[str, ...]: Field names tuple.
+        """
+        ...
+
+    def _asdict(self) -> Mapping[str, PyTree]:
+        """Return an ordered mapping of field names to field values.
+
+        Returns:
+            Mapping[str, PyTree]: Field-to-value mapping.
+        """
+        ...
+
+    @classmethod
+    def _make(cls, iterable: Sequence[PyTree]) -> NamedTupleProtocol:
+        """Construct a new state instance from a sequence of field values matching ``_fields``.
+
+        Args:
+            iterable: Ordered field values matching ``_fields``.
+
+        Returns:
+            NamedTupleProtocol: Reconstructed state container instance.
+        """
+        ...
+
+
+OptStateProtocol: TypeAlias = NamedTupleProtocol
+
+
+@runtime_checkable
+class GrainIteratorProtocol(Protocol):
+    """Protocol matching ``zero_grain`` ``DataLoaderIterator`` and ``DatasetIterator``."""
+
+    def get_state(self) -> CheckpointStateDict:
+        """Return the current serializable iterator checkpoint state.
+
+        Returns:
+            CheckpointStateDict: Iterator state dictionary.
+        """
+        ...
+
+    def set_state(self, state: CheckpointStateDict) -> None:
+        """Restore the iterator to a previously saved checkpoint state.
+
+        Args:
+            state: Checkpoint state dictionary produced by ``get_state()``.
+        """
+        ...
+
+
+PyTreeLeaf: TypeAlias = Union[
+    ScalarLeaf,
+    ArrayProtocol,
+    CompilerTensor,
+    FlaxVariableProtocol,
+    GrainIteratorProtocol,
+    LogicalGraph,
+    GraphProtocol,
+]
 PyTreeDict: TypeAlias = dict[str, "PyTree"]
 PyTreeList: TypeAlias = list["PyTree"]
 PyTreeTuple: TypeAlias = tuple["PyTree", ...]
 PyTree: TypeAlias = Union[
     PyTreeLeaf,
+    FlaxStateProtocol,
+    FrozenDictProtocol,
+    NamedTupleProtocol,
     PyTreeDict,
     PyTreeList,
     PyTreeTuple,
@@ -113,6 +280,26 @@ PyTree: TypeAlias = Union[
     Sequence["PyTree"],
     AttributeValue,
 ]
+
+
+def array_to_nested_list(value: ArrayProtocol) -> PyTree:
+    """Convert an ``ArrayProtocol`` instance into nested Python lists or a scalar leaf.
+
+    Args:
+        value: Array or tensor instance implementing ``ArrayProtocol``.
+
+    Returns:
+        PyTree: Nested Python list or scalar value.
+    """
+    if isinstance(value, ToListProtocol):
+        return value.tolist()
+    if isinstance(value, ToUnderscoreListProtocol):
+        return value.to_list()
+    if isinstance(value, CompilerTensor):
+        if value.ndim == 0:
+            return value.item()
+        return [array_to_nested_list(sub) for sub in value]
+    return []
 
 
 def is_scalar_leaf(value: PyTree) -> TypeGuard[ScalarLeaf]:
@@ -160,7 +347,7 @@ def is_array_protocol(value: PyTree) -> TypeGuard[ArrayProtocol]:
     Returns:
         TypeGuard[ArrayProtocol]: True if the value implements ``ArrayProtocol``.
     """
-    return isinstance(value, ArrayProtocol)
+    return isinstance(value, ArrayProtocol) and not isinstance(value, FlaxVariableProtocol)
 
 
 def normalize_path(path: PathLike) -> pathlib.Path:
@@ -386,6 +573,17 @@ class TypeHandlerRegistryProtocol(Protocol):
         """
         ...
 
+    def get_by_typestr(self, typestr: str) -> TypeHandlerProtocol | None:
+        """Retrieve a registered handler by its ``typestr()`` identifier.
+
+        Args:
+            typestr: Canonical type identifier string.
+
+        Returns:
+            TypeHandlerProtocol | None: Matching type handler, or None if not found.
+        """
+        ...
+
 
 @dataclasses.dataclass
 class MultiprocessingOptions:
@@ -497,6 +695,10 @@ __all__ = [
     "CompositeOptions",
     "DType",
     "FileOptions",
+    "FlaxStateProtocol",
+    "FlaxVariableProtocol",
+    "FrozenDictProtocol",
+    "GrainIteratorProtocol",
     "GraphProtocol",
     "IsPrioritizedKeyFn",
     "JsonScalar",
@@ -506,6 +708,8 @@ __all__ = [
     "MemoryLimitOptions",
     "MultiValueTransformFn",
     "MultiprocessingOptions",
+    "NamedTupleProtocol",
+    "OptStateProtocol",
     "PartitionSpec",
     "PathLike",
     "PostFinalizationCallback",
@@ -521,9 +725,12 @@ __all__ = [
     "ShouldKeepFn",
     "ShouldSaveFn",
     "TemporaryPathProtocol",
+    "ToListProtocol",
+    "ToUnderscoreListProtocol",
     "TypeHandlerProtocol",
     "TypeHandlerRegistryProtocol",
     "ValueTransformFn",
+    "array_to_nested_list",
     "is_array_protocol",
     "is_pytree_dict",
     "is_pytree_mapping",

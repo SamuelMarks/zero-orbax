@@ -13,13 +13,22 @@ from zero_orbax.core import (
     FileSystemIO,
     GlobalArraySharding,
     MsgpackEngine,
+    ReconstructedGraphNode,
     SerializedArray,
     TensorStoreDriver,
     VirtualFileSystem,
+    _encode_pytree_to_json_value,
     _pack_msgpack_bytes,
     _unpack_msgpack_bytes,
 )
-from zero_orbax.types import JsonValue, PyTree, is_array_protocol, is_scalar_leaf, normalize_path
+from zero_orbax.types import (
+    GraphProtocol,
+    JsonValue,
+    PyTree,
+    is_array_protocol,
+    is_scalar_leaf,
+    normalize_path,
+)
 
 
 class SampleArray:
@@ -148,18 +157,18 @@ def test_filesystem_io_local_and_virtual(tmp_path: pathlib.Path) -> None:
     io.remove(local_dir)
     assert not io.exists(local_dir)
 
-    # Virtual GCS/S3/memory URI paths
-    gcs_dir = "gs://test-bucket/checkpoints"
-    gcs_file = "gs://test-bucket/checkpoints/step_1/state.bin"
+    # Virtual GCS/S3/memory URI paths and trailing/duplicate slash normalization
+    gcs_dir = "gs://test-bucket//checkpoints/"
+    gcs_file = "gs://test-bucket/checkpoints//step_1/state.bin/"
     io.write("gs://other-bucket/unrelated.bin", b"other")
     io.makedirs(gcs_dir)
     assert not io.exists("gs://test-bucket/nonexistent")
     assert io.read("gs://test-bucket/nonexistent") == b""
     io.write(gcs_file, b"virtual_payload")
-    assert io.exists(gcs_file)
-    assert io.exists(gcs_dir)
-    assert io.read(gcs_file) == b"virtual_payload"
-    assert io.listdir(gcs_dir) == ["step_1"]
+    assert io.exists("gs://test-bucket/checkpoints/step_1/state.bin")
+    assert io.exists("gs://test-bucket/checkpoints")
+    assert io.read("gs://test-bucket/checkpoints/step_1/state.bin") == b"virtual_payload"
+    assert io.listdir("gs://test-bucket/checkpoints") == ["step_1"]
     assert io.listdir(tmp_path / "nonexistent_local_dir") == []
     io.remove(gcs_dir)
     assert not io.exists(gcs_file)
@@ -213,6 +222,13 @@ def test_tensorstore_driver(tmp_path: pathlib.Path) -> None:
     ts2 = TensorStoreDriver(vfs=vfs)
     ts2.open({"driver": "zarr", "path": str(disk_path)})
     assert ts2.read_tensor() == [10, 20, 30]
+    coerced_arr = ts2.read_tensor(dtype="float64", shape=(3,))
+    assert isinstance(coerced_arr, SerializedArray)
+    assert coerced_arr.dtype == "float64"
+    assert coerced_arr.shape == (3,)
+    assert coerced_arr == [10, 20, 30]
+    assert coerced_arr == SerializedArray([10, 20, 30], shape=(3,), dtype="float64")
+    assert ts2.read_tensor(dtype="int64") == [10, 20, 30]
 
     ts3 = TensorStoreDriver(vfs=vfs)
     ts3.open({"driver": "zarr", "kvstore": {"driver": "file", "path": str(disk_path)}})
@@ -224,12 +240,14 @@ def test_tensorstore_driver(tmp_path: pathlib.Path) -> None:
     ts4.open({"driver": "zarr", "kvstore": {"path": mem_uri}})
     typed_res = ts4.read_tensor(dtype="float32", shape=(2, 2))
     assert typed_res == {"val": 1, "dtype": "float32", "shape": [2, 2]}
+    assert ts4.read_tensor(dtype="float32") == {"val": 1, "dtype": "float32"}
+    assert ts4.read_tensor(shape=(2, 2)) == {"val": 1, "shape": [2, 2]}
 
     ts5 = TensorStoreDriver(vfs=vfs)
     mem_direct = "memory://ts_direct/array.ts"
-    FileSystemIO(vfs=vfs).write(mem_direct, MsgpackEngine().packb([1, 2]))
+    FileSystemIO(vfs=vfs).write(mem_direct, MsgpackEngine().packb(123))
     ts5.open({"path": mem_direct})
-    assert ts5.read_tensor() == [1, 2]
+    assert ts5.read_tensor(dtype="int32") == 123
 
     ts6 = TensorStoreDriver(vfs=vfs)
     ts6.open({})
@@ -239,9 +257,10 @@ def test_tensorstore_driver(tmp_path: pathlib.Path) -> None:
 
 
 def test_msgpack_engine_roundtrips_and_binary_framing() -> None:
-    """Test MsgpackEngine RFC 8949 binary framing across all integer/string/array/map sizes and types."""
+    """Test MsgpackEngine RFC 8949 binary framing across all integer/string/bin/array/map sizes and types."""
     engine = MsgpackEngine()
-    assert engine.packb(None) == b""
+    assert engine.packb(None) == b"\xc0"
+    assert engine.unpackb(b"\xc0") is None
     assert engine.unpackb(b"") is None
     assert engine.unpackb(b"\xff\xfe\xfd_invalid") is None
     assert engine.unpackb(b"\xc1_invalid_marker") is None
@@ -252,15 +271,28 @@ def test_msgpack_engine_roundtrips_and_binary_framing() -> None:
     assert packed_empty == b"\x80"
     assert engine.unpackb(packed_empty) == {}
 
-    # Legacy _MSGPACK_MAGIC and plain JSON backward compatibility
+    # Legacy _MSGPACK_MAGIC and plain JSON backward compatibility (including legacy hex bytes & array)
     assert engine.unpackb(b'\x93ZMPK{"legacy":1}') == {"legacy": 1}
-    assert engine.unpackb(b'{"plain_json": true}') == {"plain_json": True}
+    assert engine.unpackb(b'{"__ztype__": "bytes", "hex": "0102"}') == b"\x01\x02"
+    preserving_engine = MsgpackEngine(preserve_array=True)
+    legacy_arr = preserving_engine.unpackb(
+        b'{"__ztype__": "array", "shape": [2], "dtype": "int32", "data": [1, 2], "hex": "0102"}'
+    )
+    assert isinstance(legacy_arr, SerializedArray)
+    assert legacy_arr.tobytes() == b"\x01\x02"
+
+    with pytest.raises(TypeError, match="Unsupported PyTree node type"):
+        bad_dict: dict[str, PyTree] = {}
+        object_map: dict[str, UnsupportedCustomObj] = {"bad": UnsupportedCustomObj()}
+        bad_dict.update(object_map)  # runtime dict contains UnsupportedCustomObj
+        _encode_pytree_to_json_value(bad_dict)
 
     graph = LogicalGraph(
         name="test_graph",
         nodes={"n1": LogicalNode(id="n1", op_type="Add")},
     )
     arr = SampleArray([4, 5, 6], shape=(3,), dtype="int32")
+    sample_graph_proto = SampleGraphObj()
     complex_tree: PyTree = {
         "int_pos": 7,
         "int_neg_fix": -10,
@@ -279,13 +311,15 @@ def test_msgpack_engine_roundtrips_and_binary_framing() -> None:
         "str_short": "orbax",
         "str8": "a" * 100,
         "str16": "b" * 300,
-        "bytes": b"\x00\x01\xff",
+        "bin8": b"\x00\x01\xff",
+        "bin16": b"x" * 300,
+        "bin32": b"y" * 70000,
         "complex": 3.0 - 4.0j,
         "tuple": (1, "two", b"three"),
         "list": [10, 20],
         "array": arr,
         "graph": graph,
-        "graph_proto": SampleGraphObj(),
+        "graph_proto": sample_graph_proto,
     }
     packed = engine.packb(complex_tree)
     unpacked = engine.unpackb(packed)
@@ -307,17 +341,24 @@ def test_msgpack_engine_roundtrips_and_binary_framing() -> None:
     assert unpacked["str_short"] == "orbax"
     assert unpacked["str8"] == "a" * 100
     assert unpacked["str16"] == "b" * 300
-    assert unpacked["bytes"] == b"\x00\x01\xff"
+    assert unpacked["bin8"] == b"\x00\x01\xff"
+    assert unpacked["bin16"] == b"x" * 300
+    assert unpacked["bin32"] == b"y" * 70000
     assert unpacked["complex"] == 3.0 - 4.0j
     assert unpacked["tuple"] == (1, "two", b"three")
     assert unpacked["list"] == [10, 20]
     assert unpacked["array"] == [4, 5, 6]
     assert isinstance(unpacked["graph"], LogicalGraph)
     assert unpacked["graph"].name == "test_graph"
-    assert unpacked["graph_proto"] == {"name": "sample_ir", "inputs": ["x"], "outputs": ["y"]}
+    graph_node = unpacked["graph_proto"]
+    assert isinstance(graph_node, ReconstructedGraphNode)
+    assert isinstance(graph_node, GraphProtocol)
+    assert graph_node.name == "sample_ir"
+    assert graph_node == sample_graph_proto
+    assert graph_node == {"name": "sample_ir", "inputs": ["x"], "outputs": ["y"]}
+    assert graph_node != 123
 
     # Test preserve_array=True reconstructing SerializedArray
-    preserving_engine = MsgpackEngine(preserve_array=True)
     preserved_unpacked = preserving_engine.unpackb(preserving_engine.packb({"arr": arr}))
     assert isinstance(preserved_unpacked, dict)
     restored_arr = preserved_unpacked["arr"]
@@ -351,6 +392,12 @@ def test_msgpack_engine_roundtrips_and_binary_framing() -> None:
     for truncated in (
         b"",
         b"\xa5ab",
+        b"\xc4",
+        b"\xc4\x05ab",
+        b"\xc5\x00",
+        b"\xc5\x00\x05ab",
+        b"\xc6\x00",
+        b"\xc6\x00\x00\x00\x05ab",
         b"\xcb\x00",
         b"\xcc",
         b"\xcd\x00",
@@ -377,7 +424,7 @@ def test_msgpack_engine_roundtrips_and_binary_framing() -> None:
 
 
 def test_msgpack_large_map_and_fallback() -> None:
-    """Test map32 packing and non-dict/list fallback in _pack_msgpack_bytes."""
+    """Test map32 packing in _pack_msgpack_bytes."""
     large_map: dict[str, JsonValue] = {f"k{i}": 1 for i in range(65536)}
     packed = _pack_msgpack_bytes(large_map)
     assert packed[0] == 0xDF
@@ -401,34 +448,64 @@ def test_barrier_sync() -> None:
 
 
 def test_global_array_sharding() -> None:
-    """Test GlobalArraySharding across lists, tuples, ArrayProtocol, PartitionSpec, and LogicalMesh."""
+    """Test GlobalArraySharding across 1D/2D lists, tuples, SerializedArray, PartitionSpec, and LogicalMesh."""
     gas = GlobalArraySharding()
     assert gas.get_local_shard(None, 0) is None
     assert gas.get_local_shard([1, 2, 3, 4], 0, num_hosts=1) == [1, 2, 3, 4]
     assert gas.get_local_shard([], 0, num_hosts=2) == []
+    assert gas.get_local_shard(
+        [[]],
+        0,
+        num_hosts=2,
+        partition_spec=PartitionSpec(axes=(None, "model")),
+        mesh=LogicalMesh(shape={"model": 2}),
+    ) == [[]]
 
     spec = PartitionSpec(axes=(("data",),))
-    mesh = LogicalMesh(shape={"data": 2, "model": 1})
+    mesh = LogicalMesh(shape={"data": 2, "model": 2})
     assert gas.get_local_shard([1, 2, 3, 4], 0, num_hosts=1, partition_spec=spec, mesh=mesh) == [
         1,
         2,
     ]
     spec_str = PartitionSpec(axes=("data",))
     assert gas.get_local_shard(
-        [1, 2, 3, 4], 1, num_hosts=1, partition_spec=spec_str, mesh=mesh
-    ) == [
+        (1, 2, 3, 4), 1, num_hosts=1, partition_spec=spec_str, mesh=mesh
+    ) == (
         3,
         4,
+    )
+    # 2D sharding along axis 1
+    spec_axis1 = PartitionSpec(axes=(None, "model"))
+    mat_2d = [[1, 2, 3, 4], [5, 6, 7, 8]]
+    assert gas.get_local_shard(mat_2d, 0, num_hosts=1, partition_spec=spec_axis1, mesh=mesh) == [
+        [1, 2],
+        [5, 6],
+    ]
+    assert gas.get_local_shard(mat_2d, 1, num_hosts=1, partition_spec=spec_axis1, mesh=mesh) == [
+        [3, 4],
+        [7, 8],
+    ]
+    spec_axis1_tuple = PartitionSpec(axes=(None, ("model",)))
+    assert gas.get_local_shard(
+        mat_2d, 1, num_hosts=1, partition_spec=spec_axis1_tuple, mesh=mesh
+    ) == [
+        [3, 4],
+        [7, 8],
     ]
     spec_none = PartitionSpec(axes=(None,))
     assert gas.get_local_shard(
         [1, 2, 3, 4], 0, num_hosts=1, partition_spec=spec_none, mesh=mesh
     ) == [1, 2, 3, 4]
-    assert gas.get_local_shard([1, 2, 3, 4], 1, num_hosts=2, partition_spec=spec) == [3, 4]
 
     arr = SampleArray([10, 20, 30, 40], shape=(4,), dtype="int32")
     assert gas.get_local_shard(arr, 0, num_hosts=2) == [10, 20]
     assert gas.get_local_shard(arr, 1, num_hosts=2) == [30, 40]
+
+    ser_arr = SerializedArray([[1, 2], [3, 4]], shape=(2, 2), dtype="float32")
+    sharded_ser = gas.get_local_shard(ser_arr, 0, num_hosts=1, partition_spec=spec_axis1, mesh=mesh)
+    assert isinstance(sharded_ser, SerializedArray)
+    assert sharded_ser.shape == (2, 1)
+    assert sharded_ser.tolist() == [[1], [3]]
 
     short_arr = SampleArray([10], shape=(1,), dtype="int32")
     assert gas.get_local_shard(short_arr, 0, num_hosts=2) is short_arr

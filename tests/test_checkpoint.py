@@ -321,3 +321,301 @@ def test_apply_transformations_tuple_path_and_restore_args() -> None:
     res = apply_transformations(orig, trans, {"a": None})
     assert res == {"a": 1}
     assert RestoreArgs(restore_type=int).restore_type is int
+
+
+def test_flax_state_and_frozendict_checkpointing(tmp_path: pathlib.Path) -> None:
+    """Test saving and restoring zero_flax State, Variable, and FrozenDict with zero_chex validation.
+
+    Args:
+        tmp_path: Temporary pytest directory.
+    """
+    import zero_chex as chex
+    from zero_flax.core import FrozenDict
+    import zero_flax.nnx as nnx
+    from zero_jax import numpy as jnp
+    from zero_orbax.checkpoint import (
+        ArrayRestoreArgs,
+        BasePyTreeCheckpointHandler,
+        PyTreeCheckpointHandler,
+        PyTreeCheckpointer,
+        StandardCheckpointer,
+        args,
+    )
+    from zero_orbax.core import SerializedArray
+    from zero_orbax.types import ArrayProtocol, DType, array_to_nested_list
+
+    state = nnx.State(
+        {
+            "kernel": nnx.Param(jnp.array([[1.0, 2.0], [3.0, 4.0]], dtype=jnp.float32), tag="w"),
+            "sub": nnx.State(
+                {
+                    "running_mean": nnx.BatchStat(jnp.array([0.5, -0.5], dtype=jnp.float32)),
+                    "scalar_val": 7,
+                }
+            ),
+        }
+    )
+
+    pt_cp = PyTreeCheckpointer()
+    ckpt_dir = tmp_path / "flax_state_pt"
+    pt_cp.save(ckpt_dir, state)
+
+    restored_no_tmpl = pt_cp.restore(ckpt_dir)
+    assert isinstance(restored_no_tmpl, nnx.State)
+    assert isinstance(restored_no_tmpl["kernel"], nnx.Param)
+    assert restored_no_tmpl["kernel"].metadata.get("tag") == "w"
+    assert isinstance(restored_no_tmpl["sub"], nnx.State)
+    assert isinstance(restored_no_tmpl["sub"]["running_mean"], nnx.BatchStat)
+    chex.assert_trees_all_close(restored_no_tmpl, state)
+
+    target_state = nnx.State(
+        {
+            "kernel": nnx.Param(jnp.zeros((2, 2), dtype=jnp.float32)),
+            "sub": nnx.State(
+                {
+                    "running_mean": nnx.BatchStat(jnp.zeros((2,), dtype=jnp.float32)),
+                    "scalar_val": 0,
+                }
+            ),
+        }
+    )
+    std_cp = StandardCheckpointer()
+    std_dir = tmp_path / "flax_state_std"
+    std_cp.save(std_dir, args.StandardSave(state))
+    restored_with_tmpl = std_cp.restore(std_dir, item=target_state)
+    assert isinstance(restored_with_tmpl, nnx.State)
+    chex.assert_trees_all_close(restored_with_tmpl, state)
+    chex.assert_trees_all_close(target_state, state)
+
+    restore_args_tree: PyTree = {
+        "kernel": ArrayRestoreArgs(shape=(2, 2), dtype="float64", strict=True),
+        "sub": {
+            "running_mean": ArrayRestoreArgs(global_shape=(2,), strict=True),
+            "scalar_val": None,
+        },
+    }
+    handler = PyTreeCheckpointHandler()
+    restored_coerced = handler.restore(std_dir, item=target_state, restore_args=restore_args_tree)
+    assert isinstance(restored_coerced, nnx.State)
+    assert handler.structure(std_dir) is not None
+    assert handler.structure(None) is None
+
+    fd = FrozenDict(
+        {
+            "weights": jnp.array([10.0, 20.0], dtype=jnp.float32),
+            "nested": FrozenDict({"bias": jnp.array([1.0], dtype=jnp.float32)}),
+            "var_leaf": nnx.Cache(jnp.array([2.0], dtype=jnp.float32)),
+        }
+    )
+    fd_dir = tmp_path / "frozendict_ckpt"
+    pt_cp.save(fd_dir, fd)
+    restored_fd = pt_cp.restore(fd_dir)
+    assert isinstance(restored_fd, FrozenDict)
+    assert isinstance(restored_fd["nested"], FrozenDict)
+    chex.assert_trees_all_close(restored_fd.unfreeze(), fd.unfreeze())
+
+    tmpl_fd = FrozenDict(
+        {
+            "weights": jnp.zeros((2,), dtype=jnp.float32),
+            "nested": FrozenDict({"bias": jnp.zeros((1,), dtype=jnp.float32)}),
+            "var_leaf": nnx.Cache(jnp.zeros((1,), dtype=jnp.float32)),
+        }
+    )
+    restored_fd_tmpl = pt_cp.restore(fd_dir, item=tmpl_fd)
+    assert isinstance(restored_fd_tmpl, FrozenDict)
+    chex.assert_trees_all_close(restored_fd_tmpl.unfreeze(), fd.unfreeze())
+
+    base_h = BasePyTreeCheckpointHandler()
+    base_dir = tmp_path / "base_pytree"
+    base_h.save(base_dir, state)
+    assert isinstance(base_h.restore(base_dir), nnx.State)
+    assert base_h.restore(None, item=state) is state
+    assert isinstance(base_h.structure(base_dir), nnx.State)
+    assert base_h.structure(None) is None
+
+    unpacked_plain_to_state = base_h._unpack_pytree(
+        {"kernel": [1.0, 2.0]}, nnx.State({"kernel": [0.0, 0.0]})
+    )
+    assert isinstance(unpacked_plain_to_state, nnx.State)
+    unpacked_plain_to_fd = base_h._unpack_pytree(
+        {"a": {"b": 1}},
+        FrozenDict({"a": FrozenDict({"b": 0})}),
+    )
+    assert isinstance(unpacked_plain_to_fd, FrozenDict)
+
+    sa = SerializedArray([1.0, 2.0], shape=(2,), dtype="float32")
+    packed_sa = base_h._pack_pytree(sa)
+    assert isinstance(base_h._unpack_pytree(packed_sa, None), SerializedArray)
+    assert isinstance(base_h._unpack_pytree(sa, sa), SerializedArray)
+    assert isinstance(base_h._unpack_pytree(sa, None), jnp.ndarray)
+    assert isinstance(
+        base_h._pack_pytree(nnx.Param(sa)),
+        dict,
+    )
+    unpacked_var_from_sa = base_h._unpack_pytree(
+        {"__zero_flax_variable__": True, "var_type": "Param", "value": sa, "metadata": {"k": 1}},
+        None,
+    )
+    assert isinstance(unpacked_var_from_sa, nnx.Param)
+    unpacked_var_non_dict_meta = base_h._unpack_pytree(
+        {"__zero_flax_variable__": True, "var_type": "Param", "value": 1.0, "metadata": None},
+        None,
+    )
+    assert isinstance(unpacked_var_non_dict_meta, nnx.Param)
+
+    non_strict_args: PyTree = {
+        "kernel": ArrayRestoreArgs(shape=(2, 2), dtype="float32", strict=False),
+        "sub": {
+            "running_mean": ArrayRestoreArgs(strict=False),
+            "scalar_val": None,
+        },
+    }
+    assert isinstance(
+        handler.restore(std_dir, item=target_state, restore_args=non_strict_args),
+        nnx.State,
+    )
+
+    from zero_chex.types import ZeroArray
+
+    zero_arr = ZeroArray([1.0, 2.0], shape=(2,), dtype=DType("float32"))
+    assert array_to_nested_list(zero_arr) == [1.0, 2.0]
+
+    class _BareArray:
+        """Minimal ArrayProtocol without tolist or to_list."""
+
+        @property
+        def shape(self) -> tuple[int, ...]:
+            """Return shape.
+
+            Returns:
+                tuple[int, ...]: Shape tuple.
+            """
+            return (0,)
+
+        @property
+        def dtype(self) -> str:
+            """Return dtype.
+
+            Returns:
+                str: Dtype name.
+            """
+            return "float32"
+
+    bare = _BareArray()
+    assert isinstance(bare, ArrayProtocol)
+    assert array_to_nested_list(bare) == []
+
+
+def test_optax_and_grain_composite_checkpointing(tmp_path: pathlib.Path) -> None:
+    """Test saving and restoring zero_optax OptState and zero_grain DataLoaderIterator with CheckpointManager.
+
+    Args:
+        tmp_path: Temporary pytest directory.
+    """
+    import zero_chex as chex
+    import zero_flax.nnx as nnx
+    import zero_grain as grain
+    from zero_jax import numpy as jnp
+    import zero_optax as optax
+    from zero_orbax.checkpoint import (
+        BasePyTreeCheckpointHandler,
+        CheckpointManager,
+        PyGrainCheckpointHandler,
+        PyTreeCheckpointer,
+        args,
+    )
+
+    params = {"w": jnp.array([1.0, -2.0], dtype=jnp.float32)}
+    tx = optax.adamw(1e-3)
+    opt_state = tx.init(params)
+    _, updated_opt_state = tx.update(
+        {"w": jnp.array([0.25, -0.25], dtype=jnp.float32)}, opt_state, params
+    )
+
+    pt_cp = PyTreeCheckpointer()
+    opt_dir = tmp_path / "opt_ckpt"
+    pt_cp.save(opt_dir, updated_opt_state)
+
+    restored_opt_dict = pt_cp.restore(opt_dir)
+    assert isinstance(restored_opt_dict, dict)
+
+    fresh_opt_state = tx.init(params)
+    restored_opt = pt_cp.restore(opt_dir, item=fresh_opt_state)
+    assert isinstance(restored_opt, optax.AdamwState)
+    chex.assert_trees_all_close(restored_opt.adam_state.mu, updated_opt_state.adam_state.mu)
+    chex.assert_trees_all_close(restored_opt.adam_state.nu, updated_opt_state.adam_state.nu)
+
+    base_h = BasePyTreeCheckpointHandler()
+    unpacked_plain_opt = base_h._unpack_pytree(
+        {"count": 5},
+        updated_opt_state.scale_state,
+    )
+    assert type(unpacked_plain_opt) is type(updated_opt_state.scale_state)
+
+    assert args.has_registered_args(grain.PyGrainCheckpointHandler)
+    assert (
+        args.get_registered_args_cls(grain.PyGrainCheckpointHandler, for_save=True)
+        is args.PyGrainCheckpointSave
+    )
+    assert (
+        args.get_registered_args_cls(grain.PyGrainCheckpointHandler, for_save=False)
+        is args.PyGrainCheckpointRestore
+    )
+
+    loader = grain.DataLoader(
+        data_source=grain.RangeDataSource(0, 10, 1),
+        sampler=grain.SequentialSampler(num_records=10),
+    )
+    data_iter = iter(loader)
+    assert next(data_iter) == 0
+    assert next(data_iter) == 1
+
+    model_state = nnx.State({"w": nnx.Param(jnp.array([2.0, 4.0], dtype=jnp.float32))})
+    comp_dir = tmp_path / "composite_mgr"
+    mgr = CheckpointManager(comp_dir)
+    assert mgr.save(
+        1,
+        args=args.Composite(
+            model=args.StandardSave(model_state),
+            opt=args.PyTreeSave(updated_opt_state),
+            data=args.PyGrainCheckpointSave(data_iter),
+        ),
+    )
+    assert next(data_iter) == 2
+    assert next(data_iter) == 3
+
+    target_model = nnx.State({"w": nnx.Param(jnp.zeros((2,), dtype=jnp.float32))})
+    target_opt = tx.init(params)
+    restored_comp = mgr.restore(
+        1,
+        items={
+            "model": target_model,
+            "opt": target_opt,
+            "data": data_iter,
+        },
+    )
+    assert isinstance(restored_comp, dict)
+    assert isinstance(restored_comp["model"], nnx.State)
+    chex.assert_trees_all_close(restored_comp["model"], model_state)
+    assert type(restored_comp["opt"]) is type(updated_opt_state)
+    assert next(data_iter) == 2
+
+    restored_comp_no_items = mgr.restore(1)
+    assert isinstance(restored_comp_no_items, dict)
+    assert isinstance(restored_comp_no_items["data"], dict)
+
+    gh = PyGrainCheckpointHandler()
+    gh.save(None, data_iter)
+    gh.save(tmp_path / "grain_ignored", {"not_iter": 1})
+    assert gh.restore(None, data_iter) is data_iter
+    assert gh.restore(tmp_path / "grain_missing", data_iter) is data_iter
+    gh_dir = tmp_path / "grain_explicit"
+    gh.save(gh_dir, args.PyGrainCheckpointSave(data_iter))
+    assert isinstance(gh.restore(gh_dir, args.PyGrainCheckpointRestore(None)), dict)
+    assert gh.restore(gh_dir, args.PyGrainCheckpointRestore(data_iter)) is data_iter
+
+    empty_mgr_dir = tmp_path / "empty_step_mgr"
+    empty_mgr = CheckpointManager(empty_mgr_dir)
+    empty_mgr.steps.append(99)
+    empty_mgr.checkpoints[99] = {"fallback": 1}
+    assert empty_mgr.restore(99) == {"fallback": 1}

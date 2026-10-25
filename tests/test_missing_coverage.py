@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import datetime
 import pathlib
+
+import pytest
+from ml_switcheroo_ir import LogicalMesh, PartitionSpec
 
 from zero_orbax.checkpoint import (
     AbstractCheckpointManager,
@@ -22,9 +26,11 @@ from zero_orbax.checkpoint import (
     CompositeCheckpointHandler,
     Future,
     JsonCheckpointHandler,
+    ProtoCheckpointHandler,
     PyTreeCheckpointHandler,
     RestoreArgs,
     RestoreTransform,
+    SaveArgs,
     StandardCheckpointHandler,
     StandardCheckpointer,
     args,
@@ -33,9 +39,13 @@ from zero_orbax.checkpoint import (
     nest_asyncio,
     step_lib,
     test_utils,
+    _apply_save_args_tree,
+    _infer_array_shape,
 )
+from zero_orbax.core import SerializedArray
 from zero_orbax.types import (
     AbstractLoggerProtocol,
+    ArrayMetadataValidatorProtocol,
     CheckpointMetadataStoreProtocol,
     FileOptions,
     JsonValue,
@@ -43,6 +53,7 @@ from zero_orbax.types import (
     PreservationPolicyProtocol,
     PyTree,
     SaveDecisionPolicyProtocol,
+    TemporaryPathProtocol,
     TypeHandlerProtocol,
     TypeHandlerRegistryProtocol,
 )
@@ -203,6 +214,79 @@ class SimpleTypeHandlerRegistry(TypeHandlerRegistryProtocol):
         """
         return ty in self._map
 
+    def get_by_typestr(self, typestr: str) -> TypeHandlerProtocol | None:
+        """Look up a registered type handler by its ``typestr()``.
+
+        Args:
+            typestr: Canonical type string identifier.
+
+        Returns:
+            TypeHandlerProtocol | None: Matching handler or None.
+        """
+        for handler in self._map.values():
+            if handler.typestr() == typestr:
+                return handler
+        return None
+
+
+class RecordingValidator(ArrayMetadataValidatorProtocol):
+    """Concrete ArrayMetadataValidatorProtocol recording validated snapshots."""
+
+    def __init__(self) -> None:
+        """Initialize the validator."""
+        self.validated: list[dict[str, JsonValue]] = []
+
+    def validate(self, metadata: Mapping[str, JsonValue]) -> bool:
+        """Record and validate ``metadata``.
+
+        Args:
+            metadata: Metadata mapping.
+
+        Returns:
+            bool: Always True.
+        """
+        self.validated.append(dict(metadata))
+        return True
+
+
+class RecordingTempPath(TemporaryPathProtocol):
+    """Concrete TemporaryPathProtocol implementation for testing Checkpointer staging."""
+
+    created_count: int = 0
+    finalized_count: int = 0
+    base_dir: pathlib.Path = pathlib.Path(".")
+
+    def get(self) -> pathlib.Path:
+        """Return the temporary directory path.
+
+        Returns:
+            pathlib.Path: Temporary directory path.
+        """
+        return self.base_dir / "temp_stage"
+
+    def get_final(self) -> pathlib.Path:
+        """Return the final directory path.
+
+        Returns:
+            pathlib.Path: Final directory path.
+        """
+        return self.base_dir / "final_dest"
+
+    def create(self) -> pathlib.Path:
+        """Create the temporary directory.
+
+        Returns:
+            pathlib.Path: Created temporary directory.
+        """
+        RecordingTempPath.created_count += 1
+        p = self.get()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def finalize(self) -> None:
+        """Record finalization."""
+        RecordingTempPath.finalized_count += 1
+
 
 class SyncOnlyHandler(CheckpointHandler):
     """Non-async CheckpointHandler for testing synchronous fallback branches."""
@@ -232,18 +316,53 @@ def test_abstract_checkpointer_methods() -> None:
 
 
 def test_array_checkpoint_handler_methods(tmp_path: pathlib.Path) -> None:
-    """Test ArrayCheckpointHandler async_save, finalize, metadata, structure, and close.
+    """Test ArrayCheckpointHandler async_save, strict shape validation, mesh sharding, and close.
 
     Args:
         tmp_path: Pytest temporary directory fixture.
     """
+    assert _infer_array_shape(SerializedArray([1, 2], shape=(2,))) == (2,)
+    assert _infer_array_shape([]) == (0,)
+    assert _infer_array_shape(5) == ()
+
     h = ArrayCheckpointHandler()
     assert h.async_save(None) is None
-    futs = h.async_save(tmp_path, [10, 20])
+    futs = h.async_save(tmp_path, [10, 20, 30, 40])
     assert futs is not None and len(futs) == 1
     futs[0].result()
     assert h.metadata(tmp_path) == {"finalized": True, "directory": str(tmp_path)}
-    assert h.structure(tmp_path) == [10, 20]
+    assert h.structure(tmp_path) == [10, 20, 30, 40]
+
+    # Strict shape validation pass and failure
+    assert h.restore(tmp_path, restore_args=ArrayRestoreArgs(shape=(4,), strict=True)) == [
+        10,
+        20,
+        30,
+        40,
+    ]
+    with pytest.raises(ValueError, match="Strict shape mismatch"):
+        h.restore(tmp_path, restore_args=ArrayRestoreArgs(shape=(2,), strict=True))
+
+    # Mesh + mesh_axes sharding
+    mesh = LogicalMesh(shape={"data": 2})
+    sharded = h.restore(
+        tmp_path,
+        restore_args=ArrayRestoreArgs(
+            mesh=mesh,
+            mesh_axes=("data",),
+            strict=False,
+        ),
+    )
+    assert sharded == [10, 20]
+    sharded_pspec = h.restore(
+        tmp_path,
+        restore_args=ArrayRestoreArgs(
+            mesh=mesh,
+            mesh_axes=PartitionSpec(axes=("data",)),
+            strict=False,
+        ),
+    )
+    assert sharded_pspec == [10, 20]
     h.close()
 
 
@@ -270,7 +389,7 @@ def test_async_checkpoint_handler_methods(tmp_path: pathlib.Path) -> None:
 
 
 def test_async_checkpointer_methods(tmp_path: pathlib.Path) -> None:
-    """Test AsyncCheckpointer check_for_errors, wait_until_finished, create_temporary_path, and callbacks.
+    """Test AsyncCheckpointer check_for_errors, wait_until_finished, temporary_path_class, and callbacks.
 
     Args:
         tmp_path: Pytest temporary directory fixture.
@@ -284,15 +403,22 @@ def test_async_checkpointer_methods(tmp_path: pathlib.Path) -> None:
         post_finalization_callback=lambda: post_called.append(True),
     )
     meta_store = InMemoryMetadataStore()
+    RecordingTempPath.base_dir = tmp_path / "async_temp_test"
+    RecordingTempPath.created_count = 0
+    RecordingTempPath.finalized_count = 0
+
     cp = AsyncCheckpointer(
         handler=StandardCheckpointHandler(),
         async_options=opts,
         checkpoint_metadata_store=meta_store,
+        temporary_path_class=RecordingTempPath,
     )
     fut = cp.save(tmp_path, {"x": 1})
     assert isinstance(fut, Future)
+    assert RecordingTempPath.created_count == 1
     cp.check_for_errors()
     cp.wait_until_finished()
+    assert RecordingTempPath.finalized_count == 1
     assert len(barrier_called) == 1
     assert post_called == [True]
     assert (
@@ -300,7 +426,7 @@ def test_async_checkpointer_methods(tmp_path: pathlib.Path) -> None:
         == tmp_path.parent / f"{tmp_path.name}.orbax-checkpoint-tmp"
     )
     assert cp.create_temporary_path(None) is None
-    assert cp.structure(tmp_path) == {"x": 1}
+    assert cp.structure(RecordingTempPath().get()) == {"x": 1}
     cp.close()
     assert meta_store.closed is True
 
@@ -358,6 +484,12 @@ def test_checkpoint_manager_advanced_features(tmp_path: pathlib.Path) -> None:
     Args:
         tmp_path: Pytest temporary directory fixture.
     """
+    # Create a tmp directory to verify cleanup_tmp_directories=True removes it on init
+    stale_tmp = tmp_path / "0.orbax-checkpoint-tmp"
+    stale_tmp.mkdir(parents=True)
+    kept_dir = tmp_path / "regular_note"
+    kept_dir.mkdir(parents=True)
+
     logger = CustomLogger()
     opts = CheckpointManagerOptions(
         save_decision_policy=CustomSavePolicy(),
@@ -367,6 +499,7 @@ def test_checkpoint_manager_advanced_features(tmp_path: pathlib.Path) -> None:
         max_to_keep=1,
         file_options=FileOptions(path_permission_mode=0o755),
         todelete_subdir="trash",
+        cleanup_tmp_directories=True,
     )
     cp = Checkpointer(StandardCheckpointHandler())
     with CheckpointManager(
@@ -376,6 +509,8 @@ def test_checkpoint_manager_advanced_features(tmp_path: pathlib.Path) -> None:
         metadata={"exp": "test"},
         logger=logger,
     ) as mgr:
+        assert not stale_tmp.exists()
+        assert kept_dir.exists()
         assert mgr.should_save(1) is False
         assert mgr.should_save(42) is True
         assert mgr.save(1, {"v": 1}, metrics={"loss": 0.5}, force=True) is True
@@ -392,11 +527,18 @@ def test_checkpoint_manager_advanced_features(tmp_path: pathlib.Path) -> None:
         assert mgr.is_saving_in_progress() is False
         assert len(logger.entries) == 3
 
-        # Reload into a fresh manager
+        # Lightweight initialize skips auto-reload until all_steps(read=True)
+        mgr_light = CheckpointManager(
+            tmp_path,
+            options=CheckpointManagerOptions(lightweight_initialize=True),
+        )
+        assert mgr_light.metrics() is None
+        assert mgr_light.item_metadata() is None
+        assert mgr_light.best_step() is None
+
+        # Default initialize auto-reloads from disk immediately
         mgr2 = CheckpointManager(tmp_path)
-        assert mgr2.metrics() is None
-        assert mgr2.item_metadata() is None
-        assert mgr2.best_step() is None
+        assert mgr2.all_steps() == [1, 42]
         assert mgr2.all_steps(read=True) == [1, 42]
         assert mgr2.metadata() == {"exp": "test"}
         assert mgr2.metrics(42) == {"loss": 0.1}
@@ -430,7 +572,7 @@ def test_checkpoint_manager_advanced_features(tmp_path: pathlib.Path) -> None:
         mgr_h.delete(11)
         assert mgr_h.restore(10) == {"a": {"x": 1}, "b": {"y": 2}}
 
-    # Test single item_handler and directory override on restore
+    # Test single item_handler and directory override on restore (including step not in current manager)
     single_h_dir = tmp_path / "single_h"
     with CheckpointManager(
         single_h_dir,
@@ -438,6 +580,68 @@ def test_checkpoint_manager_advanced_features(tmp_path: pathlib.Path) -> None:
     ) as mgr_single:
         mgr_single.save(1, {"s": 10})
         assert mgr_single.restore(1, directory=single_h_dir) == {"s": 10}
+
+    fresh_unloaded_mgr = CheckpointManager(
+        tmp_path / "empty_other",
+        options=CheckpointManagerOptions(lightweight_initialize=True),
+    )
+    with pytest.raises(ValueError, match="not found"):
+        fresh_unloaded_mgr.restore()
+    assert fresh_unloaded_mgr.restore(1, directory=single_h_dir) == {"s": 10}
+    with pytest.raises(ValueError, match="not found"):
+        fresh_unloaded_mgr.restore(999, directory=single_h_dir)
+
+    # Test keep_time_interval and AsyncCheckpointer future tracking in CheckpointManager
+    time_dir = tmp_path / "time_mgr"
+    async_cp_map = {"main": AsyncCheckpointer(StandardCheckpointHandler())}
+    with CheckpointManager(
+        time_dir,
+        checkpointers=async_cp_map,
+        options=CheckpointManagerOptions(
+            max_to_keep=1,
+            keep_time_interval=datetime.timedelta(hours=1),
+        ),
+    ) as mgr_time:
+        t0 = datetime.datetime(2026, 1, 1, 12, 0, tzinfo=datetime.timezone.utc)
+        mgr_time._step_timestamps[1] = t0
+        mgr_time.save(1, {"main": {"v": 1}})
+        assert mgr_time.is_saving_in_progress() is True
+        mgr_time.check_for_errors()
+        mgr_time.wait_until_finished()
+        assert mgr_time.is_saving_in_progress() is False
+        # Step 2 is only 10 minutes after step 1 (< 1 hour interval), so step 1 is protected and step 2 is pruned when step 3 arrives
+        mgr_time._step_timestamps[2] = t0 + datetime.timedelta(minutes=10)
+        mgr_time.save(2, {"main": {"v": 2}})
+        mgr_time._step_timestamps[3] = t0 + datetime.timedelta(minutes=20)
+        mgr_time.save(3, {"main": {"v": 3}})
+        assert 1 in mgr_time.all_steps()
+
+    # Single AsyncCheckpointer in CheckpointManager
+    single_async_dir = tmp_path / "single_async_mgr"
+    with CheckpointManager(
+        single_async_dir,
+        checkpointers=AsyncCheckpointer(StandardCheckpointHandler()),
+    ) as mgr_sa:
+        mgr_sa.save(1, {"v": 10})
+        mgr_sa.check_for_errors()
+        mgr_sa.wait_until_finished()
+
+    # Test get_registered_args_cls on unregistered CheckpointHandler subclass
+    assert args.get_registered_args_cls(SyncOnlyHandler, for_save=True) is None
+    assert args.get_registered_args_cls(SyncOnlyHandler, for_save=False) is None
+
+    # Test CheckpointManager check_for_errors and wait_until_finished with non-async Checkpointer mapping and None checkpointers
+    sync_cp_map_dir = tmp_path / "sync_cp_map"
+    with CheckpointManager(
+        sync_cp_map_dir,
+        checkpointers={"sync": Checkpointer(StandardCheckpointHandler())},
+    ) as mgr_sync_map:
+        mgr_sync_map.save(1, {"sync": {"v": 1}})
+        mgr_sync_map.check_for_errors()
+        mgr_sync_map.wait_until_finished()
+    with CheckpointManager(tmp_path / "no_cp_mgr") as mgr_no_cp:
+        mgr_no_cp.check_for_errors()
+        mgr_no_cp.wait_until_finished()
 
     # Test Composite args with CheckpointManager
     comp_mgr_dir = tmp_path / "comp_mgr"
@@ -462,7 +666,7 @@ def test_checkpoint_manager_advanced_features(tmp_path: pathlib.Path) -> None:
         )
         assert restored_comp == {"state": {"w": 1}, "cfg": {"lr": 0.01}}
 
-    # Test CheckpointManager with registered and unregistered args class directly, directory=None, step_name_format, should_save_fn
+    # Test CheckpointManager with registered and unregistered args class directly
     reg_mgr_dir = tmp_path / "reg_mgr"
     with CheckpointManager(
         reg_mgr_dir,
@@ -491,6 +695,9 @@ def test_checkpoint_manager_advanced_features(tmp_path: pathlib.Path) -> None:
     mem_mgr.save(1, {"a": 1})
     mem_mgr.save(2, {"a": 2})
     assert mem_mgr.best_step() == 2
+    assert mem_mgr.restore(2) == {"a": 2}
+    with pytest.raises(ValueError, match="not found"):
+        mem_mgr.restore(999)
     mem_mgr.delete(1)
 
     ro_mgr = CheckpointManager(
@@ -520,18 +727,30 @@ def test_checkpoint_manager_options_methods() -> None:
 
 
 def test_checkpointer_methods(tmp_path: pathlib.Path) -> None:
-    """Test Checkpointer without handler (disk fallback) and with metadata store.
+    """Test Checkpointer without handler, with file_options, temporary_path_class, and metadata store.
 
     Args:
         tmp_path: Pytest temporary directory fixture.
     """
-    cp = Checkpointer()
-    assert cp.save(tmp_path, {"no_handler": 1}) is None
-    assert cp.restore(tmp_path) == {"no_handler": 1}
+    cp = Checkpointer(file_options=FileOptions(path_permission_mode=0o755))
+    assert cp.save(tmp_path / "perm_dir", {"no_handler": 1}) is None
+    assert cp.restore(tmp_path / "perm_dir") == {"no_handler": 1}
     assert cp.restore(tmp_path / "missing", item={"default": 2}) == {"default": 2}
-    assert cp.metadata(tmp_path) is None
-    assert cp.structure(tmp_path) is None
+    assert cp.metadata(tmp_path / "perm_dir") is None
+    assert cp.structure(tmp_path / "perm_dir") is None
     cp.close()
+
+    RecordingTempPath.base_dir = tmp_path / "sync_temp"
+    RecordingTempPath.created_count = 0
+    RecordingTempPath.finalized_count = 0
+    cp_temp = Checkpointer(
+        StandardCheckpointHandler(),
+        temporary_path_class=RecordingTempPath,
+    )
+    cp_temp.save(tmp_path / "ignored_dest", {"staged": 1})
+    assert RecordingTempPath.created_count == 1
+    assert RecordingTempPath.finalized_count == 1
+    cp_temp.close()
 
     meta_store = InMemoryMetadataStore()
     cp_meta = Checkpointer(StandardCheckpointHandler(), checkpoint_metadata_store=meta_store)
@@ -558,22 +777,56 @@ def test_composite_checkpoint_handler_extra_branches(tmp_path: pathlib.Path) -> 
 
 
 def test_pytree_checkpoint_handler_custom_impl_and_type_registry(tmp_path: pathlib.Path) -> None:
-    """Test PyTreeCheckpointHandler with handler_impl, type_handler_registry, and RestoreArgs.
+    """Test PyTreeCheckpointHandler with handler_impl, type_handler_registry, validator, priority keys, and SaveArgs/RestoreArgs.
 
     Args:
         tmp_path: Pytest temporary directory fixture.
     """
+    assert _apply_save_args_tree(None, SaveArgs(dtype=int)) is None
+    assert _apply_save_args_tree(10, "not_a_save_args") == 10
+    assert _apply_save_args_tree(
+        {"a": "10", "b": 2, "c": 3, "d": [1]},
+        {
+            "a": SaveArgs(dtype=int),
+            "b": SaveArgs(dtype=float),
+            "c": SaveArgs(dtype=str),
+            "d": SaveArgs(dtype=bool),
+        },
+    ) == {
+        "a": 10,
+        "b": 2.0,
+        "c": "3",
+        "d": [1],
+    }
+
     custom_impl = BasePyTreeCheckpointHandler()
     pt_with_impl = PyTreeCheckpointHandler(handler_impl=custom_impl)
     pt_with_impl.save(tmp_path / "impl", {"a": 1})
     assert pt_with_impl.restore(tmp_path / "impl") == {"a": 1}
 
+    validator = RecordingValidator()
     th_reg = SimpleTypeHandlerRegistry()
     th_reg.add(int, IntTypeHandler())
-    pt_th = PyTreeCheckpointHandler(type_handler_registry=th_reg)
-    pt_th.save(tmp_path / "th", {"num": 42})
+    pt_th = PyTreeCheckpointHandler(
+        type_handler_registry=th_reg,
+        array_metadata_validator=validator,
+        is_prioritized_key_fn=lambda k: "prio" in k,
+    )
+    pt_th.save(
+        tmp_path / "th",
+        {"z_normal": {"nested": 1}, "a_prio": 42},
+        save_args={"a_prio": SaveArgs(dtype=int)},
+    )
+    assert len(validator.validated) == 1
     restored_th = pt_th.restore(tmp_path / "th")
-    assert restored_th == {"num": {"__custom_type__": "custom_int", "__custom_hex__": b"42".hex()}}
+    assert restored_th == {"z_normal": {"nested": 1}, "a_prio": 42}
+    assert th_reg.get_by_typestr("unknown_type") is None
+
+    # Test when type_handler_registry does not have the typestr during restore
+    empty_reg = SimpleTypeHandlerRegistry()
+    pt_empty_reg = PyTreeCheckpointHandler(type_handler_registry=empty_reg)
+    raw_unmatched = pt_empty_reg.restore(tmp_path / "th")
+    assert isinstance(raw_unmatched, dict)
 
     # Test _apply_restore_args_tree for float, str, list, tuple, and unknown restore_type
     pt_plain = PyTreeCheckpointHandler()
@@ -608,6 +861,18 @@ def test_pytree_checkpoint_handler_custom_impl_and_type_registry(tmp_path: pathl
     )
     pt_agg_missing.save(None, {"num": 1, "str_unregistered": "hello"})
     assert pt_agg_missing.restore(tmp_path / "coercions") is not None
+
+
+def test_proto_handler_default_and_custom_filename(tmp_path: pathlib.Path) -> None:
+    """Test ProtoCheckpointHandler with default proto.pb and custom args.ProtoSave(filename=...).
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    proto_h = ProtoCheckpointHandler()
+    proto_h.save(tmp_path, args.ProtoSave({"msg": "hello"}, filename="custom.pb"))
+    assert (tmp_path / "custom.pb").exists()
+    assert proto_h.restore(tmp_path, args.ProtoRestore(filename="custom.pb")) == {"msg": "hello"}
 
 
 def test_standard_checkpointer_methods() -> None:

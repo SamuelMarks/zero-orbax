@@ -19,15 +19,34 @@ import re
 import shutil
 from collections.abc import Callable, Container, Iterator, Mapping, Sequence
 from types import TracebackType
-from typing import TypeVar
+from typing import Literal, TypeVar
 from typing_extensions import TypeAlias
 
+from ml_switcheroo_compiler import ops as compiler_ops
+from ml_switcheroo_compiler.core.dtype import DType as CompilerDType
+from ml_switcheroo_compiler.core.tensor import Tensor as CompilerTensor, as_tensor_obj
 from ml_switcheroo_ir import DType, LogicalMesh, PartitionSpec
+from zero_chex import assert_shape, assert_trees_all_equal_structs, assert_type
+from zero_flax.nnx.variables import (
+    BatchStat,
+    Cache,
+    Intermediate,
+    LoRAParam,
+    Param,
+    Rng,
+    RngState,
+    Variable as FlaxVariable,
+    VariableValue,
+)
+from zero_flax.types import MetadataValue
+from zero_grain._types import CheckpointStateDict
+from zero_jax import numpy as jnp
 
 from zero_orbax.core import (
     AtomicWrite,
     BarrierSync,
     FileSystemIO,
+    GlobalArraySharding,
     MsgpackEngine,
     SerializedArray,
     TensorStoreDriver,
@@ -42,11 +61,16 @@ from zero_orbax.types import (
     CheckpointMetadataStoreProtocol,
     CompositeOptions,
     FileOptions,
+    FlaxStateProtocol,
+    FlaxVariableProtocol,
+    FrozenDictProtocol,
+    GrainIteratorProtocol,
     IsPrioritizedKeyFn,
     JsonValue,
     MemoryLimitOptions,
     MultiValueTransformFn,
     MultiprocessingOptions,
+    NamedTupleProtocol,
     PathLike,
     PreservationPolicyProtocol,
     PyTree,
@@ -58,6 +82,8 @@ from zero_orbax.types import (
     TypeHandlerProtocol,
     TypeHandlerRegistryProtocol,
     ValueTransformFn,
+    array_to_nested_list,
+    is_array_protocol,
     is_pytree_dict,
     is_pytree_mapping,
     normalize_path,
@@ -71,16 +97,133 @@ contextlib = _stdlib_contextlib
 functools = _stdlib_functools
 logging = _stdlib_logging
 
-NoneType: TypeAlias = type(None)
+NoneType: TypeAlias = None
 ValueFn: TypeAlias = ValueTransformFn
 MultiValueFn: TypeAlias = MultiValueTransformFn
 
-_ArgsClsT = TypeVar("_ArgsClsT", bound=type)
-_RegisteredTarget: TypeAlias = type
-_SAVE_ARGS_TO_HANDLER: dict[type, _RegisteredTarget] = {}
-_RESTORE_ARGS_TO_HANDLER: dict[type, _RegisteredTarget] = {}
-_HANDLER_TO_SAVE_ARGS: dict[_RegisteredTarget, type] = {}
-_HANDLER_TO_RESTORE_ARGS: dict[_RegisteredTarget, type] = {}
+
+class _CheckpointArgsBase:
+    """Base class for all structured checkpoint handler argument wrappers."""
+
+    def __init__(self, item: PyTree = None) -> None:
+        """Initialize the base CheckpointArgs wrapper.
+
+        Args:
+            item: Optional item payload wrapped by these arguments. Defaults to None.
+        """
+        self.item = item
+
+
+_ArgsClsT = TypeVar("_ArgsClsT", bound=type[_CheckpointArgsBase])
+_RegisteredHandlerCls: TypeAlias = type["CheckpointHandler"]
+_RegisteredArgsCls: TypeAlias = type[_CheckpointArgsBase]
+
+
+class _ArgsHandlerCatalog:
+    """Encapsulated catalog mapping ``CheckpointArgs`` classes to ``CheckpointHandler`` classes."""
+
+    def __init__(self) -> None:
+        """Initialize the empty catalog mappings."""
+        self.save_args_to_handler: dict[_RegisteredArgsCls, _RegisteredHandlerCls] = {}
+        self.restore_args_to_handler: dict[_RegisteredArgsCls, _RegisteredHandlerCls] = {}
+        self.handler_to_save_args: dict[_RegisteredHandlerCls, _RegisteredArgsCls] = {}
+        self.handler_to_restore_args: dict[_RegisteredHandlerCls, _RegisteredArgsCls] = {}
+
+    def register(
+        self,
+        args_cls: _RegisteredArgsCls,
+        handler_cls: _RegisteredHandlerCls,
+        *,
+        for_save: bool = False,
+        for_restore: bool = False,
+    ) -> None:
+        """Register an association between ``args_cls`` and ``handler_cls``.
+
+        Args:
+            args_cls: ``CheckpointArgs`` subclass.
+            handler_cls: ``CheckpointHandler`` subclass.
+            for_save: Whether ``args_cls`` is used for save operations. Defaults to False.
+            for_restore: Whether ``args_cls`` is used for restore operations. Defaults to False.
+        """
+        if for_save:
+            self.save_args_to_handler[args_cls] = handler_cls
+            self.handler_to_save_args[handler_cls] = args_cls
+        if for_restore:
+            self.restore_args_to_handler[args_cls] = handler_cls
+            self.handler_to_restore_args[handler_cls] = args_cls
+
+    def get_handler_cls(
+        self,
+        arg_or_cls: _CheckpointArgsBase | type,
+    ) -> _RegisteredHandlerCls | None:
+        """Look up the registered ``CheckpointHandler`` subclass for ``arg_or_cls``.
+
+        Args:
+            arg_or_cls: ``CheckpointArgs`` instance or subclass.
+
+        Returns:
+            _RegisteredHandlerCls | None: Registered handler class, or None if not found.
+        """
+        target_cls: type = arg_or_cls if isinstance(arg_or_cls, type) else type(arg_or_cls)
+        if issubclass(target_cls, _CheckpointArgsBase):
+            if target_cls in self.save_args_to_handler:
+                return self.save_args_to_handler[target_cls]
+            if target_cls in self.restore_args_to_handler:
+                return self.restore_args_to_handler[target_cls]
+        return None
+
+    def get_args_cls(
+        self,
+        handler_or_cls: CheckpointHandler | type,
+        *,
+        for_save: bool = True,
+    ) -> _RegisteredArgsCls | None:
+        """Look up the registered ``CheckpointArgs`` subclass for ``handler_or_cls``.
+
+        Args:
+            handler_or_cls: ``CheckpointHandler`` instance or subclass.
+            for_save: Whether to query save args or restore args. Defaults to True.
+
+        Returns:
+            _RegisteredArgsCls | None: Registered ``CheckpointArgs`` subclass, or None.
+        """
+        target_cls: type = (
+            handler_or_cls if isinstance(handler_or_cls, type) else type(handler_or_cls)
+        )
+        if target_cls.__module__.startswith("zero_grain"):
+            target_cls = PyGrainCheckpointHandler
+        if issubclass(target_cls, CheckpointHandler):
+            if for_save and target_cls in self.handler_to_save_args:
+                return self.handler_to_save_args[target_cls]
+            if not for_save and target_cls in self.handler_to_restore_args:
+                return self.handler_to_restore_args[target_cls]
+        return None
+
+    def has_registered(
+        self, handler_or_cls: CheckpointHandler | _CheckpointArgsBase | type
+    ) -> bool:
+        """Return whether ``handler_or_cls`` is registered for save or restore.
+
+        Args:
+            handler_or_cls: Handler or args class/instance.
+
+        Returns:
+            bool: True if registered.
+        """
+        target_cls: type = (
+            handler_or_cls if isinstance(handler_or_cls, type) else type(handler_or_cls)
+        )
+        if target_cls.__module__.startswith("zero_grain"):
+            target_cls = PyGrainCheckpointHandler
+        return (
+            target_cls in self.handler_to_save_args
+            or target_cls in self.handler_to_restore_args
+            or target_cls in self.save_args_to_handler
+            or target_cls in self.restore_args_to_handler
+        )
+
+
+_CATALOG = _ArgsHandlerCatalog()
 
 
 @dataclasses.dataclass
@@ -167,18 +310,6 @@ class ArrayRestoreArgs:
         return self._restore_type
 
 
-class _CheckpointArgsBase:
-    """Base class for all structured checkpoint handler argument wrappers."""
-
-    def __init__(self, item: PyTree = None) -> None:
-        """Initialize the base CheckpointArgs wrapper.
-
-        Args:
-            item: Optional item payload wrapped by these arguments. Defaults to None.
-        """
-        self.item = item
-
-
 class args:
     """Namespace for checkpoint argument classes and handler registration utilities.
 
@@ -207,7 +338,7 @@ class args:
             super().__init__(item=item)
             self.save_args = save_args
 
-    class ArrayRestore(_CheckpointArgsBase):
+    class ArrayRestore(CheckpointArgs):
         """Arguments for restoring a single array or tensor."""
 
         def __init__(
@@ -224,7 +355,7 @@ class args:
             super().__init__(item=item)
             self.restore_args = restore_args
 
-    class Composite(_CheckpointArgsBase):
+    class Composite(CheckpointArgs):
         """Arguments for saving or restoring multiple named items via ``CompositeCheckpointHandler``."""
 
         def __init__(
@@ -282,7 +413,7 @@ class args:
             """
             return len(self._items)
 
-    class JsonSave(_CheckpointArgsBase):
+    class JsonSave(CheckpointArgs):
         """Arguments for saving a JSON-serializable dictionary or value."""
 
         def __init__(self, item: PyTree = None) -> None:
@@ -293,7 +424,7 @@ class args:
             """
             super().__init__(item=item)
 
-    class JsonRestore(_CheckpointArgsBase):
+    class JsonRestore(CheckpointArgs):
         """Arguments for restoring from a JSON checkpoint file."""
 
         def __init__(self, item: PyTree = None) -> None:
@@ -304,35 +435,44 @@ class args:
             """
             super().__init__(item=item)
 
-    class ProtoSave(_CheckpointArgsBase):
+    class ProtoSave(CheckpointArgs):
         """Arguments for saving a Protocol Buffer message."""
 
-        def __init__(self, item: PyTree = None) -> None:
+        def __init__(
+            self,
+            item: PyTree = None,
+            filename: str = "proto.pb",
+        ) -> None:
             """Initialize the ProtoSave arguments.
 
             Args:
                 item: Protocol Buffer message or representation to save. Defaults to None.
+                filename: Target protobuf filename inside the step directory. Defaults to ``"proto.pb"``.
             """
             super().__init__(item=item)
+            self.filename = filename
 
-    class ProtoRestore(_CheckpointArgsBase):
+    class ProtoRestore(CheckpointArgs):
         """Arguments for restoring a Protocol Buffer message."""
 
         def __init__(
             self,
             item: PyTree = None,
             item_type: type | None = None,
+            filename: str = "proto.pb",
         ) -> None:
             """Initialize the ProtoRestore arguments.
 
             Args:
                 item: Optional template message instance. Defaults to None.
                 item_type: Optional Protocol Buffer message class. Defaults to None.
+                filename: Source protobuf filename inside the step directory. Defaults to ``"proto.pb"``.
             """
             super().__init__(item=item)
             self.item_type = item_type
+            self.filename = filename
 
-    class PyTreeSave(_CheckpointArgsBase):
+    class PyTreeSave(CheckpointArgs):
         """Arguments for saving a PyTree structure."""
 
         def __init__(
@@ -352,7 +492,7 @@ class args:
             self.save_args = save_args
             self.ocdbt_target_data_file_size = ocdbt_target_data_file_size
 
-    class PyTreeRestore(_CheckpointArgsBase):
+    class PyTreeRestore(CheckpointArgs):
         """Arguments for restoring a PyTree structure."""
 
         def __init__(
@@ -378,7 +518,7 @@ class args:
             self.transforms = transforms
             self.transforms_default_to_original = transforms_default_to_original
 
-    class StandardSave(_CheckpointArgsBase):
+    class StandardSave(CheckpointArgs):
         """Arguments for standard PyTree saving operations."""
 
         def __init__(
@@ -395,7 +535,7 @@ class args:
             super().__init__(item=item)
             self.save_args = save_args
 
-    class StandardRestore(_CheckpointArgsBase):
+    class StandardRestore(CheckpointArgs):
         """Arguments for standard PyTree restoration operations."""
 
         def __init__(
@@ -412,7 +552,7 @@ class args:
             super().__init__(item=item)
             self.restore_args = restore_args
 
-    class JaxRandomKeySave(_CheckpointArgsBase):
+    class JaxRandomKeySave(CheckpointArgs):
         """Arguments for saving a JAX PRNG random key."""
 
         def __init__(self, item: PyTree = None) -> None:
@@ -423,7 +563,7 @@ class args:
             """
             super().__init__(item=item)
 
-    class JaxRandomKeyRestore(_CheckpointArgsBase):
+    class JaxRandomKeyRestore(CheckpointArgs):
         """Arguments for restoring a JAX PRNG random key."""
 
         def __init__(self, item: PyTree = None) -> None:
@@ -434,7 +574,7 @@ class args:
             """
             super().__init__(item=item)
 
-    class NumpyRandomKeySave(_CheckpointArgsBase):
+    class NumpyRandomKeySave(CheckpointArgs):
         """Arguments for saving a NumPy random generator state."""
 
         def __init__(self, item: PyTree = None) -> None:
@@ -445,7 +585,7 @@ class args:
             """
             super().__init__(item=item)
 
-    class NumpyRandomKeyRestore(_CheckpointArgsBase):
+    class NumpyRandomKeyRestore(CheckpointArgs):
         """Arguments for restoring a NumPy random generator state."""
 
         def __init__(self, item: PyTree = None) -> None:
@@ -456,30 +596,47 @@ class args:
             """
             super().__init__(item=item)
 
+    class PyGrainCheckpointSave(CheckpointArgs):
+        """Arguments for saving a ``zero_grain`` dataset or data loader iterator."""
+
+        def __init__(self, item: PyTree = None) -> None:
+            """Initialize the PyGrainCheckpointSave arguments.
+
+            Args:
+                item: ``GrainIteratorProtocol`` instance to checkpoint. Defaults to None.
+            """
+            super().__init__(item=item)
+
+    class PyGrainCheckpointRestore(CheckpointArgs):
+        """Arguments for restoring a ``zero_grain`` dataset or data loader iterator."""
+
+        def __init__(self, item: PyTree = None) -> None:
+            """Initialize the PyGrainCheckpointRestore arguments.
+
+            Args:
+                item: ``GrainIteratorProtocol`` instance to restore in-place. Defaults to None.
+            """
+            super().__init__(item=item)
+
     @staticmethod
     def get_registered_handler_cls(
         arg_or_cls: _CheckpointArgsBase | type,
-    ) -> type | None:
+    ) -> _RegisteredHandlerCls | None:
         """Retrieve the registered ``CheckpointHandler`` class for an args class or instance.
 
         Args:
             arg_or_cls: A ``CheckpointArgs`` instance or subclass.
 
         Returns:
-            type | None: The registered handler class, or ``None`` if not registered.
+            _RegisteredHandlerCls | None: The registered handler class, or ``None`` if not registered.
         """
-        target_cls: type = arg_or_cls if isinstance(arg_or_cls, type) else type(arg_or_cls)
-        if target_cls in _SAVE_ARGS_TO_HANDLER:
-            return _SAVE_ARGS_TO_HANDLER[target_cls]
-        if target_cls in _RESTORE_ARGS_TO_HANDLER:
-            return _RESTORE_ARGS_TO_HANDLER[target_cls]
-        return None
+        return _CATALOG.get_handler_cls(arg_or_cls)
 
     @staticmethod
     def get_registered_args_cls(
         handler_or_cls: CheckpointHandler | type,
         for_save: bool = True,
-    ) -> type | None:
+    ) -> _RegisteredArgsCls | None:
         """Retrieve the registered ``CheckpointArgs`` class for a handler.
 
         Args:
@@ -487,19 +644,14 @@ class args:
             for_save: If True, look up save args; otherwise look up restore args. Defaults to True.
 
         Returns:
-            type | None: The registered ``CheckpointArgs`` class, or ``None`` if not registered.
+            _RegisteredArgsCls | None: The registered ``CheckpointArgs`` class, or ``None`` if not registered.
         """
-        target_cls: type = (
-            handler_or_cls if isinstance(handler_or_cls, type) else type(handler_or_cls)
-        )
-        if for_save and target_cls in _HANDLER_TO_SAVE_ARGS:
-            return _HANDLER_TO_SAVE_ARGS[target_cls]
-        if not for_save and target_cls in _HANDLER_TO_RESTORE_ARGS:
-            return _HANDLER_TO_RESTORE_ARGS[target_cls]
-        return None
+        return _CATALOG.get_args_cls(handler_or_cls, for_save=for_save)
 
     @staticmethod
-    def has_registered_args(handler_or_cls: CheckpointHandler | type) -> bool:
+    def has_registered_args(
+        handler_or_cls: CheckpointHandler | _CheckpointArgsBase | type,
+    ) -> bool:
         """Check whether a handler class or args class has registered arguments.
 
         Args:
@@ -508,19 +660,11 @@ class args:
         Returns:
             bool: True if registered for save or restore, False otherwise.
         """
-        target_cls: type = (
-            handler_or_cls if isinstance(handler_or_cls, type) else type(handler_or_cls)
-        )
-        return (
-            target_cls in _HANDLER_TO_SAVE_ARGS
-            or target_cls in _HANDLER_TO_RESTORE_ARGS
-            or target_cls in _SAVE_ARGS_TO_HANDLER
-            or target_cls in _RESTORE_ARGS_TO_HANDLER
-        )
+        return _CATALOG.has_registered(handler_or_cls)
 
     @staticmethod
     def register_with_handler(
-        handler_cls: type,
+        handler_cls: type[CheckpointHandler],
         for_save: bool = False,
         for_restore: bool = False,
     ) -> Callable[[_ArgsClsT], _ArgsClsT]:
@@ -535,29 +679,33 @@ class args:
             Callable[[_ArgsClsT], _ArgsClsT]: Decorator that registers and returns the class unchanged.
         """
 
-        def _decorator(cls: _ArgsClsT) -> _ArgsClsT:
-            """Register ``cls`` in the module-level handler/args registries.
+        def _decorator(target_cls: _ArgsClsT) -> _ArgsClsT:
+            """Register ``target_cls`` in the catalog handler/args registries.
 
             Args:
-                cls: The argument class being decorated.
+                target_cls: The argument class being decorated.
 
             Returns:
                 _ArgsClsT: The unmodified argument class.
             """
-            if for_save:
-                _SAVE_ARGS_TO_HANDLER[cls] = handler_cls
-                _HANDLER_TO_SAVE_ARGS[handler_cls] = cls
-            if for_restore:
-                _RESTORE_ARGS_TO_HANDLER[cls] = handler_cls
-                _HANDLER_TO_RESTORE_ARGS[handler_cls] = cls
-            return cls
+            _CATALOG.register(
+                target_cls,
+                handler_cls,
+                for_save=for_save,
+                for_restore=for_restore,
+            )
+            return target_cls
 
         return _decorator
 
 
 _CompositeArgsCls = args.Composite
+_PyTreeSaveArgsCls = args.PyTreeSave
 _PyTreeRestoreArgsCls = args.PyTreeRestore
+_StandardSaveArgsCls = args.StandardSave
+_StandardRestoreArgsCls = args.StandardRestore
 _ArrayRestoreArgsWrapperCls = args.ArrayRestore
+_ProtoSaveArgsCls = args.ProtoSave
 _ProtoRestoreArgsCls = args.ProtoRestore
 
 
@@ -870,6 +1018,27 @@ class AsyncCheckpointHandler(CheckpointHandler):
         return [Future(result=None, commit_callback=lambda: self.finalize(directory))]
 
 
+def _infer_array_shape(val: PyTree) -> tuple[int, ...]:
+    """Infer the shape tuple of an array-like object or nested sequence.
+
+    Args:
+        val: ArrayProtocol, SerializedArray, or nested sequence.
+
+    Returns:
+        tuple[int, ...]: Inferred shape tuple.
+    """
+    if is_array_protocol(val):
+        return tuple(int(d) for d in val.shape)
+    dims: list[int] = []
+    curr: PyTree = val
+    while isinstance(curr, (list, tuple)):
+        dims.append(len(curr))
+        if len(curr) == 0:
+            break
+        curr = curr[0]
+    return tuple(dims)
+
+
 class ArrayCheckpointHandler(AsyncCheckpointHandler):
     """Handler for saving and restoring single arrays or sharded tensors."""
 
@@ -923,6 +1092,9 @@ class ArrayCheckpointHandler(AsyncCheckpointHandler):
 
         Returns:
             PyTree: Restored array or template value.
+
+        Raises:
+            ValueError: If ``strict=True`` on ``ArrayRestoreArgs`` and the restored shape mismatches.
         """
         active_restore_args = restore_args
         raw_arg = item if isinstance(item, _CheckpointArgsBase) else kwargs.get("args")
@@ -938,12 +1110,166 @@ class ArrayCheckpointHandler(AsyncCheckpointHandler):
             if raw:
                 restored = MsgpackEngine().unpackb(raw)
                 if isinstance(active_restore_args, ArrayRestoreArgs):
+                    expected_shape = active_restore_args.shape or active_restore_args.global_shape
+                    if active_restore_args.strict and expected_shape is not None:
+                        actual_shape = _infer_array_shape(restored)
+                        if actual_shape != expected_shape:
+                            raise ValueError(
+                                f"Strict shape mismatch in ArrayCheckpointHandler: expected "
+                                f"{expected_shape}, got {actual_shape}."
+                            )
+                    if (
+                        active_restore_args.mesh is not None
+                        and active_restore_args.mesh_axes is not None
+                    ):
+                        pspec = (
+                            active_restore_args.mesh_axes
+                            if isinstance(active_restore_args.mesh_axes, PartitionSpec)
+                            else PartitionSpec(axes=tuple(active_restore_args.mesh_axes))
+                        )
+                        restored = GlobalArraySharding().get_local_shard(
+                            restored,
+                            host_id=0,
+                            num_hosts=1,
+                            partition_spec=pspec,
+                            mesh=active_restore_args.mesh,
+                        )
                     rtype = active_restore_args.restore_type()
                     if rtype is tuple and isinstance(restored, list):
                         return tuple(restored)
                 return restored
             return super().restore(directory, template, *pos_args, **kwargs)
         return template
+
+
+_COMPILER_DTYPE_MAP: dict[str, CompilerDType] = {member.name: member for member in CompilerDType}
+_FLAX_VARIABLE_CLASSES: dict[str, type[FlaxVariable[VariableValue]]] = {
+    "Param": Param,
+    "BatchStat": BatchStat,
+    "Cache": Cache,
+    "Intermediate": Intermediate,
+    "LoRAParam": LoRAParam,
+    "Rng": Rng,
+    "RngState": RngState,
+    "Variable": FlaxVariable,
+}
+
+
+def _resolve_compiler_dtype(dtype_str: str) -> CompilerDType:
+    """Resolve a string dtype identifier into a ``CompilerDType`` enum member.
+
+    Args:
+        dtype_str: String representation of the data type (e.g. ``"float32"`` or ``"DType.float32"``).
+
+    Returns:
+        CompilerDType: Corresponding compiler data type enum member.
+    """
+    clean = dtype_str[6:] if dtype_str.startswith("DType.") else dtype_str
+    return _COMPILER_DTYPE_MAP.get(clean, CompilerDType.float32)
+
+
+def _coerce_flax_variable_value(val: PyTree) -> VariableValue:
+    """Coerce an unpacked PyTree leaf into a strongly typed ``VariableValue``.
+
+    Args:
+        val: Unpacked PyTree value for a Flax ``Variable``.
+
+    Returns:
+        VariableValue: Typed JAX array or scalar leaf.
+    """
+    if val is None or isinstance(val, (jnp.ndarray, int, float, bool, str)):
+        return val
+    return jnp.asarray(array_to_nested_list(val) if is_array_protocol(val) else val)
+
+
+def _coerce_flax_metadata(meta: PyTree) -> dict[str, MetadataValue]:
+    """Coerce an unpacked metadata mapping into a typed ``dict[str, MetadataValue]``.
+
+    Args:
+        meta: Raw unpacked metadata dictionary.
+
+    Returns:
+        dict[str, MetadataValue]: Strongly typed variable metadata mapping.
+    """
+    if not is_pytree_dict(meta):
+        return {}
+    return {
+        str(k): v for k, v in meta.items() if v is None or isinstance(v, (int, float, bool, str))
+    }
+
+
+def _reconstruct_array_leaf(
+    data: PyTree,
+    shape: tuple[int, ...],
+    dtype_str: str,
+    array_kind: str,
+    template: PyTree = None,
+) -> PyTree:
+    """Reconstruct a typed array leaf from serialized data, shape, and dtype.
+
+    Args:
+        data: Nested list or scalar data payload.
+        shape: Target array shape tuple.
+        dtype_str: Target data type name.
+        array_kind: Recorded array kind (``"tensor"``, ``"serialized_array"``, or ``"jax_array"``).
+        template: Optional template leaf guiding array type selection. Defaults to None.
+
+    Returns:
+        PyTree: Reconstructed ``zero_jax.numpy.ndarray``, ``CompilerTensor``, or ``SerializedArray``.
+    """
+    resolved_dt = _resolve_compiler_dtype(dtype_str)
+    raw_input = data if isinstance(data, (int, float, bool, list, tuple)) else 0.0
+    if isinstance(template, CompilerTensor) or (template is None and array_kind == "tensor"):
+        return as_tensor_obj(compiler_ops.asarray(raw_input, dtype=resolved_dt))
+    if isinstance(template, SerializedArray) or (
+        template is None and array_kind == "serialized_array"
+    ):
+        return SerializedArray(data=data, shape=shape, dtype=dtype_str)
+    return jnp.reshape(jnp.asarray(raw_input, dtype=resolved_dt), shape)
+
+
+def _build_flax_state(entries: Mapping[str, PyTree], template: PyTree = None) -> PyTree:
+    """Construct a ``zero_flax.nnx.State`` from unpacked entries and optionally update ``template``.
+
+    Args:
+        entries: Mapping of state keys to unpacked values.
+        template: Optional target ``State`` template to update in-place. Defaults to None.
+
+    Returns:
+        PyTree: Reconstructed ``zero_flax.nnx.State`` instance.
+    """
+    from zero_flax.nnx.state import State as FlaxState, StateEntry
+
+    typed_entries: dict[str, StateEntry] = {}
+    for k, v in entries.items():
+        if isinstance(v, (FlaxState, FlaxVariable)):
+            typed_entries[str(k)] = v
+        else:
+            typed_entries[str(k)] = _coerce_flax_variable_value(v)
+    state_obj = FlaxState(typed_entries)
+    if isinstance(template, FlaxState):
+        template.update(state_obj)
+    return state_obj
+
+
+def _build_frozen_dict(entries: Mapping[str, PyTree]) -> PyTree:
+    """Construct a ``zero_flax.core.FrozenDict`` from unpacked entries.
+
+    Args:
+        entries: Mapping of keys to unpacked PyTree values.
+
+    Returns:
+        PyTree: Reconstructed ``FrozenDict`` instance.
+    """
+    from zero_flax.core import FrozenDict, FrozenEntry
+
+    typed_entries: dict[str, FrozenEntry] = {}
+    for k, v in entries.items():
+        if isinstance(v, (FrozenDict, FlaxVariable)):
+            typed_entries[str(k)] = v
+        else:
+            typed_entries[str(k)] = _coerce_flax_variable_value(v)
+    return FrozenDict(typed_entries)
 
 
 class BasePyTreeCheckpointHandler(AsyncCheckpointHandler):
@@ -1001,6 +1327,264 @@ class BasePyTreeCheckpointHandler(AsyncCheckpointHandler):
         self.enable_pinned_host_transfer = enable_pinned_host_transfer
         self.is_prioritized_key_fn = is_prioritized_key_fn
 
+    def _pack_pytree(self, node: PyTree) -> PyTree:
+        """Pack rich ecosystem PyTree nodes into tagged serializable dictionaries.
+
+        Args:
+            node: Input PyTree node (``Variable``, ``State``, ``FrozenDict``, ``OptState``, array, or container).
+
+        Returns:
+            PyTree: Tagged PyTree ready for MessagePack serialization.
+        """
+        if isinstance(node, FlaxVariableProtocol):
+            return {
+                "__zero_flax_variable__": True,
+                "var_type": type(node).__name__,
+                "value": self._pack_pytree(node.value),
+                "metadata": self._pack_pytree(dict(node.metadata)),
+            }
+        if isinstance(node, FlaxStateProtocol):
+            return {
+                "__zero_flax_state__": True,
+                "entries": {str(k): self._pack_pytree(v) for k, v in node.items()},
+            }
+        if isinstance(node, FrozenDictProtocol):
+            return {
+                "__zero_flax_frozendict__": True,
+                "entries": {str(k): self._pack_pytree(v) for k, v in node.items()},
+            }
+        if isinstance(node, NamedTupleProtocol):
+            field_dict = node._asdict()
+            return {
+                "__zero_optax_opt_state__": True,
+                "state_type": type(node).__name__,
+                "fields": [str(f) for f in node._fields],
+                "values": {str(f): self._pack_pytree(field_dict.get(f)) for f in node._fields},
+            }
+        if is_array_protocol(node):
+            array_kind = (
+                "tensor"
+                if isinstance(node, CompilerTensor)
+                else ("serialized_array" if isinstance(node, SerializedArray) else "jax_array")
+            )
+            return {
+                "__zero_orbax_array__": True,
+                "array_kind": array_kind,
+                "shape": [int(d) for d in node.shape],
+                "dtype": str(node.dtype),
+                "data": array_to_nested_list(node),
+            }
+        if isinstance(node, tuple):
+            return tuple(self._pack_pytree(item) for item in node)
+        if isinstance(node, list):
+            return [self._pack_pytree(item) for item in node]
+        if is_pytree_mapping(node):
+            return {str(k): self._pack_pytree(v) for k, v in node.items()}
+        return node
+
+    def _unpack_pytree(self, node: PyTree, template: PyTree = None) -> PyTree:
+        """Unpack tagged PyTree dictionaries back into rich ecosystem containers and arrays.
+
+        Args:
+            node: Deserialized PyTree node.
+            template: Optional target template guiding container and array reconstruction. Defaults to None.
+
+        Returns:
+            PyTree: Reconstructed ecosystem PyTree.
+        """
+        if isinstance(node, FlaxStateProtocol):
+            tmpl_map = (
+                dict(template.items())
+                if isinstance(template, FlaxStateProtocol)
+                else (template if is_pytree_dict(template) else {})
+            )
+            return _build_flax_state(
+                {str(k): self._unpack_pytree(v, tmpl_map.get(str(k))) for k, v in node.items()},
+                template,
+            )
+        if is_pytree_dict(node):
+            if node.get("__zero_flax_variable__") is True:
+                var_type = str(node.get("var_type", "Variable"))
+                tmpl_val = template.value if isinstance(template, FlaxVariableProtocol) else None
+                val = self._unpack_pytree(node.get("value"), tmpl_val)
+                raw_meta = self._unpack_pytree(node.get("metadata"), None)
+                coerced_val = _coerce_flax_variable_value(val)
+                coerced_meta = _coerce_flax_metadata(raw_meta)
+                if isinstance(template, FlaxVariableProtocol):
+                    template.value = coerced_val
+                    return template.replace(value=coerced_val, **coerced_meta)
+                var_cls = _FLAX_VARIABLE_CLASSES.get(var_type, FlaxVariable)
+                return var_cls(coerced_val, **coerced_meta)
+            if node.get("__zero_flax_state__") is True:
+                raw_entries = node.get("entries")
+                entries_map = raw_entries if is_pytree_dict(raw_entries) else {}
+                tmpl_map = (
+                    dict(template.items())
+                    if isinstance(template, FlaxStateProtocol)
+                    else (template if is_pytree_dict(template) else {})
+                )
+                ordered_keys = [*tmpl_map.keys(), *(k for k in entries_map if k not in tmpl_map)]
+                unpacked_entries = {
+                    str(k): self._unpack_pytree(entries_map[k], tmpl_map.get(str(k)))
+                    for k in ordered_keys
+                    if k in entries_map
+                }
+                return _build_flax_state(unpacked_entries, template)
+            if node.get("__zero_flax_frozendict__") is True:
+                raw_entries = node.get("entries")
+                entries_map = raw_entries if is_pytree_dict(raw_entries) else {}
+                tmpl_map = (
+                    dict(template.items())
+                    if isinstance(template, FrozenDictProtocol)
+                    else (template if is_pytree_dict(template) else {})
+                )
+                ordered_keys = [*tmpl_map.keys(), *(k for k in entries_map if k not in tmpl_map)]
+                unpacked_entries = {
+                    str(k): self._unpack_pytree(entries_map[k], tmpl_map.get(str(k)))
+                    for k in ordered_keys
+                    if k in entries_map
+                }
+                return _build_frozen_dict(unpacked_entries)
+            if node.get("__zero_optax_opt_state__") is True:
+                raw_fields = node.get("fields")
+                raw_values = node.get("values")
+                field_names = (
+                    [str(f) for f in raw_fields] if isinstance(raw_fields, (list, tuple)) else []
+                )
+                values_map = raw_values if is_pytree_dict(raw_values) else {}
+                tmpl_fields = (
+                    dict(template._asdict())
+                    if isinstance(template, NamedTupleProtocol)
+                    else (template if is_pytree_dict(template) else {})
+                )
+                unpacked_vals = [
+                    self._unpack_pytree(values_map.get(f), tmpl_fields.get(f)) for f in field_names
+                ]
+                if isinstance(template, NamedTupleProtocol):
+                    return template._make(unpacked_vals)
+                return {f: v for f, v in zip(field_names, unpacked_vals)}
+            if node.get("__zero_orbax_array__") is True:
+                raw_shape = node.get("shape")
+                shape_tuple = (
+                    tuple(int(d) for d in raw_shape if isinstance(d, int))
+                    if isinstance(raw_shape, (list, tuple))
+                    else ()
+                )
+                dtype_str = str(node.get("dtype", "float32"))
+                array_kind = str(node.get("array_kind", "jax_array"))
+                return _reconstruct_array_leaf(
+                    node.get("data"),
+                    shape_tuple,
+                    dtype_str,
+                    array_kind,
+                    template,
+                )
+            if isinstance(template, FlaxStateProtocol):
+                tmpl_map = dict(template.items())
+                unpacked_s = {
+                    str(k): self._unpack_pytree(v, tmpl_map.get(str(k))) for k, v in node.items()
+                }
+                return _build_flax_state(unpacked_s, template)
+            if isinstance(template, FrozenDictProtocol):
+                tmpl_map = dict(template.items())
+                unpacked_fd = {
+                    str(k): self._unpack_pytree(v, tmpl_map.get(str(k))) for k, v in node.items()
+                }
+                return _build_frozen_dict(unpacked_fd)
+            if isinstance(template, NamedTupleProtocol):
+                tmpl_map = dict(template._asdict())
+                vals = [self._unpack_pytree(node.get(f), tmpl_map.get(f)) for f in template._fields]
+                return template._make(vals)
+            tmpl_dict = template if is_pytree_dict(template) else {}
+            return {k: self._unpack_pytree(v, tmpl_dict.get(k)) for k, v in node.items()}
+        if isinstance(node, SerializedArray):
+            return _reconstruct_array_leaf(
+                node.tolist(),
+                node.shape,
+                str(node.dtype),
+                "jax_array",
+                template,
+            )
+        if isinstance(node, tuple):
+            tmpl_seq = template if isinstance(template, (list, tuple)) else ()
+            return tuple(
+                self._unpack_pytree(item, tmpl_seq[idx] if idx < len(tmpl_seq) else None)
+                for idx, item in enumerate(node)
+            )
+        if isinstance(node, list):
+            tmpl_seq = template if isinstance(template, (list, tuple)) else ()
+            return [
+                self._unpack_pytree(item, tmpl_seq[idx] if idx < len(tmpl_seq) else None)
+                for idx, item in enumerate(node)
+            ]
+        return node
+
+    def _extract_structure(self, node: PyTree) -> PyTree:
+        """Extract the unpacked structural tree of a saved PyTree payload.
+
+        Args:
+            node: Packed or unpacked PyTree node.
+
+        Returns:
+            PyTree: Reconstructed structural tree.
+        """
+        return self._unpack_pytree(node, None)
+
+    def save(
+        self,
+        directory: PathLike | None = None,
+        item: PyTree = None,
+        *pos_args: PyTree,
+        **kwargs: PyTree,
+    ) -> None:
+        """Save a PyTree to ``directory`` after packing rich ecosystem nodes.
+
+        Args:
+            directory: Target checkpoint directory path. Defaults to None.
+            item: PyTree or ``CheckpointArgs`` payload to save. Defaults to None.
+            *pos_args: Additional positional save arguments.
+            **kwargs: Additional keyword save arguments.
+        """
+        payload = _unwrap_checkpoint_arg(item, kwargs)
+        packed = self._pack_pytree(payload)
+        super().save(directory, packed, *pos_args, **kwargs)
+
+    def restore(
+        self,
+        directory: PathLike | None = None,
+        item: PyTree = None,
+        *pos_args: PyTree,
+        **kwargs: PyTree,
+    ) -> PyTree:
+        """Restore and unpack a PyTree from ``directory``.
+
+        Args:
+            directory: Source checkpoint directory path. Defaults to None.
+            item: Optional target template or ``CheckpointArgs`` wrapper. Defaults to None.
+            *pos_args: Additional positional restore arguments.
+            **kwargs: Additional keyword restore arguments.
+
+        Returns:
+            PyTree: Unpacked PyTree structure or fallback template.
+        """
+        template = _unwrap_checkpoint_arg(item, kwargs)
+        sentinel = "__zero_orbax_missing__"
+        raw_restored = super().restore(directory, sentinel, *pos_args, **kwargs)
+        if raw_restored == sentinel:
+            return template
+        return self._unpack_pytree(raw_restored, template)
+
+    def structure(self, directory: PathLike | None = None) -> PyTree:
+        """Return the structural skeleton of the saved PyTree checkpoint.
+
+        Args:
+            directory: Checkpoint directory path. Defaults to None.
+
+        Returns:
+            PyTree: Extracted PyTree structure, or None.
+        """
+        return self._extract_structure(super().structure(directory))
+
     def get_param_names(self, item: PyTree) -> PyTree:
         """Derive dotted parameter names for each leaf in a PyTree dictionary.
 
@@ -1035,6 +1619,35 @@ class BasePyTreeCheckpointHandler(AsyncCheckpointHandler):
         return _build_names(item, "")
 
 
+def _apply_save_args_tree(item: PyTree, save_args_tree: PyTree) -> PyTree:
+    """Recursively apply a tree of ``SaveArgs`` to ``item`` before serialization.
+
+    Args:
+        item: PyTree structure to save.
+        save_args_tree: Matching tree of ``SaveArgs``.
+
+    Returns:
+        PyTree: PyTree with leaf ``dtype`` coercions applied.
+    """
+    if save_args_tree is None or item is None:
+        return item
+    if is_pytree_dict(item) and is_pytree_dict(save_args_tree):
+        return {k: _apply_save_args_tree(v, save_args_tree.get(k)) for k, v in item.items()}
+    if isinstance(save_args_tree, SaveArgs):
+        dt = save_args_tree.dtype
+        if (dt is int or dt == "int" or dt == "int32" or dt == "int64") and isinstance(
+            item, (int, float, str, bool)
+        ):
+            return int(item)
+        if (dt is float or dt == "float" or dt == "float32" or dt == "float64") and isinstance(
+            item, (int, float, str, bool)
+        ):
+            return float(item)
+        if dt is str or dt == "str":
+            return str(item)
+    return item
+
+
 def _apply_restore_args_tree(restored: PyTree, restore_args_tree: PyTree) -> PyTree:
     """Recursively apply a tree of ``RestoreArgs`` / ``ArrayRestoreArgs`` to ``restored``.
 
@@ -1043,14 +1656,42 @@ def _apply_restore_args_tree(restored: PyTree, restore_args_tree: PyTree) -> PyT
         restore_args_tree: Matching tree of ``RestoreArgs`` or ``ArrayRestoreArgs``.
 
     Returns:
-        PyTree: Coerced PyTree structure.
+        PyTree: Coerced and validated PyTree structure.
     """
     if restore_args_tree is None:
         return restored
+    if isinstance(restored, FlaxStateProtocol) and is_pytree_dict(restore_args_tree):
+        return _build_flax_state(
+            {k: _apply_restore_args_tree(v, restore_args_tree.get(k)) for k, v in restored.items()},
+            restored,
+        )
     if is_pytree_dict(restored) and is_pytree_dict(restore_args_tree):
         return {
             k: _apply_restore_args_tree(v, restore_args_tree.get(k)) for k, v in restored.items()
         }
+    if isinstance(restored, FlaxVariableProtocol) and isinstance(
+        restore_args_tree, ArrayRestoreArgs
+    ):
+        coerced_inner = _apply_restore_args_tree(restored.value, restore_args_tree)
+        return restored.replace(value=_coerce_flax_variable_value(coerced_inner))
+    if isinstance(restore_args_tree, ArrayRestoreArgs) and is_array_protocol(restored):
+        expected_shape = (
+            restore_args_tree.shape
+            if restore_args_tree.shape is not None
+            else restore_args_tree.global_shape
+        )
+        if restore_args_tree.strict and expected_shape is not None:
+            assert_shape(restored, expected_shape)
+        if restore_args_tree.dtype is not None:
+            resolved_dt = _resolve_compiler_dtype(str(restore_args_tree.dtype))
+            nested_data = array_to_nested_list(restored)
+            raw_in = (
+                nested_data if isinstance(nested_data, (int, float, bool, list, tuple)) else 0.0
+            )
+            restored = jnp.reshape(jnp.asarray(raw_in, dtype=resolved_dt), restored.shape)
+            if restore_args_tree.strict:
+                assert_type(restored, resolved_dt)
+        return restored
     target_type: type | str | None = (
         restore_args_tree.restore_type
         if isinstance(restore_args_tree, RestoreArgs)
@@ -1060,16 +1701,26 @@ def _apply_restore_args_tree(restored: PyTree, restore_args_tree: PyTree) -> PyT
             else None
         )
     )
+    target_dtype: str | DType | type | None = (
+        restore_args_tree.dtype
+        if isinstance(restore_args_tree, (RestoreArgs, ArrayRestoreArgs))
+        else None
+    )
+    effective_target = target_type if target_type is not None else target_dtype
 
-    if target_type is int and isinstance(restored, (int, float, str, bool)):
+    if (effective_target is int or effective_target in ("int", "int32", "int64")) and isinstance(
+        restored, (int, float, str, bool)
+    ):
         return int(restored)
-    if target_type is float and isinstance(restored, (int, float, str, bool)):
+    if (
+        effective_target is float or effective_target in ("float", "float32", "float64")
+    ) and isinstance(restored, (int, float, str, bool)):
         return float(restored)
-    if target_type is str and restored is not None:
+    if (effective_target is str or effective_target == "str") and restored is not None:
         return str(restored)
-    if target_type is list and isinstance(restored, (tuple, list)):
+    if effective_target is list and isinstance(restored, (tuple, list)):
         return list(restored)
-    if target_type is tuple and isinstance(restored, (tuple, list)):
+    if effective_target is tuple and isinstance(restored, (tuple, list)):
         return tuple(restored)
     return restored
 
@@ -1133,6 +1784,21 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
         self.save_device_host_concurrent_gb = save_device_host_concurrent_gb
         self.handler_impl = handler_impl
 
+    def _order_prioritized_keys(self, node: PyTree) -> PyTree:
+        """Order dictionary keys placing prioritized keys first when ``self.is_prioritized_key_fn`` is set.
+
+        Args:
+            node: PyTree node to order.
+
+        Returns:
+            PyTree: Ordered PyTree dictionary.
+        """
+        if self.is_prioritized_key_fn is None or not is_pytree_dict(node):
+            return node
+        prio_fn = self.is_prioritized_key_fn
+        sorted_keys = sorted(node.keys(), key=lambda k: (0 if prio_fn((str(k),)) else 1, k))
+        return {k: self._order_prioritized_keys(node[k]) for k in sorted_keys}
+
     def _encode_custom_leaves(self, node: PyTree) -> PyTree:
         """Encode leaves registered in ``self.type_handler_registry`` before packing.
 
@@ -1154,30 +1820,72 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
             }
         return node
 
+    def _decode_custom_leaves(self, node: PyTree) -> PyTree:
+        """Decode leaves tagged with ``__custom_type__`` using ``self.type_handler_registry``.
+
+        Args:
+            node: Restored PyTree node to inspect.
+
+        Returns:
+            PyTree: Tree with custom leaves deserialized via their registered ``TypeHandlerProtocol``.
+        """
+        if self.type_handler_registry is None or node is None:
+            return node
+        if is_pytree_dict(node):
+            custom_type = node.get("__custom_type__")
+            custom_hex = node.get("__custom_hex__")
+            if isinstance(custom_type, str) and isinstance(custom_hex, str):
+                th = self.type_handler_registry.get_by_typestr(custom_type)
+                if th is not None:
+                    return th.deserialize(bytes.fromhex(custom_hex))
+            return {k: self._decode_custom_leaves(v) for k, v in node.items()}
+        return node
+
     def save(
         self,
         directory: PathLike | None = None,
         item: PyTree = None,
         *pos_args: PyTree,
+        save_args: PyTree = None,
         **kwargs: PyTree,
     ) -> None:
-        """Save a PyTree to ``directory``, respecting ``handler_impl`` and ``aggregate_filename``.
+        """Save a PyTree to ``directory``, respecting ``handler_impl``, ``save_args``, and ``aggregate_filename``.
 
         Args:
             directory: Target checkpoint directory. Defaults to None.
-            item: PyTree or ``args.PyTreeSave`` wrapper to save. Defaults to None.
+            item: PyTree or ``args.PyTreeSave`` / ``args.StandardSave`` wrapper to save. Defaults to None.
             *pos_args: Additional positional save arguments.
+            save_args: Optional PyTree of ``SaveArgs``. Defaults to None.
             **kwargs: Additional keyword save arguments.
         """
         if self.handler_impl is not None:
             self.handler_impl.save(directory, item, *pos_args, **kwargs)
             return
+        active_save_args = save_args
+        raw_arg = item if isinstance(item, _CheckpointArgsBase) else kwargs.get("args")
+        if (
+            isinstance(raw_arg, (_PyTreeSaveArgsCls, _StandardSaveArgsCls))
+            and active_save_args is None
+        ):
+            active_save_args = raw_arg.save_args
         payload = _unwrap_checkpoint_arg(item, kwargs)
+        if active_save_args is not None:
+            payload = _apply_save_args_tree(payload, active_save_args)
+        payload = self._order_prioritized_keys(payload)
+        if (
+            self.array_metadata_validator is not None
+            and self.enable_post_merge_validation
+            and is_pytree_mapping(payload)
+        ):
+            meta_snapshot: dict[str, JsonValue] = {
+                str(k): str(type(v).__name__) for k, v in payload.items()
+            }
+            self.array_metadata_validator.validate(meta_snapshot)
         encoded_payload = self._encode_custom_leaves(payload)
         super().save(directory, encoded_payload, *pos_args, **kwargs)
         if directory is not None and self.aggregate_filename is not None:
             key = str(directory).rstrip("/")
-            encoded = MsgpackEngine().packb(encoded_payload)
+            encoded = MsgpackEngine().packb(self._pack_pytree(encoded_payload))
             AtomicWrite().atomic_write_bytes(f"{key}/{self.aggregate_filename}", encoded)
 
     def restore(
@@ -1194,7 +1902,7 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
 
         Args:
             directory: Source checkpoint directory. Defaults to None.
-            item: Target structure or ``args.PyTreeRestore``. Defaults to None.
+            item: Target structure or ``args.PyTreeRestore`` / ``args.StandardRestore``. Defaults to None.
             *pos_args: Additional positional restore arguments.
             transforms: Optional transformation rules PyTree. Defaults to None.
             transforms_default_to_original: Whether untransformed fields fall back to original values. Defaults to True.
@@ -1216,6 +1924,11 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
                 raw_arg.restore_args if active_restore_args is None else active_restore_args
             )
             target_item = raw_arg.item
+        elif isinstance(raw_arg, _StandardRestoreArgsCls):
+            active_restore_args = (
+                raw_arg.restore_args if active_restore_args is None else active_restore_args
+            )
+            target_item = raw_arg.item
         else:
             target_item = _unwrap_checkpoint_arg(item, kwargs)
 
@@ -1224,9 +1937,11 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
             agg_path = f"{str(directory).rstrip('/')}/{self.aggregate_filename}"
             raw_agg = FileSystemIO().read(agg_path)
             if raw_agg:
-                restored = MsgpackEngine().unpackb(raw_agg)
+                restored = self._unpack_pytree(MsgpackEngine().unpackb(raw_agg), target_item)
         if restored is None:
             restored = super().restore(directory, target_item, *pos_args, **kwargs)
+        if restored is not None:
+            restored = self._decode_custom_leaves(restored)
         if active_restore_args is not None and restored is not None:
             restored = _apply_restore_args_tree(restored, active_restore_args)
         if transforms is not None and target_item is not None and restored is not None:
@@ -1236,10 +1951,16 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
                 target_item,
                 default_to_original=default_orig,
             )
+        if (
+            transforms is None
+            and isinstance(target_item, (FlaxStateProtocol, FrozenDictProtocol, NamedTupleProtocol))
+            and isinstance(restored, (FlaxStateProtocol, FrozenDictProtocol, NamedTupleProtocol))
+        ):
+            assert_trees_all_equal_structs(restored, target_item)
         return restored
 
 
-class StandardCheckpointHandler(AsyncCheckpointHandler):
+class StandardCheckpointHandler(PyTreeCheckpointHandler):
     """Standard handler for saving and restoring typical training state PyTrees."""
 
     def __init__(
@@ -1260,12 +1981,13 @@ class StandardCheckpointHandler(AsyncCheckpointHandler):
             pytree_metadata_options: Optional ``PyTreeMetadataOptions``. Defaults to None.
             use_ocdbt: Whether to use OCDBT storage format. Defaults to True.
         """
-        super().__init__()
-        self.save_concurrent_gb = save_concurrent_gb
-        self.restore_concurrent_gb = restore_concurrent_gb
-        self.multiprocessing_options = multiprocessing_options
-        self.pytree_metadata_options = pytree_metadata_options
-        self.use_ocdbt = use_ocdbt
+        super().__init__(
+            save_concurrent_gb=save_concurrent_gb,
+            restore_concurrent_gb=restore_concurrent_gb,
+            multiprocessing_options=multiprocessing_options,
+            pytree_metadata_options=pytree_metadata_options,
+            use_ocdbt=use_ocdbt,
+        )
 
 
 class JsonCheckpointHandler(AsyncCheckpointHandler):
@@ -1344,14 +2066,14 @@ class ProtoCheckpointHandler(AsyncCheckpointHandler):
 
     def __init__(
         self,
-        filename: str,
+        filename: str = "proto.pb",
         *,
         multiprocessing_options: MultiprocessingOptions | None = None,
     ) -> None:
         """Initialize the ProtoCheckpointHandler.
 
         Args:
-            filename: Target filename for the serialized protobuf artifact.
+            filename: Target filename for the serialized protobuf artifact. Defaults to ``"proto.pb"``.
             multiprocessing_options: Optional ``MultiprocessingOptions``. Defaults to None.
         """
         super().__init__()
@@ -1374,8 +2096,14 @@ class ProtoCheckpointHandler(AsyncCheckpointHandler):
             **kwargs: Additional keyword save arguments.
         """
         if directory is not None:
+            raw_arg = item if isinstance(item, _CheckpointArgsBase) else kwargs.get("args")
+            fname = (
+                raw_arg.filename
+                if isinstance(raw_arg, _ProtoSaveArgsCls) and self.filename == "proto.pb"
+                else self.filename
+            )
             payload = _unwrap_checkpoint_arg(item, kwargs)
-            target_path = f"{str(directory).rstrip('/')}/{self.filename}"
+            target_path = f"{str(directory).rstrip('/')}/{fname}"
             AtomicWrite().atomic_write_bytes(target_path, MsgpackEngine().packb(payload))
 
     def restore(
@@ -1398,9 +2126,14 @@ class ProtoCheckpointHandler(AsyncCheckpointHandler):
         """
         raw_arg = item if isinstance(item, _CheckpointArgsBase) else kwargs.get("args")
         item_type = raw_arg.item_type if isinstance(raw_arg, _ProtoRestoreArgsCls) else None
+        fname = (
+            raw_arg.filename
+            if isinstance(raw_arg, _ProtoRestoreArgsCls) and self.filename == "proto.pb"
+            else self.filename
+        )
         template = _unwrap_checkpoint_arg(item, kwargs)
         if directory is not None:
-            raw = FileSystemIO().read(f"{str(directory).rstrip('/')}/{self.filename}")
+            raw = FileSystemIO().read(f"{str(directory).rstrip('/')}/{fname}")
             if raw:
                 unpacked = MsgpackEngine().unpackb(raw)
                 if item_type is str and unpacked is not None:
@@ -1625,6 +2358,66 @@ class NumpyRandomKeyCheckpointHandler(AsyncCheckpointHandler):
         return self.post_restore(template)
 
 
+class PyGrainCheckpointHandler(AsyncCheckpointHandler):
+    """Handler for saving and restoring ``zero_grain`` dataset and data loader iterators."""
+
+    def save(
+        self,
+        directory: PathLike | None = None,
+        item: PyTree = None,
+        *pos_args: PyTree,
+        **kwargs: PyTree,
+    ) -> None:
+        """Save a ``GrainIteratorProtocol`` state into ``directory/process_0-of-1.json``.
+
+        Args:
+            directory: Target checkpoint directory path. Defaults to None.
+            item: ``GrainIteratorProtocol`` or ``args.PyGrainCheckpointSave`` wrapper. Defaults to None.
+            *pos_args: Additional positional save arguments.
+            **kwargs: Additional keyword save arguments.
+        """
+        if directory is not None:
+            payload = _unwrap_checkpoint_arg(item, kwargs)
+            if isinstance(payload, GrainIteratorProtocol):
+                state = payload.get_state()
+                target_path = f"{str(directory).rstrip('/')}/process_0-of-1.json"
+                AtomicWrite().atomic_write_bytes(
+                    target_path,
+                    json.dumps(state, indent=2).encode("utf-8"),
+                )
+
+    def restore(
+        self,
+        directory: PathLike | None = None,
+        item: PyTree = None,
+        *pos_args: PyTree,
+        **kwargs: PyTree,
+    ) -> PyTree:
+        """Restore a ``GrainIteratorProtocol`` state from ``directory/process_0-of-1.json``.
+
+        Args:
+            directory: Source checkpoint directory path. Defaults to None.
+            item: Optional target ``GrainIteratorProtocol`` or ``args.PyGrainCheckpointRestore``. Defaults to None.
+            *pos_args: Additional positional restore arguments.
+            **kwargs: Additional keyword restore arguments.
+
+        Returns:
+            PyTree: The restored iterator (mutated in-place) or raw state dictionary if ``item is None``.
+        """
+        template = _unwrap_checkpoint_arg(item, kwargs)
+        if directory is not None:
+            target_path = f"{str(directory).rstrip('/')}/process_0-of-1.json"
+            raw = FileSystemIO().read(target_path)
+            if raw:
+                state: CheckpointStateDict = json.loads(raw.decode("utf-8"))
+                if isinstance(template, GrainIteratorProtocol):
+                    template.set_state(state)
+                    return template
+                state_tree: PyTree = dict(state)
+                return state_tree
+        return template
+
+
 class CheckpointHandlerRegistry:
     """Base interface for mapping checkpoint items and argument types to handlers."""
 
@@ -1786,17 +2579,18 @@ class CompositeCheckpointHandler(AsyncCheckpointHandler):
                 return from_reg
         if isinstance(item_arg, _CheckpointArgsBase):
             reg_cls = args.get_registered_handler_cls(item_arg)
-            if (
-                reg_cls is not None
-                and issubclass(reg_cls, CheckpointHandler)
-                and reg_cls is not ProtoCheckpointHandler
-            ):
+            if reg_cls is not None and issubclass(reg_cls, CheckpointHandler):
                 existing = self._item_handlers.get(item_name)
                 if existing is not None and isinstance(existing, reg_cls):
                     return existing
                 inst: CheckpointHandler = reg_cls()
                 self._item_handlers[item_name] = inst
                 return inst
+        unwrapped_item = item_arg.item if isinstance(item_arg, _CheckpointArgsBase) else item_arg
+        if isinstance(unwrapped_item, GrainIteratorProtocol):
+            grain_handler = PyGrainCheckpointHandler()
+            self._item_handlers[item_name] = grain_handler
+            return grain_handler
         if item_name in self._item_handlers:
             return self._item_handlers[item_name]
         default_handler = StandardCheckpointHandler()
@@ -1915,8 +2709,14 @@ class CompositeCheckpointHandler(AsyncCheckpointHandler):
         restored_dict: dict[str, PyTree] = {}
         for name in target_names:
             sub_arg = comp_map.get(name)
-            sub_handler = self._resolve_handler_for_item(name, sub_arg)
             sub_dir = f"{base_dir}/{name}"
+            if (
+                sub_arg is None
+                and name not in self._item_handlers
+                and FileSystemIO().exists(f"{sub_dir}/process_0-of-1.json")
+            ):
+                self._item_handlers[name] = PyGrainCheckpointHandler()
+            sub_handler = self._resolve_handler_for_item(name, sub_arg)
             restored_dict[name] = sub_handler.restore(sub_dir, sub_arg)
         return restored_dict
 
@@ -1971,34 +2771,31 @@ class CompositeCheckpointHandler(AsyncCheckpointHandler):
             sub_handler.close()
 
 
-_SAVE_ARGS_TO_HANDLER.update(
-    {
-        args.ArraySave: ArrayCheckpointHandler,
-        args.JsonSave: JsonCheckpointHandler,
-        args.ProtoSave: ProtoCheckpointHandler,
-        args.PyTreeSave: PyTreeCheckpointHandler,
-        args.StandardSave: StandardCheckpointHandler,
-        args.JaxRandomKeySave: JaxRandomKeyCheckpointHandler,
-        args.NumpyRandomKeySave: NumpyRandomKeyCheckpointHandler,
-        args.Composite: CompositeCheckpointHandler,
-    }
-)
-_RESTORE_ARGS_TO_HANDLER.update(
-    {
-        args.ArrayRestore: ArrayCheckpointHandler,
-        args.JsonRestore: JsonCheckpointHandler,
-        args.ProtoRestore: ProtoCheckpointHandler,
-        args.PyTreeRestore: PyTreeCheckpointHandler,
-        args.StandardRestore: StandardCheckpointHandler,
-        args.JaxRandomKeyRestore: JaxRandomKeyCheckpointHandler,
-        args.NumpyRandomKeyRestore: NumpyRandomKeyCheckpointHandler,
-        args.Composite: CompositeCheckpointHandler,
-    }
-)
-for _s_cls, _h_cls in _SAVE_ARGS_TO_HANDLER.items():
-    _HANDLER_TO_SAVE_ARGS[_h_cls] = _s_cls
-for _r_cls, _h_cls in _RESTORE_ARGS_TO_HANDLER.items():
-    _HANDLER_TO_RESTORE_ARGS[_h_cls] = _r_cls
+for _s_cls, _h_cls in (
+    (args.ArraySave, ArrayCheckpointHandler),
+    (args.JsonSave, JsonCheckpointHandler),
+    (args.ProtoSave, ProtoCheckpointHandler),
+    (args.PyTreeSave, PyTreeCheckpointHandler),
+    (args.StandardSave, StandardCheckpointHandler),
+    (args.JaxRandomKeySave, JaxRandomKeyCheckpointHandler),
+    (args.NumpyRandomKeySave, NumpyRandomKeyCheckpointHandler),
+    (args.PyGrainCheckpointSave, PyGrainCheckpointHandler),
+    (args.Composite, CompositeCheckpointHandler),
+):
+    _CATALOG.register(_s_cls, _h_cls, for_save=True)
+
+for _r_cls, _h_cls in (
+    (args.ArrayRestore, ArrayCheckpointHandler),
+    (args.JsonRestore, JsonCheckpointHandler),
+    (args.ProtoRestore, ProtoCheckpointHandler),
+    (args.PyTreeRestore, PyTreeCheckpointHandler),
+    (args.StandardRestore, StandardCheckpointHandler),
+    (args.JaxRandomKeyRestore, JaxRandomKeyCheckpointHandler),
+    (args.NumpyRandomKeyRestore, NumpyRandomKeyCheckpointHandler),
+    (args.PyGrainCheckpointRestore, PyGrainCheckpointHandler),
+    (args.Composite, CompositeCheckpointHandler),
+):
+    _CATALOG.register(_r_cls, _h_cls, for_restore=True)
 
 
 class AbstractCheckpointer:
@@ -2153,16 +2950,31 @@ class Checkpointer(AbstractCheckpointer):
         Returns:
             Future | None: Always returns ``None`` for synchronous ``Checkpointer``.
         """
+        perm_mode = (
+            self.file_options.path_permission_mode if self.file_options is not None else None
+        )
+        temp_obj: TemporaryPathProtocol | None = None
+        active_path: PathLike = path
+        if self.temporary_path_class is not None:
+            temp_obj = self.temporary_path_class()
+            temp_obj.create()
+            active_path = temp_obj.get()
+        elif perm_mode is not None:
+            FileSystemIO().makedirs(path, exist_ok=True, permission_mode=perm_mode)
+
         if self.handler is not None:
-            self.handler.save(path, item, *pos_args, **kwargs)
-            self.handler.finalize(path)
+            self.handler.save(active_path, item, *pos_args, **kwargs)
+            self.handler.finalize(active_path)
         else:
             payload = _unwrap_checkpoint_arg(item, kwargs)
-            key = str(path).rstrip("/")
+            key = str(active_path).rstrip("/")
             AtomicWrite().atomic_write_bytes(
                 f"{key}/checkpoint.msgpack",
                 MsgpackEngine().packb(payload),
+                permission_mode=perm_mode,
             )
+        if temp_obj is not None:
+            temp_obj.finalize()
         if self.checkpoint_metadata_store is not None:
             self.checkpoint_metadata_store.write(path, {"path": str(path)})
         return None
@@ -2305,12 +3117,20 @@ class AsyncCheckpointer(Checkpointer):
             Future: Future representing the asynchronous save operation.
         """
         if isinstance(self.handler, AsyncCheckpointHandler):
-            sub_futures = self.handler.async_save(path, item, *pos_args, **kwargs) or []
+            temp_obj: TemporaryPathProtocol | None = None
+            active_path: PathLike = path
+            if self.temporary_path_class is not None:
+                temp_obj = self.temporary_path_class()
+                temp_obj.create()
+                active_path = temp_obj.get()
+            sub_futures = self.handler.async_save(active_path, item, *pos_args, **kwargs) or []
 
             def _commit() -> None:
                 """Finalize all handler futures and run barrier/post-finalization hooks."""
                 for sf in sub_futures:
                     sf.result(timeout=float(self.timeout_secs))
+                if temp_obj is not None:
+                    temp_obj.finalize()
                 if (
                     self.async_options is not None
                     and self.async_options.barrier_sync_fn is not None
@@ -2410,6 +3230,10 @@ class StandardCheckpointer(AsyncCheckpointer):
         atomicity_options: AtomicityOptions | None = None,
         checkpoint_metadata_store: CheckpointMetadataStoreProtocol | None = None,
         temporary_path_class: type[TemporaryPathProtocol] | None = None,
+        save_concurrent_gb: int = 96,
+        restore_concurrent_gb: int = 96,
+        pytree_metadata_options: PyTreeMetadataOptions | None = None,
+        use_ocdbt: bool = True,
         **kwargs: PyTree,
     ) -> None:
         """Initialize the StandardCheckpointer.
@@ -2421,10 +3245,20 @@ class StandardCheckpointer(AsyncCheckpointer):
             atomicity_options: Optional ``AtomicityOptions``. Defaults to None.
             checkpoint_metadata_store: Optional metadata store implementation. Defaults to None.
             temporary_path_class: Optional temporary path class. Defaults to None.
+            save_concurrent_gb: Max concurrent GB during save. Defaults to 96.
+            restore_concurrent_gb: Max concurrent GB during restore. Defaults to 96.
+            pytree_metadata_options: Optional ``PyTreeMetadataOptions``. Defaults to None.
+            use_ocdbt: Whether to use OCDBT storage format. Defaults to True.
             **kwargs: Additional keyword options for ``StandardCheckpointHandler``.
         """
         super().__init__(
-            handler=StandardCheckpointHandler(multiprocessing_options=multiprocessing_options),
+            handler=StandardCheckpointHandler(
+                save_concurrent_gb=save_concurrent_gb,
+                restore_concurrent_gb=restore_concurrent_gb,
+                multiprocessing_options=multiprocessing_options,
+                pytree_metadata_options=pytree_metadata_options,
+                use_ocdbt=use_ocdbt,
+            ),
             multiprocessing_options=multiprocessing_options,
             async_options=async_options,
             file_options=file_options,
@@ -2464,7 +3298,7 @@ class CheckpointManagerOptions:
     keep_time_interval: datetime.timedelta | None = None
     keep_period: int | None = None
     best_fn: BestFn | None = None
-    best_mode: str = "max"
+    best_mode: Literal["min", "max"] | str = "max"
     keep_checkpoints_without_metrics: bool = True
     step_prefix: str | None = None
     step_format_fixed_length: int | None = None
@@ -2566,7 +3400,7 @@ class CheckpointManagerOptions:
         max_to_keep: int | None = None,
         keep_period: int | None = None,
         read_only: bool | None = None,
-        best_mode: str | None = None,
+        best_mode: Literal["min", "max"] | str | None = None,
         create: bool | None = None,
         step_prefix: str | None = None,
         step_format_fixed_length: int | None = None,
@@ -2623,7 +3457,7 @@ class AbstractCheckpointManager:
         save_kwargs: Mapping[str, JsonValue] | None = None,
         metrics: Mapping[str, float | int] | None = None,
         force: bool = False,
-        args: _CheckpointArgsBase | PyTree = None,
+        args: args.CheckpointArgs | None = None,
         **kwargs: PyTree,
     ) -> bool:
         """Save a checkpoint at the given training step.
@@ -2651,7 +3485,7 @@ class AbstractCheckpointManager:
         items: PyTree = None,
         restore_kwargs: Mapping[str, JsonValue] | None = None,
         directory: PathLike | None = None,
-        args: _CheckpointArgsBase | PyTree = None,
+        args: args.CheckpointArgs | None = None,
         **kwargs: PyTree,
     ) -> PyTree:
         """Restore a checkpoint from a specific training step.
@@ -2823,6 +3657,8 @@ class CheckpointManager(AbstractCheckpointManager):
         self.steps: list[int] = []
         self.checkpoints: dict[int, PyTree] = {}
         self._step_metrics: dict[int, dict[str, float | int]] = {}
+        self._step_timestamps: dict[int, datetime.datetime] = {}
+        self._pending_futures: list[Future] = []
         self.latest: int | None = None
         self._saving_in_progress: bool = False
 
@@ -2835,6 +3671,16 @@ class CheckpointManager(AbstractCheckpointManager):
             FileSystemIO().makedirs(self.directory, exist_ok=True, permission_mode=perm)
         if (
             self.directory is not None
+            and self.options is not None
+            and self.options.cleanup_tmp_directories
+        ):
+            io_clean = FileSystemIO()
+            base_clean = str(self.directory).rstrip("/")
+            for entry in io_clean.listdir(self.directory):
+                if entry.endswith(".orbax-checkpoint-tmp") or ".tmp." in entry:
+                    io_clean.remove(f"{base_clean}/{entry}")
+        if (
+            self.directory is not None
             and self._metadata is not None
             and (self.options is None or self.options.save_root_metadata)
             and (self.options is None or not self.options.read_only)
@@ -2843,6 +3689,10 @@ class CheckpointManager(AbstractCheckpointManager):
                 f"{str(self.directory).rstrip('/')}/_root_metadata.json",
                 json.dumps({"metadata": self._metadata}).encode("utf-8"),
             )
+        if self.directory is not None and (
+            self.options is None or not self.options.lightweight_initialize
+        ):
+            self.reload()
 
     def _get_name_format(self) -> step_lib.NameFormat:
         """Resolve the active ``step_lib.NameFormat`` from ``self.options``.
@@ -2899,6 +3749,16 @@ class CheckpointManager(AbstractCheckpointManager):
             self.options.save_interval_steps > 0 and (step % self.options.save_interval_steps) == 0
         )
 
+    def _record_future(self, maybe_fut: Future | PyTree) -> None:
+        """Record an asynchronous ``Future`` returned by a checkpointer.
+
+        Args:
+            maybe_fut: Candidate ``Future`` or return value from ``save()``.
+        """
+        if isinstance(maybe_fut, Future):
+            self._pending_futures.append(maybe_fut)
+            self._saving_in_progress = True
+
     def _persist_step_to_disk(
         self,
         step_dir: str,
@@ -2928,11 +3788,13 @@ class CheckpointManager(AbstractCheckpointManager):
 
         if isinstance(self.checkpointers, Mapping) and is_pytree_dict(items):
             for item_name, cp in self.checkpointers.items():
-                cp.save(f"{step_dir}/{item_name}", items.get(item_name), **extra_kw)
+                res = cp.save(f"{step_dir}/{item_name}", items.get(item_name), **extra_kw)
+                self._record_future(res)
             return
         if isinstance(self.checkpointers, AbstractCheckpointer):
             target_val = items if items is not None else args_obj
-            self.checkpointers.save(step_dir, target_val, **extra_kw)
+            res = self.checkpointers.save(step_dir, target_val, **extra_kw)
+            self._record_future(res)
             return
 
         if isinstance(self.item_handlers, Mapping) and is_pytree_dict(items):
@@ -2946,11 +3808,7 @@ class CheckpointManager(AbstractCheckpointManager):
 
         if isinstance(args_obj, _CheckpointArgsBase):
             reg_h_cls = args.get_registered_handler_cls(args_obj)
-            if (
-                reg_h_cls is not None
-                and issubclass(reg_h_cls, CheckpointHandler)
-                and reg_h_cls is not ProtoCheckpointHandler
-            ):
+            if reg_h_cls is not None and issubclass(reg_h_cls, CheckpointHandler):
                 reg_h_cls().save(step_dir, args_obj, **extra_kw)
                 return
 
@@ -2959,7 +3817,8 @@ class CheckpointManager(AbstractCheckpointManager):
             if items is not None
             else (args_obj.item if isinstance(args_obj, _CheckpointArgsBase) else args_obj)
         )
-        encoded = MsgpackEngine().packb(payload)
+        packed = BasePyTreeCheckpointHandler()._pack_pytree(payload)
+        encoded = MsgpackEngine().packb(packed)
         AtomicWrite().atomic_write_bytes(f"{step_dir}/checkpoint.msgpack", encoded)
 
     def _compute_protected_steps(self, opts: CheckpointManagerOptions) -> set[int]:
@@ -2979,10 +3838,19 @@ class CheckpointManager(AbstractCheckpointManager):
             for s in self.steps:
                 if s % opts.keep_period == 0:
                     protected.add(s)
-        if opts.should_keep_fn is not None:
-            now = datetime.datetime.now(tz=datetime.timezone.utc)
+        if opts.keep_time_interval is not None:
+            default_epoch = datetime.datetime.now(tz=datetime.timezone.utc)
+            last_kept_time: datetime.datetime | None = None
             for s in self.steps:
-                if opts.should_keep_fn(s, now):
+                ts = self._step_timestamps.get(s, default_epoch)
+                if last_kept_time is None or (ts - last_kept_time) >= opts.keep_time_interval:
+                    protected.add(s)
+                    last_kept_time = ts
+        if opts.should_keep_fn is not None:
+            default_now = datetime.datetime.now(tz=datetime.timezone.utc)
+            for s in self.steps:
+                step_ts = self._step_timestamps.get(s, default_now)
+                if opts.should_keep_fn(s, step_ts):
                     protected.add(s)
         if opts.best_fn is not None and opts.max_to_keep is not None:
             best_fn = opts.best_fn
@@ -3036,7 +3904,7 @@ class CheckpointManager(AbstractCheckpointManager):
         save_kwargs: Mapping[str, JsonValue] | None = None,
         metrics: Mapping[str, float | int] | None = None,
         force: bool = False,
-        args: _CheckpointArgsBase | PyTree = None,
+        args: args.CheckpointArgs | None = None,
         **kwargs: PyTree,
     ) -> bool:
         """Save a checkpoint at ``step`` if retention/interval conditions are satisfied.
@@ -3074,6 +3942,8 @@ class CheckpointManager(AbstractCheckpointManager):
         if step not in self.steps:
             self.steps.append(step)
         self.checkpoints[step] = payload
+        if step not in self._step_timestamps:
+            self._step_timestamps[step] = datetime.datetime.now(tz=datetime.timezone.utc)
         if metrics is not None:
             self._step_metrics[step] = dict(metrics)
         self.latest = max(self.steps)
@@ -3109,6 +3979,7 @@ class CheckpointManager(AbstractCheckpointManager):
                 self.steps.remove(to_remove)
                 self.checkpoints.pop(to_remove, None)
                 self._step_metrics.pop(to_remove, None)
+                self._step_timestamps.pop(to_remove, None)
                 self._remove_step_storage(to_remove)
             self.latest = max(self.steps) if self.steps else None
         return True
@@ -3168,15 +4039,27 @@ class CheckpointManager(AbstractCheckpointManager):
 
         if isinstance(args_obj, _CheckpointArgsBase):
             reg_h_cls = args.get_registered_handler_cls(args_obj)
-            if (
-                reg_h_cls is not None
-                and issubclass(reg_h_cls, CheckpointHandler)
-                and reg_h_cls is not ProtoCheckpointHandler
-            ):
+            if reg_h_cls is not None and issubclass(reg_h_cls, CheckpointHandler):
                 return reg_h_cls().restore(step_dir, args_obj, **extra_kw)
 
         raw = FileSystemIO().read(f"{step_dir}/checkpoint.msgpack")
-        return MsgpackEngine().unpackb(raw)
+        if raw:
+            return BasePyTreeCheckpointHandler()._unpack_pytree(
+                MsgpackEngine().unpackb(raw),
+                items,
+            )
+        discovered_subdirs = [
+            entry
+            for entry in FileSystemIO().listdir(step_dir)
+            if not entry.startswith("_") and entry != "metrics.json"
+        ]
+        if discovered_subdirs:
+            comp_handler = CompositeCheckpointHandler(
+                *(self.item_names or ()),
+                handler_registry=self.handler_registry,
+            )
+            return comp_handler.restore(step_dir, items)
+        return None
 
     def restore(
         self,
@@ -3184,7 +4067,7 @@ class CheckpointManager(AbstractCheckpointManager):
         items: PyTree = None,
         restore_kwargs: Mapping[str, JsonValue] | None = None,
         directory: PathLike | None = None,
-        args: _CheckpointArgsBase | PyTree = None,
+        args: args.CheckpointArgs | None = None,
         **kwargs: PyTree,
     ) -> PyTree:
         """Restore a checkpoint for ``step`` (or the latest step if ``step is None``).
@@ -3205,18 +4088,17 @@ class CheckpointManager(AbstractCheckpointManager):
         """
         target_step = self.latest if step is None else step
         base_dir = directory if directory is not None else self.directory
-        if target_step is None or target_step not in self.checkpoints:
+        if target_step is None:
             raise ValueError(f"Checkpoint for step {step} not found.")
-        if base_dir is not None and (
-            directory is not None
-            or isinstance(args, _CheckpointArgsBase)
-            or self.checkpointers is not None
-            or self.item_handlers is not None
-        ):
+        if base_dir is not None:
             step_dir = self._step_dir(target_step, base_dir=base_dir)
+            if target_step not in self.checkpoints and not FileSystemIO().exists(step_dir):
+                raise ValueError(f"Checkpoint for step {step} not found.")
             from_disk = self._restore_step_from_disk(step_dir, items, args, restore_kwargs)
             if from_disk is not None:
                 return from_disk
+        elif target_step not in self.checkpoints:
+            raise ValueError(f"Checkpoint for step {step} not found.")
         stored = self.checkpoints.get(target_step)
         return stored if stored is not None else items
 
@@ -3270,8 +4152,33 @@ class CheckpointManager(AbstractCheckpointManager):
             self.steps.remove(step)
             self.checkpoints.pop(step, None)
             self._step_metrics.pop(step, None)
+            self._step_timestamps.pop(step, None)
             self.latest = max(self.steps) if self.steps else None
             self._remove_step_storage(step)
+
+    def check_for_errors(self) -> None:
+        """Check for any asynchronous background errors across pending futures and checkpointers."""
+        for fut in self._pending_futures:
+            fut.result()
+        if isinstance(self.checkpointers, AsyncCheckpointer):
+            self.checkpointers.check_for_errors()
+        elif isinstance(self.checkpointers, Mapping):
+            for cp in self.checkpointers.values():
+                if isinstance(cp, AsyncCheckpointer):
+                    cp.check_for_errors()
+
+    def wait_until_finished(self) -> None:
+        """Block until any in-flight background operations complete."""
+        for fut in self._pending_futures:
+            fut.result()
+        self._pending_futures.clear()
+        if isinstance(self.checkpointers, AsyncCheckpointer):
+            self.checkpointers.wait_until_finished()
+        elif isinstance(self.checkpointers, Mapping):
+            for cp in self.checkpointers.values():
+                if isinstance(cp, AsyncCheckpointer):
+                    cp.wait_until_finished()
+        self._saving_in_progress = False
 
     def is_saving_in_progress(self) -> bool:
         """Return whether an asynchronous save operation is currently in progress.
@@ -3341,6 +4248,10 @@ class CheckpointManager(AbstractCheckpointManager):
                 self.steps.append(step_num)
                 restored_val = self._restore_step_from_disk(step_dir, None, None, None)
                 self.checkpoints[step_num] = restored_val
+                self._step_timestamps.setdefault(
+                    step_num,
+                    datetime.datetime.now(tz=datetime.timezone.utc),
+                )
                 raw_m = io_handler.read(f"{step_dir}/metrics.json")
                 if raw_m:
                     loaded_m: dict[str, float | int] = json.loads(raw_m.decode("utf-8"))
@@ -3550,7 +4461,11 @@ def apply_transformations(
                         )
                         res[k] = t.multi_value_fn(coerced_full)
                     else:
-                        fallback_val = o if (t.use_fallback or t.original_key is None) else o
+                        fallback_val = (
+                            o
+                            if (t.use_fallback or t.original_key is None)
+                            else (new_val if new_val is not None else o)
+                        )
                         resolved_o = (
                             _get_by_path(orig_full, t.original_key, fallback_val)
                             if t.original_key is not None
@@ -3598,9 +4513,7 @@ def merge_trees(
             for k, v in t.items():
                 existing = res.get(k)
                 if is_pytree_dict(existing) and is_pytree_dict(v):
-                    new_val: dict[str, PyTree] = dict(existing)
-                    new_val.update(v)
-                    res[k] = new_val
+                    res[k] = merge_trees(existing, v)
                 else:
                     res[k] = v
         else:
@@ -3794,6 +4707,7 @@ class handlers:
     JsonCheckpointHandler = JsonCheckpointHandler
     NumpyRandomKeyCheckpointHandler = NumpyRandomKeyCheckpointHandler
     ProtoCheckpointHandler = ProtoCheckpointHandler
+    PyGrainCheckpointHandler = PyGrainCheckpointHandler
     PyTreeCheckpointHandler = PyTreeCheckpointHandler
     StandardCheckpointHandler = StandardCheckpointHandler
     CheckpointHandlerRegistry = CheckpointHandlerRegistry
@@ -3909,6 +4823,7 @@ __all__ = [
     "JsonCheckpointHandler",
     "NumpyRandomKeyCheckpointHandler",
     "ProtoCheckpointHandler",
+    "PyGrainCheckpointHandler",
     "PyTreeCheckpointHandler",
     "PyTreeCheckpointer",
     "RestoreArgs",

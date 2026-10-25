@@ -9,6 +9,45 @@ import sys
 import types
 from collections.abc import Mapping
 
+NAMESPACE_EMULATING_CLASSES: frozenset[str] = frozenset(
+    {
+        "abstract_checkpoint_manager",
+        "abstract_checkpointer",
+        "abstract_logger",
+        "aggregate_handlers",
+        "args",
+        "async_checkpoint_handler",
+        "async_checkpointer",
+        "atomicity",
+        "checkpoint",
+        "checkpoint_args",
+        "checkpoint_handler",
+        "checkpoint_manager",
+        "checkpoint_utils",
+        "checkpointer",
+        "epath",
+        "future",
+        "handlers",
+        "metadata",
+        "msgpack_utils",
+        "multihost",
+        "nest_asyncio",
+        "options",
+        "orbax",
+        "path",
+        "pytree_checkpointer",
+        "serialization",
+        "standard_checkpointer",
+        "step",
+        "step_lib",
+        "test_utils",
+        "transform_utils",
+        "tree",
+        "type_handlers",
+        "utils",
+    }
+)
+
 
 def dump_api(module: types.ModuleType) -> dict[str, dict[str, str | list[str]]]:
     """Introspect a Python module and build a structural dictionary of its public symbols.
@@ -73,8 +112,10 @@ def verify_snapshot_compliance(
         expected_type = expected.get("type")
         actual_type = actual.get("type")
 
-        if (expected_type == "namespace" and actual_type == "class") or (
-            expected_type == "class" and actual_type == "namespace"
+        if (
+            name in NAMESPACE_EMULATING_CLASSES
+            and expected_type == "namespace"
+            and actual_type == "class"
         ):
             continue
         if expected_type != actual_type:

@@ -50,7 +50,7 @@ def test_check_allowed_imports(tmp_path: pathlib.Path) -> None:
 
 
 def test_check_docs(tmp_path: pathlib.Path) -> None:
-    """Test check_docs across fully documented files, missing docstrings, stub docstrings, and missing Args.
+    """Test check_docs across fully documented files, missing docstrings, stub docstrings, and missing/extra Args/Returns/Raises.
 
     Args:
         tmp_path: Pytest temporary directory fixture.
@@ -66,7 +66,11 @@ def test_check_docs(tmp_path: pathlib.Path) -> None:
         '    """Sample class docstring."""',
         "",
         "def zero_params() -> int:",
-        '    """Return constant one."""',
+        '    """Return constant one.',
+        "",
+        "    Returns:",
+        "        int: One.",
+        '    """',
         "    return 1",
         "",
         "async def add(a: int, *args: int, **kwargs: int) -> int:",
@@ -125,10 +129,19 @@ def test_check_docs(tmp_path: pathlib.Path) -> None:
         "",
         "    Args:",
         "        x: Documented x.",
+        "        z: Extra documented z.",
         '    """',
-        "    return x + y",
+        '    raise ValueError("err")',
+        "",
+        "def no_annotation_fn():",
+        '    """No return annotation."""',
+        "    return None",
     ]
-    (invalid_dir / "bad_docs.py").write_text(NL.join(bad_doc_lines) + NL, encoding="utf-8")
+    bad_doc_path = invalid_dir / "bad_docs.py"
+    bad_doc_path.write_text(NL.join(bad_doc_lines) + NL, encoding="utf-8")
+    m_strict, _ = check_docs.check_file(str(bad_doc_path), strict_sections=True)
+    assert m_strict >= 6
+
     (invalid_dir / "stub_mod.py").write_text(
         '"""Provide module docstring."""' + NL,
         encoding="utf-8",
@@ -159,7 +172,7 @@ def test_lint_typing(tmp_path: pathlib.Path) -> None:
         "class Box:",
         '    """Box class."""',
         "",
-        "    def get(self, x: int) -> int:",
+        "    def get(self, x: int = 1) -> int:",
         '        """Get x.',
         "",
         "        Args:",
@@ -174,13 +187,15 @@ def test_lint_typing(tmp_path: pathlib.Path) -> None:
     bad_dir.mkdir()
     bad_file = bad_dir / "violations.py"
     bad_lines = [
+        "import builtins",
         "from typing import Any, cast",
         "import typing",
+        "BadAlias = Any",
         "x: Any = 1  #" + " type: ignore",
         "y: typing.Any = 2",
         "def untyped(a, *args, **kwargs):",
         "    return getattr(a, 'x')",
-        "def bad_types(a: object, *args: Any, **kwargs: object) -> Any:",
+        "def bad_types(a: object = object, *args: Any, **kwargs: object) -> Any:",
         "    typing.cast(int, a)",
         "    globals()",
         "    return a.__dict__",
@@ -227,17 +242,19 @@ def test_check_compliance_and_generate_snapshot(tmp_path: pathlib.Path) -> None:
     mismatch_snap: dict[str, dict[str, str | list[str]]] = {
         "__version__": {"type": "other"},
         "MissingClass": {"type": "class", "methods": ["foo"]},
-        "submod": {"type": "class", "methods": []},
+        "args": {"type": "namespace"},
+        "NonNamespaceSubmod": {"type": "class", "methods": []},
         "CONST": {"type": "function"},
         "SampleClass": {"type": "class", "methods": ["missing_method"]},
     }
     current_mock: dict[str, dict[str, str | list[str]]] = {
-        "submod": {"type": "namespace"},
+        "args": {"type": "class", "methods": []},
+        "NonNamespaceSubmod": {"type": "namespace"},
         "CONST": {"type": "other"},
         "SampleClass": {"type": "class", "methods": ["existing_method"]},
     }
     errs = check_compliance.verify_snapshot_compliance(current_mock, mismatch_snap)
-    assert len(errs) == 3
+    assert len(errs) == 4
 
     bad_snap_file = tmp_path / "bad_snap.json"
     bad_snap_file.write_text(
@@ -276,18 +293,46 @@ def test_update_badges(tmp_path: pathlib.Path) -> None:
     text_1 = readme_1.read_text(encoding="utf-8")
     assert "api_compliance-100%25-brightgreen.svg" in text_1
 
+    readme_2 = tmp_path / "README_2.md"
+    readme_2.write_text(
+        "# Title"
+        + NL
+        + "[![Test Coverage](https://img.shields.io/badge/test_coverage-90%25-green.svg)](#)"
+        + NL
+        + "[![Doc Coverage](https://img.shields.io/badge/doc_coverage-90%25-green.svg)](#)"
+        + NL
+        + "[![API Compliance](https://img.shields.io/badge/api_compliance-95%25-green.svg)](#)"
+        + NL,
+        encoding="utf-8",
+    )
     assert (
         update_badges.update_readme(
-            str(readme_1),
-            test_cov=95.5,
-            doc_cov=100.0,
+            readme_path=str(readme_2),
+            test_cov=88.4,
+            doc_cov=92.0,
             api_compliance=100.0,
         )
         is True
     )
-    text_2 = readme_1.read_text(encoding="utf-8")
-    assert "test_coverage-95.5%25-green.svg" in text_2
+    text_2 = readme_2.read_text(encoding="utf-8")
+    assert "test_coverage-88.4%25-yellowgreen.svg" in text_2
+    assert "doc_coverage-92%25-green.svg" in text_2
+    assert "api_compliance-100%25-brightgreen.svg" in text_2
 
-    readme_plain = tmp_path / "README_plain.md"
-    readme_plain.write_text("# Plain README" + NL, encoding="utf-8")
-    assert update_badges.update_readme(str(readme_plain)) is True
+    readme_no_doc = tmp_path / "README_no_doc.md"
+    readme_no_doc.write_text("# Only header" + NL, encoding="utf-8")
+    assert update_badges.update_readme(readme_path=str(readme_no_doc)) is True
+
+
+def test_requirements_txt_contains_griffe() -> None:
+    """Verify requirements.txt pins griffelib and griffecli from SamuelMarks/griffe@rest."""
+    req_path = pathlib.Path(__file__).resolve().parent.parent / "requirements.txt"
+    req_txt = req_path.read_text(encoding="utf-8")
+    assert (
+        "griffelib @ git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffelib"
+        in req_txt
+    )
+    assert (
+        "griffecli @ git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffecli"
+        in req_txt
+    )

@@ -19,27 +19,28 @@ def test_missing_symbols_and_behavioral_contracts(tmp_path: pathlib.Path) -> Non
         name: obj for name, obj in inspect.getmembers(zcp, inspect.isclass)
     }
 
-    target_classes = [
-        "AbstractCheckpointManager",
-        "AbstractCheckpointer",
-        "AsyncCheckpointer",
-        "AsyncOptions",
-        "CheckpointHandler",
-        "CheckpointManager",
-        "CheckpointManagerOptions",
-        "Checkpointer",
-        "Future",
-        "PyTreeCheckpointHandler",
-        "PyTreeCheckpointer",
-        "RestoreArgs",
-        "SaveArgs",
-        "StandardCheckpointHandler",
-    ]
-    for cls_name in target_classes:
+    expected_init_params: dict[str, tuple[str, ...]] = {
+        "AbstractCheckpointManager": (),
+        "AbstractCheckpointer": (),
+        "AsyncCheckpointer": ("_handler",),
+        "AsyncOptions": ("timeout_secs",),
+        "CheckpointHandler": (),
+        "CheckpointManager": ("directory", "checkpointers", "options"),
+        "CheckpointManagerOptions": ("save_interval_steps", "max_to_keep"),
+        "Checkpointer": ("handler",),
+        "Future": ("result",),
+        "PyTreeCheckpointHandler": ("aggregate_filename",),
+        "PyTreeCheckpointer": ("primary_host",),
+        "RestoreArgs": ("restore_type",),
+        "SaveArgs": ("aggregate",),
+        "StandardCheckpointHandler": ("save_concurrent_gb",),
+    }
+    for cls_name, expected_params in expected_init_params.items():
         assert cls_name in exported_members
         cls_obj = exported_members[cls_name]
         sig = inspect.signature(cls_obj)
-        assert len(sig.parameters) >= 0
+        for param_name in expected_params:
+            assert param_name in sig.parameters
 
     # Behavioral contract verification across the exported classes
     save_args = zcp.SaveArgs(aggregate=True, dtype="float32", chunk_byte_size=1024, shard_axes=(0,))

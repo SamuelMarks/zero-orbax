@@ -4,7 +4,8 @@ Verifies that across ``src/``, ``scripts/``, and ``tests/``:
 - ``Any`` and ``object`` are never imported or used in type annotations.
 - ``typing.cast``, ``getattr``, ``setattr``, ``hasattr``, ``delattr``, ``globals``, ``locals``,
   ``vars``, ``exec``, ``eval``, ``compile``, ``__import__``, ``__dict__``, ``__class__``,
-  ``__bases__``, and ``__mro__`` are not used.
+  ``__bases__``, ``__mro__``, ``__subclasses__``, ``__globals__``, ``__code__``, ``__closure__``,
+  ``__func__``, and ``__self__`` are not used.
 - Inline type-ignore suppression comments are not used.
 - Every function and method has explicit type annotations on all parameters and return values.
 """
@@ -52,6 +53,27 @@ FORBIDDEN_DUNDER_ATTRS: frozenset[str] = frozenset(
         "__class__",
         "__bases__",
         "__mro__",
+        "__subclasses__",
+        "__globals__",
+        "__code__",
+        "__closure__",
+        "__func__",
+        "__self__",
+    }
+)
+FORBIDDEN_IMPORT_NAMES: frozenset[str] = frozenset(
+    {
+        "Any",
+        "cast",
+        "getattr",
+        "setattr",
+        "hasattr",
+        "delattr",
+        "vars",
+        "globals",
+        "locals",
+        "exec",
+        "eval",
     }
 )
 
@@ -102,6 +124,12 @@ def _check_function_node(
                     f"{file_path}:{arg.lineno}: prohibited parameter annotation '{hit}' on '{arg.arg}'"
                 )
 
+    for default_val in [d for d in [*node.args.defaults, *node.args.kw_defaults] if d is not None]:
+        for hit in _annotation_violations(default_val):
+            violations.append(
+                f"{file_path}:{node.lineno}: prohibited default value reference '{hit}' in '{node.name}'"
+            )
+
     for var_arg in (node.args.vararg, node.args.kwarg):
         if var_arg is not None:
             if var_arg.annotation is None:
@@ -151,9 +179,15 @@ def scan_file(file_path: str) -> list[str]:
                 violations.append(f"{file_path}:{tok.start[0]}: prohibited type-ignore comment")
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
+        if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name in ("Any", "cast"):
+                if alias.name == "builtins":
+                    violations.append(f"{file_path}:{node.lineno}: prohibited import 'builtins'")
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in FORBIDDEN_IMPORT_NAMES or (
+                    alias.asname is not None and alias.asname in FORBIDDEN_IMPORT_NAMES
+                ):
                     violations.append(
                         f"{file_path}:{node.lineno}: prohibited import '{alias.name}'"
                     )
@@ -164,6 +198,13 @@ def scan_file(file_path: str) -> list[str]:
                 violations.append(
                     f"{file_path}:{node.lineno}: prohibited variable annotation '{hit}'"
                 )
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id.endswith("Alias"):
+                    for hit in _annotation_violations(node.value):
+                        violations.append(
+                            f"{file_path}:{node.lineno}: prohibited type alias value '{hit}'"
+                        )
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id in FORBIDDEN_REFLECTION_CALLS:
                 violations.append(

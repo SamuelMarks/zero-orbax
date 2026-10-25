@@ -47,14 +47,27 @@ class PyTreeCheckpointHandlerTest(parameterized.TestCase):
             handler.close()
 
     def test_merge_trees(self) -> None:
-        """Test merging multiple overlapping PyTree dictionaries."""
-        tree1: dict[str, PyTree] = {"a": 1, "b": {"c": 2}}
-        tree2: dict[str, PyTree] = {"b": {"d": 3}, "e": 4}
+        """Test deeply merging 3-level nested PyTree dictionaries."""
+        tree1: dict[str, PyTree] = {
+            "a": 1,
+            "b": {"c": 2, "nested": {"x": 10, "shared": "old"}},
+        }
+        tree2: dict[str, PyTree] = {
+            "b": {"d": 3, "nested": {"y": 20, "shared": "new"}},
+            "e": 4,
+        }
         merged = ocp.merge_trees(tree1, tree2)
-        self.assertEqual(merged, {"a": 1, "b": {"c": 2, "d": 3}, "e": 4})
+        self.assertEqual(
+            merged,
+            {
+                "a": 1,
+                "b": {"c": 2, "d": 3, "nested": {"x": 10, "y": 20, "shared": "new"}},
+                "e": 4,
+            },
+        )
 
     def test_apply_transformations(self) -> None:
-        """Test applying a set of transformation rules to a PyTree."""
+        """Test applying transformation rules including use_fallback=True vs False."""
 
         def _scale10(val: PyTree) -> PyTree:
             """Multiply an integer leaf by 10.
@@ -86,3 +99,11 @@ class PyTreeCheckpointHandlerTest(parameterized.TestCase):
         new_t: PyTree = {"a": None, "b": {"c": None}}
         res = ocp.apply_transformations(orig, transformations, new_t)
         self.assertEqual(res, {"a": 10, "b": {"c": 40}})
+
+        # Verify use_fallback=True vs use_fallback=False when original_key is absent
+        orig_fb: PyTree = {"k": 100}
+        trans_with_fb: PyTree = {"k": ocp.Transform(original_key="missing_key", use_fallback=True)}
+        trans_no_fb: PyTree = {"k": ocp.Transform(original_key="missing_key", use_fallback=False)}
+        target_fb: PyTree = {"k": -1}
+        self.assertEqual(ocp.apply_transformations(orig_fb, trans_with_fb, target_fb), {"k": 100})
+        self.assertEqual(ocp.apply_transformations(orig_fb, trans_no_fb, target_fb), {"k": -1})

@@ -14,6 +14,10 @@ ALLOWED_INTERNAL: frozenset[str] = frozenset(
         "ml_switcheroo_ir",
         "ml_switcheroo_compiler",
         "ml_ecosystem_snapshots",
+        "zero_chex",
+        "zero_flax",
+        "zero_grain",
+        "zero_optax",
         "zero_jax",
         "zero_orbax",
     }

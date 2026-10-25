@@ -8,13 +8,17 @@ engine, multi-host barrier synchronization, and global array sharding utilities.
 
 from __future__ import annotations
 
+import contextvars
+import dataclasses
 import json
 import os
 import pathlib
 import shutil
 import struct
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from typing import Union
+from typing_extensions import TypeAlias
 
 from ml_switcheroo_ir import LogicalGraph, LogicalMesh, PartitionSpec
 
@@ -26,10 +30,47 @@ from zero_orbax.types import (
     PathLike,
     PyTree,
     PyTreeLeaf,
+    array_to_nested_list,
     is_array_protocol,
     is_pytree_mapping,
     normalize_path,
 )
+
+_VIRTUAL_SCHEMES: tuple[str, ...] = ("gs://", "s3://", "memory://")
+_VFS_FILES_CTX: contextvars.ContextVar[dict[str, bytes] | None] = contextvars.ContextVar(
+    "_VFS_FILES_CTX",
+    default=None,
+)
+_BARRIER_COUNTS_CTX: contextvars.ContextVar[dict[str, int] | None] = contextvars.ContextVar(
+    "_BARRIER_COUNTS_CTX",
+    default=None,
+)
+
+
+def _get_default_vfs_files() -> dict[str, bytes]:
+    """Return the active context-local default virtual file system dictionary.
+
+    Returns:
+        dict[str, bytes]: Context-scoped virtual file dictionary.
+    """
+    current = _VFS_FILES_CTX.get()
+    if current is None:
+        current = {}
+        _VFS_FILES_CTX.set(current)
+    return current
+
+
+def _get_default_barrier_counts() -> dict[str, int]:
+    """Return the active context-local default barrier counter dictionary.
+
+    Returns:
+        dict[str, int]: Context-scoped barrier counter dictionary.
+    """
+    current = _BARRIER_COUNTS_CTX.get()
+    if current is None:
+        current = {}
+        _BARRIER_COUNTS_CTX.set(current)
+    return current
 
 
 def _is_virtual_uri(path_str: str) -> bool:
@@ -41,23 +82,36 @@ def _is_virtual_uri(path_str: str) -> bool:
     Returns:
         bool: True if the path starts with a virtual URI scheme.
     """
-    return path_str.startswith(("gs://", "s3://", "memory://"))
+    return path_str.startswith(_VIRTUAL_SCHEMES)
+
+
+def _normalize_virtual_key(key: str) -> str:
+    """Normalize a virtual URI or path string by collapsing duplicate slashes and trailing slashes.
+
+    Args:
+        key: Raw path or virtual URI string.
+
+    Returns:
+        str: Normalized virtual URI or path key.
+    """
+    for scheme in _VIRTUAL_SCHEMES:
+        if key.startswith(scheme):
+            rest = key[len(scheme) :]
+            parts = [p for p in rest.split("/") if p]
+            return scheme + "/".join(parts)
+    return key.rstrip("/") if key != "/" else key
 
 
 class VirtualFileSystem:
     """Encapsulated in-memory virtual file system store for ``gs://``, ``s3://``, and ``memory://`` URIs."""
 
-    _default_files: dict[str, bytes] = {}
-
     def __init__(self, files: dict[str, bytes] | None = None) -> None:
         """Initialize the VirtualFileSystem store.
 
         Args:
-            files: Optional isolated dictionary backing this store. Defaults to the shared store when None.
+            files: Optional isolated dictionary backing this store. Defaults to the context store when None.
         """
-        self._files: dict[str, bytes] = (
-            files if files is not None else VirtualFileSystem._default_files
-        )
+        self._files: dict[str, bytes] = files if files is not None else _get_default_vfs_files()
 
     def get(self, key: str) -> bytes | None:
         """Retrieve stored bytes for ``key`` if present.
@@ -68,7 +122,7 @@ class VirtualFileSystem:
         Returns:
             bytes | None: Stored bytes, or None if not present.
         """
-        return self._files.get(key)
+        return self._files.get(_normalize_virtual_key(key))
 
     def put(self, key: str, data: bytes) -> None:
         """Store ``data`` under ``key``.
@@ -77,7 +131,7 @@ class VirtualFileSystem:
             key: Virtual URI or path key.
             data: Raw byte payload.
         """
-        self._files[key] = data
+        self._files[_normalize_virtual_key(key)] = data
 
     def has_key(self, key: str) -> bool:
         """Check whether an exact ``key`` exists in the store.
@@ -88,7 +142,7 @@ class VirtualFileSystem:
         Returns:
             bool: True if ``key`` exists.
         """
-        return key in self._files
+        return _normalize_virtual_key(key) in self._files
 
     def keys(self) -> list[str]:
         """Return a snapshot list of all keys in the virtual store.
@@ -107,7 +161,7 @@ class VirtualFileSystem:
         Returns:
             bytes | None: Removed bytes, or None if missing.
         """
-        return self._files.pop(key, None)
+        return self._files.pop(_normalize_virtual_key(key), None)
 
     def reset(self) -> None:
         """Clear all entries in this virtual file system store."""
@@ -138,7 +192,7 @@ class FileSystemIO:
         Raises:
             FileNotFoundError: If ``strict=True`` and the path does not exist.
         """
-        raw_str = str(path)
+        raw_str = _normalize_virtual_key(str(path))
         cached = self.vfs.get(raw_str)
         if cached is not None:
             return cached
@@ -164,7 +218,7 @@ class FileSystemIO:
             data: The raw bytes to write.
             permission_mode: Optional octal file permission mode to apply. Defaults to None.
         """
-        raw_str = str(path)
+        raw_str = _normalize_virtual_key(str(path))
         if _is_virtual_uri(raw_str):
             self.vfs.put(raw_str, data)
             return
@@ -184,7 +238,7 @@ class FileSystemIO:
         Returns:
             bool: True if the file or directory exists.
         """
-        raw_str = str(path)
+        raw_str = _normalize_virtual_key(str(path))
         if self.vfs.has_key(raw_str):
             return True
         prefix = raw_str.rstrip("/") + "/"
@@ -208,7 +262,7 @@ class FileSystemIO:
             exist_ok: Whether to succeed if the directory already exists. Defaults to True.
             permission_mode: Optional octal directory permission mode. Defaults to None.
         """
-        raw_str = str(path)
+        raw_str = _normalize_virtual_key(str(path))
         if not _is_virtual_uri(raw_str):
             norm = normalize_path(path)
             norm.mkdir(parents=True, exist_ok=exist_ok)
@@ -224,7 +278,7 @@ class FileSystemIO:
         Returns:
             list[str]: Sorted list of immediate entry names.
         """
-        raw_str = str(path)
+        raw_str = _normalize_virtual_key(str(path))
         entries: set[str] = set()
         prefix = raw_str.rstrip("/") + "/"
         for key in self.vfs.keys():
@@ -245,7 +299,7 @@ class FileSystemIO:
         Args:
             path: File or directory path to remove.
         """
-        raw_str = str(path)
+        raw_str = _normalize_virtual_key(str(path))
         self.vfs.pop(raw_str)
         prefix = raw_str.rstrip("/") + "/"
         for k in self.vfs.keys():
@@ -288,7 +342,7 @@ class AtomicWrite:
             data: Raw bytes to write atomically.
             permission_mode: Optional octal permission mode for the written file. Defaults to None.
         """
-        raw_str = str(path)
+        raw_str = _normalize_virtual_key(str(path))
         if _is_virtual_uri(raw_str):
             self.vfs.put(raw_str, data)
             return
@@ -360,6 +414,61 @@ class SerializedArray:
             bytes: Raw bytes.
         """
         return self._raw_bytes
+
+    def __eq__(self, other: SerializedArray | PyTree) -> bool:
+        """Compare equality against another ``SerializedArray`` or Python sequence.
+
+        Args:
+            other: Other array or PyTree value to compare.
+
+        Returns:
+            bool: True if shape, dtype, and data match.
+        """
+        if isinstance(other, SerializedArray):
+            return (
+                self._shape == other._shape
+                and self._dtype == other._dtype
+                and self._data == other._data
+            )
+        return bool(self._data == other)
+
+
+@dataclasses.dataclass(eq=False)
+class ReconstructedGraphNode:
+    """Concrete implementation of ``GraphProtocol`` reconstructed during MessagePack decoding.
+
+    Attributes:
+        name: Graph identifier name.
+        inputs: List of input tensor names.
+        outputs: List of output tensor names.
+    """
+
+    name: str
+    inputs: list[str]
+    outputs: list[str]
+
+    def __eq__(self, other: ReconstructedGraphNode | PyTree) -> bool:
+        """Compare equality against another ``GraphProtocol`` or dictionary representation.
+
+        Args:
+            other: GraphProtocol object or dictionary to compare against.
+
+        Returns:
+            bool: True if ``name``, ``inputs``, and ``outputs`` match.
+        """
+        if isinstance(other, GraphProtocol):
+            return (
+                self.name == other.name
+                and self.inputs == other.inputs
+                and self.outputs == other.outputs
+            )
+        if isinstance(other, Mapping):
+            return (
+                other.get("name") == self.name
+                and other.get("inputs") == self.inputs
+                and other.get("outputs") == self.outputs
+            )
+        return False
 
 
 class TensorStoreDriver:
@@ -456,34 +565,68 @@ class TensorStoreDriver:
         if not raw:
             return None
         restored = MsgpackEngine().unpackb(raw)
-        if dtype is not None and shape is not None and is_pytree_mapping(restored):
-            merged = dict(restored)
-            merged["dtype"] = dtype
-            merged["shape"] = list(shape)
-            return merged
+        if dtype is not None or shape is not None:
+            if is_pytree_mapping(restored):
+                merged = dict(restored)
+                if dtype is not None:
+                    merged["dtype"] = dtype
+                if shape is not None:
+                    merged["shape"] = list(shape)
+                return merged
+            if isinstance(restored, (list, tuple, SerializedArray)):
+                raw_data = (
+                    restored.tolist() if isinstance(restored, SerializedArray) else list(restored)
+                )
+                inferred_shape = (
+                    shape
+                    if shape is not None
+                    else (
+                        restored.shape
+                        if isinstance(restored, SerializedArray)
+                        else (len(restored),)
+                    )
+                )
+                resolved_dtype = (
+                    dtype
+                    if dtype is not None
+                    else (restored.dtype if isinstance(restored, SerializedArray) else "float32")
+                )
+                return SerializedArray(
+                    data=raw_data,
+                    shape=inferred_shape,
+                    dtype=resolved_dtype,
+                )
         return restored
 
 
 _MSGPACK_MAGIC = b"\x93ZMPK"
-_EXT_TAGGED_JSON = 1
+_PackedMsgpackValue: TypeAlias = Union[
+    None,
+    bool,
+    int,
+    float,
+    str,
+    bytes,
+    list["_PackedMsgpackValue"],
+    tuple["_PackedMsgpackValue", ...],
+    dict[str, "_PackedMsgpackValue"],
+]
 
 
-def _encode_pytree_to_json_value(node: PyTree) -> JsonValue:
-    """Recursively encode a PyTree into a tagged JSON-serializable structure.
+def _encode_pytree_to_json_value(node: PyTree) -> _PackedMsgpackValue:
+    """Recursively encode a PyTree into a tagged MessagePack-serializable structure.
 
     Args:
         node: PyTree node to encode.
 
     Returns:
-        JsonValue: Tagged JSON structure preserving tuples, bytes, arrays, and graphs.
+        _PackedMsgpackValue: Tagged structure preserving tuples, bytes, arrays, and graphs.
 
     Raises:
         TypeError: If ``node`` is an unsupported type.
     """
-    if node is None or isinstance(node, (bool, int, float, str)):
+    if node is None or isinstance(node, (bool, int, float, str, bytes)):
         return node
-    if isinstance(node, bytes):
-        return {"__ztype__": "bytes", "hex": node.hex()}
     if isinstance(node, complex):
         return {"__ztype__": "complex", "real": node.real, "imag": node.imag}
     if isinstance(node, LogicalGraph):
@@ -492,20 +635,20 @@ def _encode_pytree_to_json_value(node: PyTree) -> JsonValue:
             "payload": node.to_json(),
         }
     if isinstance(node, ArrayProtocol):
-        raw_hex = node.tobytes().hex() if isinstance(node, BytesSerializableProtocol) else ""
+        raw_bytes = node.tobytes() if isinstance(node, BytesSerializableProtocol) else b""
         return {
             "__ztype__": "array",
-            "shape": list(node.shape),
+            "shape": [int(d) for d in node.shape],
             "dtype": str(node.dtype),
-            "data": _encode_pytree_to_json_value(node.tolist()),
-            "hex": raw_hex,
+            "data": _encode_pytree_to_json_value(array_to_nested_list(node)),
+            "raw": raw_bytes,
         }
     if isinstance(node, GraphProtocol):
         return {
             "__ztype__": "graph_protocol",
             "name": node.name,
-            "inputs": list(node.inputs),
-            "outputs": list(node.outputs),
+            "inputs": [str(x) for x in node.inputs],
+            "outputs": [str(x) for x in node.outputs],
         }
     if isinstance(node, tuple):
         return {
@@ -514,19 +657,27 @@ def _encode_pytree_to_json_value(node: PyTree) -> JsonValue:
         }
     if isinstance(node, Mapping):
         return {str(k): _encode_pytree_to_json_value(v) for k, v in node.items()}
-    return [_encode_pytree_to_json_value(item) for item in node]
+    if isinstance(node, Sequence):
+        return [_encode_pytree_to_json_value(item) for item in node]
+    raise TypeError(f"Unsupported PyTree node type for MessagePack serialization: {type(node)}")
 
 
-def _decode_json_value_to_pytree(value: JsonValue, *, preserve_array: bool = False) -> PyTree:
-    """Recursively decode a tagged JSON structure back into a PyTree.
+def _decode_json_value_to_pytree(
+    value: _PackedMsgpackValue | JsonValue,
+    *,
+    preserve_array: bool = False,
+) -> PyTree:
+    """Recursively decode a tagged MessagePack/JSON structure back into a PyTree.
 
     Args:
-        value: Tagged JSON structure produced by ``_encode_pytree_to_json_value``.
+        value: Tagged structure produced by ``_encode_pytree_to_json_value``.
         preserve_array: If True, reconstruct ``SerializedArray`` instances for array nodes. Defaults to False.
 
     Returns:
         PyTree: Reconstructed PyTree structure.
     """
+    if isinstance(value, bytes):
+        return value
     if isinstance(value, list):
         return [_decode_json_value_to_pytree(item, preserve_array=preserve_array) for item in value]
     if isinstance(value, dict):
@@ -555,11 +706,11 @@ def _decode_json_value_to_pytree(value: JsonValue, *, preserve_array: bool = Fal
             name_val = value.get("name")
             inputs_val = value.get("inputs")
             outputs_val = value.get("outputs")
-            return {
-                "name": str(name_val) if name_val is not None else "",
-                "inputs": list(inputs_val) if isinstance(inputs_val, list) else [],
-                "outputs": list(outputs_val) if isinstance(outputs_val, list) else [],
-            }
+            return ReconstructedGraphNode(
+                name=str(name_val) if name_val is not None else "",
+                inputs=[str(x) for x in inputs_val] if isinstance(inputs_val, list) else [],
+                outputs=[str(x) for x in outputs_val] if isinstance(outputs_val, list) else [],
+            )
         if tag == "array":
             decoded_data = _decode_json_value_to_pytree(
                 value.get("data"),
@@ -573,7 +724,12 @@ def _decode_json_value_to_pytree(value: JsonValue, *, preserve_array: bool = Fal
                     else ()
                 )
                 dtype_str = str(value.get("dtype", "float32"))
-                raw_bytes = bytes.fromhex(hex_val) if isinstance(hex_val, str) and hex_val else b""
+                raw_field = value.get("raw")
+                raw_bytes = (
+                    raw_field
+                    if isinstance(raw_field, bytes)
+                    else (bytes.fromhex(hex_val) if isinstance(hex_val, str) and hex_val else b"")
+                )
                 return SerializedArray(
                     data=decoded_data,
                     shape=shape_tuple,
@@ -588,14 +744,14 @@ def _decode_json_value_to_pytree(value: JsonValue, *, preserve_array: bool = Fal
     return value
 
 
-def _pack_msgpack_bytes(value: JsonValue) -> bytes:
-    """Encode a JSON-compatible value into RFC 8949 binary MessagePack bytes.
+def _pack_msgpack_bytes(value: _PackedMsgpackValue | JsonValue) -> bytes:
+    """Encode a tagged value into RFC 8949 / MessagePack binary bytes.
 
     Args:
-        value: Tagged JSON value to encode.
+        value: Tagged value to encode.
 
     Returns:
-        bytes: RFC 8949 binary MessagePack representation.
+        bytes: Binary MessagePack representation.
     """
     if value is None:
         return b"\xc0"
@@ -625,6 +781,13 @@ def _pack_msgpack_bytes(value: JsonValue) -> bytes:
         return b"\xd3" + struct.pack(">q", value)
     if isinstance(value, float):
         return b"\xcb" + struct.pack(">d", value)
+    if isinstance(value, bytes):
+        n = len(value)
+        if n <= 0xFF:
+            return b"\xc4" + struct.pack(">B", n) + value
+        if n <= 0xFFFF:
+            return b"\xc5" + struct.pack(">H", n) + value
+        return b"\xc6" + struct.pack(">I", n) + value
     if isinstance(value, str):
         raw = value.encode("utf-8")
         n = len(raw)
@@ -658,15 +821,15 @@ def _pack_msgpack_bytes(value: JsonValue) -> bytes:
     return b"".join(parts)
 
 
-def _unpack_msgpack_bytes(data: bytes, offset: int = 0) -> tuple[JsonValue, int]:
-    """Decode an RFC 8949 binary MessagePack value starting at ``offset``.
+def _unpack_msgpack_bytes(data: bytes, offset: int = 0) -> tuple[_PackedMsgpackValue, int]:
+    """Decode a binary MessagePack value starting at ``offset``.
 
     Args:
         data: Full binary MessagePack byte buffer.
         offset: Starting byte index. Defaults to 0.
 
     Returns:
-        tuple[JsonValue, int]: Decoded ``(value, next_offset)`` pair.
+        tuple[_PackedMsgpackValue, int]: Decoded ``(value, next_offset)`` pair.
 
     Raises:
         ValueError: If the buffer is truncated or contains an invalid marker.
@@ -698,6 +861,33 @@ def _unpack_msgpack_bytes(data: bytes, offset: int = 0) -> tuple[JsonValue, int]
         return False, pos
     if marker == 0xC3:
         return True, pos
+    if marker == 0xC4:
+        if pos + 1 > len(data):
+            raise ValueError("Truncated bin8 length in MessagePack buffer.")
+        length = data[pos]
+        start = pos + 1
+        end = start + length
+        if end > len(data):
+            raise ValueError("Truncated bin8 payload in MessagePack buffer.")
+        return data[start:end], end
+    if marker == 0xC5:
+        if pos + 2 > len(data):
+            raise ValueError("Truncated bin16 length in MessagePack buffer.")
+        length = struct.unpack(">H", data[pos : pos + 2])[0]
+        start = pos + 2
+        end = start + length
+        if end > len(data):
+            raise ValueError("Truncated bin16 payload in MessagePack buffer.")
+        return data[start:end], end
+    if marker == 0xC6:
+        if pos + 4 > len(data):
+            raise ValueError("Truncated bin32 length in MessagePack buffer.")
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        start = pos + 4
+        end = start + length
+        if end > len(data):
+            raise ValueError("Truncated bin32 payload in MessagePack buffer.")
+        return data[start:end], end
     if marker == 0xCB:
         if pos + 8 > len(data):
             raise ValueError("Truncated float64 in MessagePack buffer.")
@@ -792,7 +982,9 @@ def _unpack_msgpack_bytes(data: bytes, offset: int = 0) -> tuple[JsonValue, int]
     raise ValueError(f"Unsupported MessagePack marker: 0x{marker:02x}")
 
 
-def _unpack_msgpack_array(data: bytes, pos: int, count: int) -> tuple[list[JsonValue], int]:
+def _unpack_msgpack_array(
+    data: bytes, pos: int, count: int
+) -> tuple[list[_PackedMsgpackValue], int]:
     """Decode ``count`` sequential MessagePack array elements starting at ``pos``.
 
     Args:
@@ -801,9 +993,9 @@ def _unpack_msgpack_array(data: bytes, pos: int, count: int) -> tuple[list[JsonV
         count: Number of elements in the array.
 
     Returns:
-        tuple[list[JsonValue], int]: Decoded list and next byte offset.
+        tuple[list[_PackedMsgpackValue], int]: Decoded list and next byte offset.
     """
-    items: list[JsonValue] = []
+    items: list[_PackedMsgpackValue] = []
     curr = pos
     for _ in range(count):
         item, curr = _unpack_msgpack_bytes(data, curr)
@@ -811,7 +1003,11 @@ def _unpack_msgpack_array(data: bytes, pos: int, count: int) -> tuple[list[JsonV
     return items, curr
 
 
-def _unpack_msgpack_map(data: bytes, pos: int, count: int) -> tuple[dict[str, JsonValue], int]:
+def _unpack_msgpack_map(
+    data: bytes,
+    pos: int,
+    count: int,
+) -> tuple[dict[str, _PackedMsgpackValue], int]:
     """Decode ``count`` key-value pairs from a MessagePack map starting at ``pos``.
 
     Args:
@@ -820,9 +1016,9 @@ def _unpack_msgpack_map(data: bytes, pos: int, count: int) -> tuple[dict[str, Js
         count: Number of key-value entries in the map.
 
     Returns:
-        tuple[dict[str, JsonValue], int]: Decoded dictionary and next byte offset.
+        tuple[dict[str, _PackedMsgpackValue], int]: Decoded dictionary and next byte offset.
     """
-    result: dict[str, JsonValue] = {}
+    result: dict[str, _PackedMsgpackValue] = {}
     curr = pos
     for _ in range(count):
         key, curr = _unpack_msgpack_bytes(data, curr)
@@ -846,9 +1042,9 @@ class MsgpackEngine:
     def packb(self, tree: PyTree) -> bytes:
         r"""Pack a PyTree into deterministic RFC 8949 binary MessagePack framing.
 
-        Returns ``b""`` when ``tree`` is ``None``. Empty dictionaries ``{}`` are
-        encoded as the standard MessagePack fixmap ``b"\x80"`` so that
-        ``unpackb(packb({})) == {}``.
+        ``None`` is encoded as the standard MessagePack ``nil`` byte (``b"\xc0"``)
+        and ``{}`` is encoded as the empty fixmap (``b"\x80"``), ensuring
+        saved ``None`` and ``{}`` values are never confused with missing/empty files.
 
         Args:
             tree: The PyTree structure to pack.
@@ -856,8 +1052,6 @@ class MsgpackEngine:
         Returns:
             bytes: Packed binary representation.
         """
-        if tree is None:
-            return b""
         encoded = _encode_pytree_to_json_value(tree)
         return _pack_msgpack_bytes(encoded)
 
@@ -904,15 +1098,15 @@ class MsgpackEngine:
 class BarrierSync:
     """Multi-host barrier synchronization primitive with encapsulated counter state."""
 
-    _default_counts: dict[str, int] = {}
-
     def __init__(self, counts: dict[str, int] | None = None) -> None:
         """Initialize the BarrierSync primitive.
 
         Args:
-            counts: Optional isolated dictionary of barrier counts. Defaults to the shared store when None.
+            counts: Optional isolated dictionary of barrier counts. Defaults to the context store when None.
         """
-        self._counts: dict[str, int] = counts if counts is not None else BarrierSync._default_counts
+        self._counts: dict[str, int] = (
+            counts if counts is not None else _get_default_barrier_counts()
+        )
 
     def wait(self, id_str: str, timeout: int = 300) -> None:
         """Wait for a named synchronization barrier across hosts.
@@ -944,6 +1138,55 @@ class BarrierSync:
         self._counts.clear()
 
 
+def _slice_along_axis(
+    data: PyTree,
+    axis: int,
+    host_id: int,
+    num_shards: int,
+) -> PyTree:
+    """Slice a nested Python list or tuple along ``axis`` for ``host_id`` out of ``num_shards``.
+
+    Args:
+        data: Nested list or tuple representing an N-dimensional array.
+        axis: Target axis index (0-based).
+        host_id: Shard index ``0 <= host_id < num_shards``.
+        num_shards: Number of shards along ``axis``.
+
+    Returns:
+        PyTree: Sliced nested list or tuple.
+    """
+    if isinstance(data, (list, tuple)) and len(data) > 0:
+        total = len(data)
+        if axis == 0:
+            chunk = max(1, total // num_shards)
+            start = host_id * chunk
+            end = total if host_id == num_shards - 1 else min(total, start + chunk)
+            sliced = data[start:end]
+            return tuple(sliced) if isinstance(data, tuple) else list(sliced)
+        sub_sliced = [_slice_along_axis(elem, axis - 1, host_id, num_shards) for elem in data]
+        return tuple(sub_sliced) if isinstance(data, tuple) else sub_sliced
+    return data
+
+
+def _infer_nested_shape(data: PyTree) -> tuple[int, ...]:
+    """Infer the shape tuple of a nested Python list/tuple.
+
+    Args:
+        data: Nested list/tuple or scalar.
+
+    Returns:
+        tuple[int, ...]: Inferred dimensions.
+    """
+    dims: list[int] = []
+    curr: PyTree = data
+    while isinstance(curr, (list, tuple)):
+        dims.append(len(curr))
+        if len(curr) == 0:
+            break
+        curr = curr[0]
+    return tuple(dims)
+
+
 class GlobalArraySharding:
     """Global array sharding utility for extracting host-local tensor shards."""
 
@@ -956,6 +1199,9 @@ class GlobalArraySharding:
         mesh: LogicalMesh | None = None,
     ) -> PyTree:
         """Extract the local shard of a global array for a specific host.
+
+        Supports 1D and multi-axis ``PartitionSpec`` + ``LogicalMesh`` sharding across
+        lists, tuples, and ``ArrayProtocol`` / ``SerializedArray`` instances.
 
         Args:
             array: The global array, sequence, or PyTree to shard.
@@ -971,15 +1217,21 @@ class GlobalArraySharding:
             ValueError: If ``host_id < 0`` or ``num_hosts <= 0`` or ``host_id >= num_hosts``.
         """
         effective_hosts = num_hosts
+        target_axis = 0
         if mesh is not None and partition_spec is not None and len(partition_spec.axes) > 0:
-            first_axis = partition_spec.axes[0]
-            if isinstance(first_axis, str):
-                effective_hosts = max(effective_hosts, max(1, mesh.shape.get(first_axis, 1)))
-            elif first_axis is not None:
-                axis_factor = 1
-                for axis_name in first_axis:
-                    axis_factor *= max(1, mesh.shape.get(axis_name, 1))
-                effective_hosts = max(effective_hosts, axis_factor)
+            for idx, axis_spec in enumerate(partition_spec.axes):
+                if isinstance(axis_spec, str):
+                    factor = max(1, mesh.shape.get(axis_spec, 1))
+                    target_axis = idx
+                    effective_hosts = max(effective_hosts, factor)
+                    break
+                if axis_spec is not None:
+                    axis_factor = 1
+                    for axis_name in axis_spec:
+                        axis_factor *= max(1, mesh.shape.get(axis_name, 1))
+                    target_axis = idx
+                    effective_hosts = max(effective_hosts, axis_factor)
+                    break
 
         if effective_hosts <= 0 or host_id < 0 or host_id >= effective_hosts:
             raise ValueError(f"Invalid host_id={host_id} for num_hosts={effective_hosts}.")
@@ -988,24 +1240,20 @@ class GlobalArraySharding:
         if effective_hosts == 1 and (partition_spec is None or len(partition_spec.axes) == 0):
             return array
         if isinstance(array, (list, tuple)):
-            total = len(array)
-            if total == 0:
-                return array
-            chunk = max(1, total // effective_hosts)
-            start = host_id * chunk
-            end = total if host_id == effective_hosts - 1 else min(total, start + chunk)
-            return array[start:end]
+            return _slice_along_axis(array, target_axis, host_id, effective_hosts)
         if is_array_protocol(array):
-            data_list = array.tolist()
-            if isinstance(data_list, list) and len(data_list) >= effective_hosts:
-                chunk = max(1, len(data_list) // effective_hosts)
-                start = host_id * chunk
-                end = (
-                    len(data_list)
-                    if host_id == effective_hosts - 1
-                    else min(len(data_list), start + chunk)
-                )
-                return data_list[start:end]
+            data_list = array_to_nested_list(array)
+            if isinstance(data_list, list) and len(data_list) >= (
+                effective_hosts if target_axis == 0 else 1
+            ):
+                sliced_data = _slice_along_axis(data_list, target_axis, host_id, effective_hosts)
+                if isinstance(array, SerializedArray):
+                    return SerializedArray(
+                        data=sliced_data,
+                        shape=_infer_nested_shape(sliced_data),
+                        dtype=str(array.dtype),
+                    )
+                return sliced_data
         return array
 
 
@@ -1015,6 +1263,7 @@ __all__ = [
     "FileSystemIO",
     "GlobalArraySharding",
     "MsgpackEngine",
+    "ReconstructedGraphNode",
     "SerializedArray",
     "TensorStoreDriver",
     "VirtualFileSystem",

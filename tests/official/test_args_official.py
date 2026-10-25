@@ -12,22 +12,47 @@ import zero_orbax.checkpoint as ocp
 class ArgsTest(parameterized.TestCase):
     """Test suite for checkpoint arguments and handlers registration."""
 
+    def test_all_args_inherit_from_checkpoint_args(self) -> None:
+        """Verify all 15 ocp.args.* classes are instances of ocp.args.CheckpointArgs."""
+        all_instances = (
+            ocp.args.CheckpointArgs(),
+            ocp.args.ArraySave([1, 2]),
+            ocp.args.ArrayRestore(),
+            ocp.args.Composite(a=ocp.args.StandardSave({"x": 1})),
+            ocp.args.JsonSave({"k": "v"}),
+            ocp.args.JsonRestore(),
+            ocp.args.ProtoSave({"msg": 1}),
+            ocp.args.ProtoRestore(),
+            ocp.args.PyTreeSave({"w": 1}),
+            ocp.args.PyTreeRestore(),
+            ocp.args.StandardSave({"w": 1}),
+            ocp.args.StandardRestore(),
+            ocp.args.JaxRandomKeySave([0, 1]),
+            ocp.args.JaxRandomKeyRestore(),
+            ocp.args.NumpyRandomKeySave({"seed": 42}),
+            ocp.args.NumpyRandomKeyRestore(),
+        )
+        for inst in all_instances:
+            self.assertIsInstance(inst, ocp.args.CheckpointArgs)
+
     def test_args_composite(self) -> None:
         """Test Composite args save and restore round-trip through CompositeCheckpointHandler."""
         with tempfile.TemporaryDirectory() as tmpdir:
             composite_save = ocp.args.Composite(
                 state=ocp.args.StandardSave({"step": 5, "weights": [1.0, 2.0]}),
                 meta=ocp.args.JsonSave({"epoch": 2, "tag": "v1"}),
+                proto=ocp.args.ProtoSave({"proto_field": "ok"}),
             )
-            self.assertEqual(len(composite_save), 2)
-            self.assertEqual(list(composite_save.keys()), ["state", "meta"])
+            self.assertEqual(len(composite_save), 3)
+            self.assertEqual(list(composite_save.keys()), ["state", "meta", "proto"])
 
-            handler = ocp.CompositeCheckpointHandler("state", "meta")
+            handler = ocp.CompositeCheckpointHandler("state", "meta", "proto")
             handler.save(tmpdir, composite_save)
 
             composite_restore = ocp.args.Composite(
                 state=ocp.args.StandardRestore(),
                 meta=ocp.args.JsonRestore(),
+                proto=ocp.args.ProtoRestore(),
             )
             restored = handler.restore(tmpdir, composite_restore)
             self.assertEqual(
@@ -35,6 +60,7 @@ class ArgsTest(parameterized.TestCase):
                 {
                     "state": {"step": 5, "weights": [1.0, 2.0]},
                     "meta": {"epoch": 2, "tag": "v1"},
+                    "proto": {"proto_field": "ok"},
                 },
             )
             handler.close()
@@ -56,9 +82,20 @@ class ArgsTest(parameterized.TestCase):
 
             std_dir = f"{tmpdir}/std"
             std_handler = ocp.StandardCheckpointHandler()
-            std_handler.save(std_dir, ocp.args.StandardSave(item={"k": [1, 2]}))
-            restored_std = std_handler.restore(std_dir, ocp.args.StandardRestore())
-            self.assertEqual(restored_std, {"k": [1, 2]})
+            std_handler.save(
+                std_dir,
+                ocp.args.StandardSave(
+                    item={"k": [1, 2], "cast_int": 4.9},
+                    save_args={"cast_int": ocp.SaveArgs(dtype=int)},
+                ),
+            )
+            restored_std = std_handler.restore(
+                std_dir,
+                ocp.args.StandardRestore(
+                    restore_args={"cast_int": ocp.RestoreArgs(dtype=float)},
+                ),
+            )
+            self.assertEqual(restored_std, {"k": [1, 2], "cast_int": 4.0})
 
             arr_dir = f"{tmpdir}/arr"
             arr_handler = ocp.ArrayCheckpointHandler()

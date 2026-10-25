@@ -74,37 +74,81 @@ def _required_param_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[
     return params
 
 
+def _is_non_none_return(returns_node: ast.AST | None) -> bool:
+    """Determine whether a return annotation represents a non-``None`` return value.
+
+    Args:
+        returns_node: Return annotation AST node on a function definition.
+
+    Returns:
+        bool: True if the return annotation is present and not ``None``.
+    """
+    if returns_node is None:
+        return False
+    return not (
+        (isinstance(returns_node, ast.Constant) and returns_node.value is None)
+        or (isinstance(returns_node, ast.Name) and returns_node.id == "None")
+    )
+
+
 def _check_function_args_doc(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     doc: str,
+    *,
+    strict_sections: bool = False,
 ) -> list[str]:
     """Verify that all required parameters on a function AST node are documented in ``Args:``.
+
+    Also rejects extra documented parameters not in the function signature, and when
+    ``strict_sections=True`` verifies ``Returns:`` / ``Yields:`` and ``Raises:`` sections.
 
     Args:
         node: Function or async function AST node.
         doc: Non-empty docstring of the function.
+        strict_sections: Whether to enforce ``Returns:`` and ``Raises:`` sections. Defaults to False.
 
     Returns:
-        list[str]: Missing argument error message (empty list if all parameters are documented).
+        list[str]: Missing or extra argument/section error messages.
     """
+    errors: list[str] = []
     req_params = _required_param_names(node)
-    if not req_params:
-        return []
     doc_args = _extract_documented_args(doc)
-    undocumented = [p for p in req_params if p not in doc_args]
-    if undocumented:
-        return [
+    if req_params:
+        undocumented = [p for p in req_params if p not in doc_args]
+        if undocumented:
+            errors.append(
+                f"{type(node).__name__} '{node.name}' at line {node.lineno} "
+                f"(MISSING ARGS DOC: {', '.join(undocumented)})"
+            )
+    extra_documented = sorted(doc_args - set(req_params))
+    if extra_documented:
+        errors.append(
             f"{type(node).__name__} '{node.name}' at line {node.lineno} "
-            f"(MISSING ARGS DOC: {', '.join(undocumented)})"
-        ]
-    return []
+            f"(EXTRA ARGS DOC: {', '.join(extra_documented)})"
+        )
+    if strict_sections:
+        if _is_non_none_return(node.returns) and "Returns:" not in doc and "Yields:" not in doc:
+            errors.append(
+                f"{type(node).__name__} '{node.name}' at line {node.lineno} (MISSING RETURNS DOC)"
+            )
+        has_direct_raise = any(
+            isinstance(stmt, ast.Raise)
+            for stmt in node.body
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        )
+        if has_direct_raise and "Raises:" not in doc:
+            errors.append(
+                f"{type(node).__name__} '{node.name}' at line {node.lineno} (MISSING RAISES DOC)"
+            )
+    return errors
 
 
-def check_file(path: str) -> tuple[int, int]:
+def check_file(path: str, *, strict_sections: bool = False) -> tuple[int, int]:
     """Check a single Python file for module, class, function, and argument docstring coverage.
 
     Args:
         path: Path to the Python file to inspect.
+        strict_sections: Whether to enforce ``Returns:`` and ``Raises:`` sections. Defaults to False.
 
     Returns:
         tuple[int, int]: Tuple of ``(missing_count, total_items_count)``.
@@ -148,7 +192,7 @@ def check_file(path: str) -> tuple[int, int]:
                     f"{type(node).__name__} '{node.name}' at line {node.lineno} (STUB DOCSTRING)"
                 )
             else:
-                missing.extend(_check_function_args_doc(node, doc))
+                missing.extend(_check_function_args_doc(node, doc, strict_sections=strict_sections))
 
     if missing:
         print(f"Missing/Stub in {path}:")
@@ -180,7 +224,9 @@ def run_doc_check(
         for root, _, files in sorted(os.walk(directory)):
             for file in sorted(files):
                 if file.endswith(".py"):
-                    m, t = check_file(os.path.join(root, file))
+                    full_path = os.path.join(root, file)
+                    is_prod = directory in ("src", "scripts")
+                    m, t = check_file(full_path, strict_sections=is_prod)
                     total_missing += m
                     total_items += t
 
