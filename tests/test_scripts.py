@@ -395,8 +395,9 @@ def test_update_badges(tmp_path: pathlib.Path) -> None:
 
 
 def test_requirements_txt_contains_griffe() -> None:
-    """Verify requirements.txt pins griffelib and griffecli from SamuelMarks/griffe@rest."""
-    req_path = pathlib.Path(__file__).resolve().parent.parent / "requirements.txt"
+    """Verify requirements.txt pins griffelib, griffecli, and sibling zero-* dependencies."""
+    root_dir = pathlib.Path(__file__).resolve().parent.parent
+    req_path = root_dir / "requirements.txt"
     req_txt = req_path.read_text(encoding="utf-8")
     assert (
         "griffelib @ git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffelib"
@@ -407,6 +408,21 @@ def test_requirements_txt_contains_griffe() -> None:
         in req_txt
     )
     assert (
+        "ml-switcheroo-ir @ https://github.com/SamuelMarks/ml-switcheroo-ir/releases/download/v0.0.4/ml_switcheroo_ir-0.0.4-py3-none-any.whl"
+        in req_txt
+    )
+    assert (
+        "ml-switcheroo-compiler @ https://github.com/SamuelMarks/ml-switcheroo-compiler/releases/download/v0.0.1/ml_switcheroo_compiler-0.0.1-py3-none-any.whl"
+        in req_txt
+    )
+    assert (
         "ml-ecosystem-snapshots @ https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.5/ml_ecosystem_snapshots-0.0.5-py3-none-any.whl"
         in req_txt
     )
+    for sibling_pkg in ("zero-jax", "zero-chex", "zero-flax", "zero-grain", "zero-optax"):
+        assert f"{sibling_pkg} @ git+https://github.com/SamuelMarks/{sibling_pkg}.git@master" in (
+            req_txt
+        )
+    ci_txt = (root_dir / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "pip install --no-deps" in ci_txt
+    assert "pip install --no-deps -e ." in ci_txt

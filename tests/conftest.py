@@ -17,6 +17,10 @@ _SIBLING_PATHS = (
     os.path.join(_REPO_ROOT, "..", "ml-ecosystem-snapshots", "src"),
     os.path.join(_REPO_ROOT, "..", "ml-switcheroo-compiler", "src"),
     os.path.join(_REPO_ROOT, "..", "zero-jax", "src"),
+    os.path.join(_REPO_ROOT, "..", "zero-chex", "src"),
+    os.path.join(_REPO_ROOT, "..", "zero-flax", "src"),
+    os.path.join(_REPO_ROOT, "..", "zero-grain", "src"),
+    os.path.join(_REPO_ROOT, "..", "zero-optax", "src"),
 )
 
 for _path in reversed(_SIBLING_PATHS):
@@ -27,6 +31,8 @@ for _path in reversed(_SIBLING_PATHS):
 def _setup_clean_zero_chex() -> None:
     """Export committed HEAD of ``../zero-chex`` into a temporary path so in-flight sibling edits do not break imports."""
     chex_repo = os.path.join(_REPO_ROOT, "..", "zero-chex")
+    if not os.path.isdir(os.path.join(chex_repo, ".git")):  # pragma: no cover
+        return
     tmp_chex_dir = os.path.join(tempfile.gettempdir(), "zero_orbax_clean_zero_chex")
     os.makedirs(tmp_chex_dir, exist_ok=True)
     archive = subprocess.run(

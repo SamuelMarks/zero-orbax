@@ -117,13 +117,26 @@ disallow_subclassing_any = false
 
 [[tool.mypy.overrides]]
 module = [
+    "zero_chex",
+    "zero_chex.*",
+    "zero_flax",
+    "zero_flax.*",
+    "zero_grain",
+    "zero_grain.*",
+    "zero_optax",
+    "zero_optax.*",
+    "zero_jax",
+    "zero_jax.*",
+]
+follow_imports = "silent"
+
+[[tool.mypy.overrides]]
+module = [
     "absl.*",
     "ml_switcheroo_ir.*",
     "ml_switcheroo_compiler.*",
     "ml_ecosystem_snapshots.*",
-    "orbax.*",
     "pytest",
-    "_pytest.*",
 ]
 ignore_missing_imports = true
 follow_imports = "skip"
