@@ -7,7 +7,12 @@ import datetime
 import pathlib
 
 import pytest
+from ml_switcheroo_compiler import ops as compiler_ops
+from ml_switcheroo_compiler.core.dtype import DType as CompilerDType
+from ml_switcheroo_compiler.core.tensor import as_tensor_obj
 from ml_switcheroo_ir import LogicalMesh, PartitionSpec
+from zero_flax.core import FrozenDict
+from zero_jax import numpy as jnp
 
 from zero_orbax.checkpoint import (
     AbstractCheckpointManager,
@@ -39,10 +44,11 @@ from zero_orbax.checkpoint import (
     nest_asyncio,
     step_lib,
     test_utils,
+    _apply_restore_args_tree,
     _apply_save_args_tree,
     _infer_array_shape,
 )
-from zero_orbax.core import SerializedArray
+from zero_orbax.core import AtomicityTemporaryPath, SerializedArray
 from zero_orbax.types import (
     AbstractLoggerProtocol,
     ArrayMetadataValidatorProtocol,
@@ -413,6 +419,7 @@ def test_async_checkpointer_methods(tmp_path: pathlib.Path) -> None:
         checkpoint_metadata_store=meta_store,
         temporary_path_class=RecordingTempPath,
     )
+    assert cp.timeout_secs == 60
     fut = cp.save(tmp_path, {"x": 1})
     assert isinstance(fut, Future)
     assert RecordingTempPath.created_count == 1
@@ -430,10 +437,65 @@ def test_async_checkpointer_methods(tmp_path: pathlib.Path) -> None:
     cp.close()
     assert meta_store.closed is True
 
-    # Test AsyncCheckpointer with synchronous handler
-    sync_cp = AsyncCheckpointer(handler=SyncOnlyHandler())
+    # Test AsyncCheckpointer with real AtomicityTemporaryPath promotion
+    atomic_dest = tmp_path / "atomic_async_dest"
+    cp_atomic = AsyncCheckpointer(
+        handler=StandardCheckpointHandler(),
+        temporary_path_class=AtomicityTemporaryPath,
+        file_options=FileOptions(path_permission_mode=0o755),
+    )
+    fut_atomic = cp_atomic.save(atomic_dest, {"real_atomic": 42})
+    assert (tmp_path / "atomic_async_dest.orbax-checkpoint-tmp").exists()
+    assert not atomic_dest.exists()
+    fut_atomic.result()
+    assert atomic_dest.exists()
+    assert not (tmp_path / "atomic_async_dest.orbax-checkpoint-tmp").exists()
+    restored_fut_atomic = cp_atomic.restore(atomic_dest)
+    assert isinstance(restored_fut_atomic, Future)
+    assert restored_fut_atomic.result() == {"real_atomic": 42}
+    cp_atomic.close()
+
+    # Test AsyncCheckpointer with file_options (no temporary_path_class)
+    perm_async_dir = tmp_path / "perm_async_dir"
+    cp_perm_async = AsyncCheckpointer(
+        handler=StandardCheckpointHandler(),
+        file_options=FileOptions(path_permission_mode=0o755),
+    )
+    cp_perm_async.save(perm_async_dir, {"perm": 1}).result()
+    cp_perm_async.close()
+
+    # Test AsyncCheckpointer with synchronous handler and barrier_sync_fn
+    sync_barriers: list[tuple[str, int]] = []
+    sync_cp = AsyncCheckpointer(
+        handler=SyncOnlyHandler(),
+        async_options=AsyncOptions(
+            timeout_secs=30,
+            barrier_sync_fn=lambda k, t: sync_barriers.append((k, t)),
+        ),
+    )
     sync_fut = sync_cp.save(tmp_path / "sync_dir", {"s": 2})
+    assert sync_fut.done() is False
+    sync_cp.wait_until_finished()
     assert sync_fut.done() is True
+    assert len(sync_barriers) == 1
+
+    sync_cp_no_barrier = AsyncCheckpointer(handler=SyncOnlyHandler())
+    sync_cp_no_barrier.save(tmp_path / "sync_dir_nb", {"s": 3}).result()
+
+    # Test Future exception capture and re-raise
+    def _failing_commit() -> None:
+        """Raise a RuntimeError during commit.
+
+        Raises:
+            RuntimeError: Always.
+        """
+        raise RuntimeError("background commit failed")
+
+    bad_fut = Future(result=None, commit_callback=_failing_commit)
+    with pytest.raises(RuntimeError, match="background commit failed"):
+        bad_fut.result()
+    with pytest.raises(RuntimeError, match="background commit failed"):
+        bad_fut.result()
 
 
 def test_base_pytree_checkpoint_handler_methods() -> None:
@@ -708,13 +770,38 @@ def test_checkpoint_manager_advanced_features(tmp_path: pathlib.Path) -> None:
 
     # Test Composite args on manager without item_handlers mapping
     comp_no_h_dir = tmp_path / "comp_no_h"
-    with CheckpointManager(comp_no_h_dir) as mgr_c2:
+    with CheckpointManager(
+        comp_no_h_dir,
+        options=CheckpointManagerOptions(
+            temporary_path_class=AtomicityTemporaryPath,
+            enable_async_checkpointing=False,
+        ),
+    ) as mgr_c2:
         mgr_c2.save(1, args=args.Composite(a=args.StandardSave({"v": 1})))
         assert mgr_c2.best_step() == 1
         assert mgr_c2.restore(1, args=args.Composite(a=args.StandardRestore())) == {"a": {"v": 1}}
-        # Restore when disk file is missing falls back to self.checkpoints[step]
-        (comp_no_h_dir / "1" / "checkpoint.msgpack").unlink(missing_ok=True)
-        assert mgr_c2.restore(1, directory=comp_no_h_dir) == {"a": {"v": 1}}
+        assert mgr_c2.item_metadata(1) == {"a": {"v": 1}}
+        assert mgr_c2.metadata(1) is None
+        # When composite subdirs are removed, restore falls back to items
+        import shutil as _shutil
+
+        _shutil.rmtree(comp_no_h_dir / "1" / "a")
+        assert mgr_c2.restore(1, items={"empty_fb": 1}) == {"empty_fb": 1}
+
+    # Test CheckpointManager.metadata(step) when _orbax_metadata.json exists, and item_metadata when step not in steps
+    meta_step_dir = tmp_path / "meta_step_mgr"
+    with CheckpointManager(
+        meta_step_dir,
+        item_handlers=StandardCheckpointHandler(),
+    ) as mgr_ms:
+        mgr_ms.save(5, {"w": 10})
+        step_meta = mgr_ms.metadata(5)
+        assert isinstance(step_meta, dict) and "directory" in step_meta
+        assert mgr_ms.item_metadata(999) is None
+        # When disk file is removed after save, restore falls back to items
+        (meta_step_dir / "5" / "checkpoint.msgpack").unlink(missing_ok=True)
+        (meta_step_dir / "5" / "_orbax_metadata.json").unlink(missing_ok=True)
+        assert mgr_ms.restore(5, items={"fallback_tmpl": 7}) == {"fallback_tmpl": 7}
 
 
 def test_checkpoint_manager_options_methods() -> None:
@@ -752,6 +839,21 @@ def test_checkpointer_methods(tmp_path: pathlib.Path) -> None:
     assert RecordingTempPath.finalized_count == 1
     cp_temp.close()
 
+    # Test Checkpointer with real AtomicityTemporaryPath promotion and barrier_sync_fn
+    sync_barriers: list[str] = []
+    real_dest = tmp_path / "real_staged_dest"
+    cp_real_temp = Checkpointer(
+        StandardCheckpointHandler(),
+        temporary_path_class=AtomicityTemporaryPath,
+        file_options=FileOptions(path_permission_mode=0o755),
+        barrier_sync_fn=lambda k, t: sync_barriers.append(k),
+    )
+    cp_real_temp.save(real_dest, {"real_staged": 99})
+    assert real_dest.exists()
+    assert cp_real_temp.restore(real_dest) == {"real_staged": 99}
+    assert sync_barriers == [str(real_dest)]
+    cp_real_temp.close()
+
     meta_store = InMemoryMetadataStore()
     cp_meta = Checkpointer(StandardCheckpointHandler(), checkpoint_metadata_store=meta_store)
     cp_meta.save(tmp_path / "with_meta", {"m": 1})
@@ -784,20 +886,41 @@ def test_pytree_checkpoint_handler_custom_impl_and_type_registry(tmp_path: pathl
     """
     assert _apply_save_args_tree(None, SaveArgs(dtype=int)) is None
     assert _apply_save_args_tree(10, "not_a_save_args") == 10
-    assert _apply_save_args_tree(
-        {"a": "10", "b": 2, "c": 3, "d": [1]},
+    coerced_save_tree = _apply_save_args_tree(
+        {
+            "a": "10",
+            "b": 2,
+            "c": 3,
+            "d": [1],
+            "seq_list": ["5", "6"],
+            "seq_tuple": ("7", "8"),
+            "jnp_arr": jnp.asarray([1.0, 2.0], dtype="float32"),
+            "ser_arr": SerializedArray([1.0, 2.0], shape=(2,), dtype="float32"),
+            "ct_arr": as_tensor_obj(compiler_ops.asarray([1, 2], dtype=CompilerDType.int32)),
+            "empty_sa": 9,
+        },
         {
             "a": SaveArgs(dtype=int),
             "b": SaveArgs(dtype=float),
             "c": SaveArgs(dtype=str),
             "d": SaveArgs(dtype=bool),
+            "seq_list": [SaveArgs(dtype=int), SaveArgs(dtype=int)],
+            "seq_tuple": (SaveArgs(dtype=int), SaveArgs(dtype=int)),
+            "jnp_arr": SaveArgs(dtype="int32"),
+            "ser_arr": SaveArgs(dtype="int32"),
+            "ct_arr": SaveArgs(dtype=float),
+            "empty_sa": {"nested_non_save_args": None},
         },
-    ) == {
-        "a": 10,
-        "b": 2.0,
-        "c": "3",
-        "d": [1],
-    }
+    )
+    assert isinstance(coerced_save_tree, dict) and coerced_save_tree["seq_list"] == [5, 6]
+    assert _apply_restore_args_tree(
+        FrozenDict({"x": "10"}),
+        {"x": RestoreArgs(restore_type=int)},
+    ) == FrozenDict({"x": 10})
+    assert _apply_restore_args_tree(
+        ["1", ("2",)],
+        [RestoreArgs(restore_type=int), (RestoreArgs(restore_type=int),)],
+    ) == [1, (2,)]
 
     custom_impl = BasePyTreeCheckpointHandler()
     pt_with_impl = PyTreeCheckpointHandler(handler_impl=custom_impl)
@@ -807,6 +930,9 @@ def test_pytree_checkpoint_handler_custom_impl_and_type_registry(tmp_path: pathl
     validator = RecordingValidator()
     th_reg = SimpleTypeHandlerRegistry()
     th_reg.add(int, IntTypeHandler())
+    th_reg.add(int, IntTypeHandler(), override=False)
+    assert th_reg.has(int) is True
+    assert RecordingTempPath().get_final() == RecordingTempPath.base_dir / "final_dest"
     pt_th = PyTreeCheckpointHandler(
         type_handler_registry=th_reg,
         array_metadata_validator=validator,
@@ -814,12 +940,12 @@ def test_pytree_checkpoint_handler_custom_impl_and_type_registry(tmp_path: pathl
     )
     pt_th.save(
         tmp_path / "th",
-        {"z_normal": {"nested": 1}, "a_prio": 42},
-        save_args={"a_prio": SaveArgs(dtype=int)},
+        {"z_normal": {"nested": [1, (2,)]}, "a_prio": 42},
+        save_args={"a_prio": SaveArgs(dtype=int), "z_normal": {"nested": None}},
     )
     assert len(validator.validated) == 1
     restored_th = pt_th.restore(tmp_path / "th")
-    assert restored_th == {"z_normal": {"nested": 1}, "a_prio": 42}
+    assert restored_th == {"z_normal": {"nested": [1, (2,)]}, "a_prio": 42}
     assert th_reg.get_by_typestr("unknown_type") is None
 
     # Test when type_handler_registry does not have the typestr during restore
@@ -875,14 +1001,23 @@ def test_proto_handler_default_and_custom_filename(tmp_path: pathlib.Path) -> No
     assert proto_h.restore(tmp_path, args.ProtoRestore(filename="custom.pb")) == {"msg": "hello"}
 
 
-def test_standard_checkpointer_methods() -> None:
-    """Test StandardCheckpointer check_for_errors, metadata, create_temporary_path, wait, and close."""
+def test_standard_checkpointer_methods(tmp_path: pathlib.Path) -> None:
+    """Test StandardCheckpointer save, restore, check_for_errors, metadata, structure, and close.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
     cp = StandardCheckpointer()
     cp.check_for_errors()
     assert cp.metadata() is None
     assert cp.create_temporary_path() is None
     cp.wait_until_finished()
     assert cp.structure() is None
+    std_dir = tmp_path / "std_cp_ckpt"
+    cp.save(std_dir, {"weights": [1, 2, 3]})
+    cp.wait_until_finished()
+    assert cp.metadata(std_dir) == {"finalized": True, "directory": str(std_dir)}
+    assert cp.structure(std_dir) == {"weights": [1, 2, 3]}
     cp.close()
 
 

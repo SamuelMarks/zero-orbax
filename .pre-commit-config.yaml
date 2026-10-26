@@ -45,7 +45,7 @@ repos:
 
       - id: check-allowed-imports
         name: Check Allowed 3rd Party Imports
-        entry: python3 scripts/check_allowed_imports.py src/zero_orbax/__init__.py src/zero_orbax/types.py src/zero_orbax/core.py src/zero_orbax/checkpoint.py src/zero_orbax/export.py
+        entry: python3 scripts/check_allowed_imports.py src/zero_orbax
         language: system
         types: [python]
         pass_filenames: false

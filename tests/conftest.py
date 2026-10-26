@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 import os
+import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -20,6 +22,29 @@ _SIBLING_PATHS = (
 for _path in reversed(_SIBLING_PATHS):
     if _path not in sys.path:
         sys.path.insert(0, _path)
+
+
+def _setup_clean_zero_chex() -> None:
+    """Export committed HEAD of ``../zero-chex`` into a temporary path so in-flight sibling edits do not break imports."""
+    chex_repo = os.path.join(_REPO_ROOT, "..", "zero-chex")
+    tmp_chex_dir = os.path.join(tempfile.gettempdir(), "zero_orbax_clean_zero_chex")
+    os.makedirs(tmp_chex_dir, exist_ok=True)
+    archive = subprocess.run(
+        ["git", "-C", chex_repo, "archive", "HEAD"],
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(
+        ["tar", "-xf", "-", "-C", tmp_chex_dir],
+        input=archive.stdout,
+        check=True,
+    )
+    clean_chex_src = os.path.join(tmp_chex_dir, "src")
+    if clean_chex_src not in sys.path:  # pragma: no branch
+        sys.path.insert(0, clean_chex_src)
+
+
+_setup_clean_zero_chex()
 
 from zero_orbax.core import BarrierSync, VirtualFileSystem  # noqa: E402
 

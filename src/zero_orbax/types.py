@@ -331,9 +331,9 @@ def is_pytree_dict(value: PyTree) -> TypeGuard[dict[str, PyTree]]:
         value: The PyTree node to inspect.
 
     Returns:
-        TypeGuard[dict[str, PyTree]]: True if the value is a ``dict``.
+        TypeGuard[dict[str, PyTree]]: True if the value is a ``dict`` with string keys.
     """
-    return isinstance(value, dict)
+    return isinstance(value, dict) and all(isinstance(k, str) for k in value)
 
 
 def is_pytree_mapping(value: PyTree) -> TypeGuard[Mapping[str, PyTree]]:
@@ -343,9 +343,9 @@ def is_pytree_mapping(value: PyTree) -> TypeGuard[Mapping[str, PyTree]]:
         value: The PyTree node to inspect.
 
     Returns:
-        TypeGuard[Mapping[str, PyTree]]: True if the value is a ``Mapping``.
+        TypeGuard[Mapping[str, PyTree]]: True if the value is a ``Mapping`` with string keys.
     """
-    return isinstance(value, Mapping)
+    return isinstance(value, Mapping) and all(isinstance(k, str) for k in value)
 
 
 def is_array_protocol(value: PyTree) -> TypeGuard[ArrayProtocol]:
@@ -358,6 +358,27 @@ def is_array_protocol(value: PyTree) -> TypeGuard[ArrayProtocol]:
         TypeGuard[ArrayProtocol]: True if the value implements ``ArrayProtocol``.
     """
     return isinstance(value, ArrayProtocol) and not isinstance(value, FlaxVariableProtocol)
+
+
+def infer_array_shape(val: PyTree) -> tuple[int, ...]:
+    """Infer the shape tuple of an array-like object or nested sequence.
+
+    Args:
+        val: ArrayProtocol, SerializedArray, or nested sequence.
+
+    Returns:
+        tuple[int, ...]: Inferred shape tuple.
+    """
+    if is_array_protocol(val):
+        return tuple(int(d) for d in val.shape)
+    dims: list[int] = []
+    curr: PyTree = val
+    while isinstance(curr, (list, tuple)):
+        dims.append(len(curr))
+        if len(curr) == 0:
+            break
+        curr = curr[0]
+    return tuple(dims)
 
 
 def normalize_path(path: PathLike) -> pathlib.Path:
@@ -744,6 +765,7 @@ __all__ = [
     "TypeHandlerRegistryProtocol",
     "ValueTransformFn",
     "array_to_nested_list",
+    "infer_array_shape",
     "is_array_protocol",
     "is_pytree_dict",
     "is_pytree_mapping",

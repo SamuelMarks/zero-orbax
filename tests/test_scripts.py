@@ -43,6 +43,9 @@ def test_check_allowed_imports(tmp_path: pathlib.Path) -> None:
     bad_import.write_text(NL.join(bad_lines) + NL, encoding="utf-8")
     assert check_allowed_imports.check_file(str(bad_import)) is False
     assert check_allowed_imports.main([str(bad_import)]) == 1
+    (tmp_path / "ignore.txt").write_text("txt", encoding="utf-8")
+    assert check_allowed_imports.main([str(tmp_path)]) == 1
+    assert check_allowed_imports.main([]) == 0
 
     syntax_err = tmp_path / "syntax_err.py"
     syntax_err.write_text("def broken(:" + NL, encoding="utf-8")
@@ -85,7 +88,19 @@ def test_check_docs(tmp_path: pathlib.Path) -> None:
         "    Returns:",
         "        int: Sum.",
         '    """',
-        "    return a",
+        "    def _nested() -> int:",
+        '        """Nested helper.',
+        "",
+        "        Returns:",
+        "            int: Zero.",
+        "",
+        "        Raises:",
+        "            ValueError: Never.",
+        '        """',
+        "        if False:",
+        '            raise ValueError("nested")',
+        "        return 0",
+        "    return a + _nested()",
         "",
         "CONST_VAL = 1",
     ]
@@ -172,6 +187,9 @@ def test_lint_typing(tmp_path: pathlib.Path) -> None:
         "class Box:",
         '    """Box class."""',
         "",
+        "class SubBox(Box, metaclass=type):",
+        '    """SubBox class."""',
+        "",
         "    def get(self, x: int = 1) -> int:",
         '        """Get x.',
         "",
@@ -191,6 +209,8 @@ def test_lint_typing(tmp_path: pathlib.Path) -> None:
         "from typing import Any, cast",
         "import typing",
         "BadAlias = Any",
+        "class BadClass(object, metaclass=Any):",
+        "    pass",
         "x: Any = 1  #" + " type: ignore",
         "y: typing.Any = 2",
         "def untyped(a, *args, **kwargs):",

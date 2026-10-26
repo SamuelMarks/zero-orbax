@@ -59,6 +59,10 @@ FORBIDDEN_DUNDER_ATTRS: frozenset[str] = frozenset(
         "__closure__",
         "__func__",
         "__self__",
+        "__module__",
+        "__qualname__",
+        "__getattribute__",
+        "__setattr__",
     }
 )
 FORBIDDEN_IMPORT_NAMES: frozenset[str] = frozenset(
@@ -199,12 +203,19 @@ def scan_file(file_path: str) -> list[str]:
                     f"{file_path}:{node.lineno}: prohibited variable annotation '{hit}'"
                 )
         elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id.endswith("Alias"):
-                    for hit in _annotation_violations(node.value):
-                        violations.append(
-                            f"{file_path}:{node.lineno}: prohibited type alias value '{hit}'"
-                        )
+            for hit in _annotation_violations(node.value):
+                violations.append(f"{file_path}:{node.lineno}: prohibited type alias value '{hit}'")
+        elif isinstance(node, ast.ClassDef):
+            for base_node in node.bases:
+                for hit in _annotation_violations(base_node):
+                    violations.append(
+                        f"{file_path}:{node.lineno}: prohibited class base reference '{hit}'"
+                    )
+            for kw_node in node.keywords:
+                for hit in _annotation_violations(kw_node.value):
+                    violations.append(
+                        f"{file_path}:{node.lineno}: prohibited class keyword reference '{hit}'"
+                    )
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id in FORBIDDEN_REFLECTION_CALLS:
                 violations.append(

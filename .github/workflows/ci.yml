@@ -50,7 +50,7 @@ jobs:
 
     - name: Run Allowed Imports and API Compliance Checks
       run: |
-        python3 scripts/check_allowed_imports.py src/zero_orbax/*.py
+        python3 scripts/check_allowed_imports.py src/zero_orbax
         python3 scripts/check_compliance.py
 
     - name: Run Tests with 100% Line and Branch Coverage

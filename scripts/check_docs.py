@@ -91,21 +91,38 @@ def _is_non_none_return(returns_node: ast.AST | None) -> bool:
     )
 
 
+def _has_direct_raise(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Determine whether a function body contains a ``raise`` statement outside nested definitions.
+
+    Args:
+        node: Function or async function AST node to inspect.
+
+    Returns:
+        bool: True if any statement in the function body (including nested control flow) raises.
+    """
+    stack: list[ast.AST] = list(node.body)
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(current, ast.Raise):
+            return True
+        stack.extend(ast.iter_child_nodes(current))
+    return False
+
+
 def _check_function_args_doc(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     doc: str,
-    *,
-    strict_sections: bool = False,
 ) -> list[str]:
-    """Verify that all required parameters on a function AST node are documented in ``Args:``.
+    """Verify that all required parameters, returns, and raises on a function AST node are documented.
 
-    Also rejects extra documented parameters not in the function signature, and when
-    ``strict_sections=True`` verifies ``Returns:`` / ``Yields:`` and ``Raises:`` sections.
+    Also rejects extra documented parameters not in the function signature, and
+    verifies ``Returns:`` / ``Yields:`` and ``Raises:`` sections.
 
     Args:
         node: Function or async function AST node.
         doc: Non-empty docstring of the function.
-        strict_sections: Whether to enforce ``Returns:`` and ``Raises:`` sections. Defaults to False.
 
     Returns:
         list[str]: Missing or extra argument/section error messages.
@@ -126,33 +143,28 @@ def _check_function_args_doc(
             f"{type(node).__name__} '{node.name}' at line {node.lineno} "
             f"(EXTRA ARGS DOC: {', '.join(extra_documented)})"
         )
-    if strict_sections:
-        if _is_non_none_return(node.returns) and "Returns:" not in doc and "Yields:" not in doc:
-            errors.append(
-                f"{type(node).__name__} '{node.name}' at line {node.lineno} (MISSING RETURNS DOC)"
-            )
-        has_direct_raise = any(
-            isinstance(stmt, ast.Raise)
-            for stmt in node.body
-            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    if _is_non_none_return(node.returns) and "Returns:" not in doc and "Yields:" not in doc:
+        errors.append(
+            f"{type(node).__name__} '{node.name}' at line {node.lineno} (MISSING RETURNS DOC)"
         )
-        if has_direct_raise and "Raises:" not in doc:
-            errors.append(
-                f"{type(node).__name__} '{node.name}' at line {node.lineno} (MISSING RAISES DOC)"
-            )
+    if _has_direct_raise(node) and "Raises:" not in doc:
+        errors.append(
+            f"{type(node).__name__} '{node.name}' at line {node.lineno} (MISSING RAISES DOC)"
+        )
     return errors
 
 
-def check_file(path: str, *, strict_sections: bool = False) -> tuple[int, int]:
+def check_file(path: str, *, strict_sections: bool = True) -> tuple[int, int]:
     """Check a single Python file for module, class, function, and argument docstring coverage.
 
     Args:
         path: Path to the Python file to inspect.
-        strict_sections: Whether to enforce ``Returns:`` and ``Raises:`` sections. Defaults to False.
+        strict_sections: Retained for backward compatibility; strict sections are always enforced. Defaults to True.
 
     Returns:
         tuple[int, int]: Tuple of ``(missing_count, total_items_count)``.
     """
+    _ = strict_sections
     with open(path, encoding="utf-8") as f:
         content = f.read()
 
@@ -192,7 +204,7 @@ def check_file(path: str, *, strict_sections: bool = False) -> tuple[int, int]:
                     f"{type(node).__name__} '{node.name}' at line {node.lineno} (STUB DOCSTRING)"
                 )
             else:
-                missing.extend(_check_function_args_doc(node, doc, strict_sections=strict_sections))
+                missing.extend(_check_function_args_doc(node, doc))
 
     if missing:
         print(f"Missing/Stub in {path}:")
@@ -225,8 +237,7 @@ def run_doc_check(
             for file in sorted(files):
                 if file.endswith(".py"):
                     full_path = os.path.join(root, file)
-                    is_prod = directory in ("src", "scripts")
-                    m, t = check_file(full_path, strict_sections=is_prod)
+                    m, t = check_file(full_path, strict_sections=True)
                     total_missing += m
                     total_items += t
 

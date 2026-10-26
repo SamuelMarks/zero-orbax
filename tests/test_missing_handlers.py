@@ -144,6 +144,20 @@ def test_random_key_handlers(tmp_path: pathlib.Path) -> None:
     assert np_h.restore(tmp_path / "missing_np", item=[9]) == [9]
     assert np_h.restore(None, item=[8]) == [8]
     np_h.save(None, [0])
+    zcp.CheckpointHandler().save(None, {"noop": 1})
+    from zero_jax import numpy as jnp
+    from zero_orbax.core import SerializedArray
+
+    ser_key = SerializedArray([7, 8], shape=(2,), dtype="int32")
+    post_ser = jax_h.post_restore(
+        ser_key,
+        metadata=zcp.RestoreArgs(restore_type="jax", dtype="int32"),
+    )
+    assert isinstance(post_ser, jnp.ndarray) and post_ser.tolist() == [7, 8]
+    assert (
+        jax_h.post_restore("not_seq_or_num", metadata=zcp.RestoreArgs(restore_type="jax"))
+        == "not_seq_or_num"
+    )
 
 
 def test_composite_checkpoint_handler_and_registry(tmp_path: pathlib.Path) -> None:

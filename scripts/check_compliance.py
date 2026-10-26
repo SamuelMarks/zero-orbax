@@ -761,6 +761,19 @@ DEFAULT_SOURCE_FILES: tuple[str, ...] = (
     "src/zero_orbax/core.py",
     "src/zero_orbax/checkpoint.py",
     "src/zero_orbax/export.py",
+    "src/zero_orbax/_checkpoint/__init__.py",
+    "src/zero_orbax/_checkpoint/args_lib.py",
+    "src/zero_orbax/_checkpoint/checkpointer_lib.py",
+    "src/zero_orbax/_checkpoint/future_lib.py",
+    "src/zero_orbax/_checkpoint/handlers_lib.py",
+    "src/zero_orbax/_checkpoint/manager_lib.py",
+    "src/zero_orbax/_checkpoint/namespaces_lib.py",
+    "src/zero_orbax/_checkpoint/options_lib.py",
+    "src/zero_orbax/_checkpoint/step_lib.py",
+    "src/zero_orbax/_checkpoint/transform_lib.py",
+    "src/zero_orbax/_checkpoint/type_handlers_lib.py",
+    "src/zero_orbax/_checkpoint/utils_lib.py",
+    "src/zero_orbax/_checkpoint/v1_lib.py",
 )
 
 DEFAULT_STRUCTURAL_SNAPSHOT: dict[str, dict[str, str | list[str]]] = {

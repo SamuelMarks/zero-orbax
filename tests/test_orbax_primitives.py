@@ -5,10 +5,15 @@ from __future__ import annotations
 import pathlib
 
 import pytest
+from ml_switcheroo_compiler import ops as compiler_ops
+from ml_switcheroo_compiler.core.dtype import DType as CompilerDType
+from ml_switcheroo_compiler.core.tensor import Tensor as CompilerTensor, as_tensor_obj
 from ml_switcheroo_ir import LogicalGraph, LogicalMesh, LogicalNode, PartitionSpec
+from zero_jax import numpy as jnp
 
 from zero_orbax.core import (
     AtomicWrite,
+    AtomicityTemporaryPath,
     BarrierSync,
     FileSystemIO,
     GlobalArraySharding,
@@ -170,13 +175,20 @@ def test_filesystem_io_local_and_virtual(tmp_path: pathlib.Path) -> None:
     assert io.read("gs://test-bucket/checkpoints/step_1/state.bin") == b"virtual_payload"
     assert io.listdir("gs://test-bucket/checkpoints") == ["step_1"]
     assert io.listdir(tmp_path / "nonexistent_local_dir") == []
-    io.remove(gcs_dir)
+    io.move(
+        "gs://test-bucket/checkpoints/step_1/state.bin",
+        "gs://test-bucket/checkpoints/step_1/moved.bin",
+    )
+    assert io.read("gs://test-bucket/checkpoints/step_1/moved.bin") == b"virtual_payload"
+    io.move("gs://test-bucket/checkpoints/step_1", "gs://test-bucket/checkpoints/step_2")
+    assert io.read("gs://test-bucket/checkpoints/step_2/moved.bin") == b"virtual_payload"
+    io.remove("gs://test-bucket/checkpoints")
     assert not io.exists(gcs_file)
     vfs.reset()
 
 
 def test_atomic_write(tmp_path: pathlib.Path) -> None:
-    """Test AtomicWrite on existing directories, auto-created parent directories, and virtual URIs.
+    """Test AtomicWrite and AtomicityTemporaryPath on local and virtual URIs.
 
     Args:
         tmp_path: Pytest temporary directory fixture.
@@ -196,6 +208,33 @@ def test_atomic_write(tmp_path: pathlib.Path) -> None:
 
     aw.atomic_write_bytes("memory://in_mem/file.bin", b"mem_bytes")
     assert FileSystemIO(vfs=vfs).read("memory://in_mem/file.bin") == b"mem_bytes"
+
+    # Test AtomicityTemporaryPath initialization and finalization branches
+    atp_both = AtomicityTemporaryPath(
+        temporary_path=tmp_path / "custom_tmp",
+        final_path=tmp_path / "custom_final",
+    )
+    assert atp_both.get() == tmp_path / "custom_tmp"
+    assert atp_both.get_final() == tmp_path / "custom_final"
+    atp_both.finalize()  # no-op when temp_path does not exist
+
+    atp_tmp_only = AtomicityTemporaryPath(
+        temporary_path=tmp_path / "step_5.orbax-checkpoint-tmp",
+    )
+    assert atp_tmp_only.get_final() == tmp_path / "step_5"
+
+    atp_default = AtomicityTemporaryPath()
+    assert atp_default.get_final() == pathlib.Path("temp_stage")
+
+    atp_virt = AtomicityTemporaryPath(
+        temporary_path="memory://stage_tmp",
+        final_path="memory://stage_final",
+        permission_mode=0o755,
+        vfs=vfs,
+    )
+    aw.atomic_write_bytes("memory://stage_tmp/data.bin", b"staged_v")
+    atp_virt.finalize()
+    assert FileSystemIO(vfs=vfs).read("memory://stage_final/data.bin") == b"staged_v"
 
 
 def test_tensorstore_driver(tmp_path: pathlib.Path) -> None:
@@ -265,6 +304,30 @@ def test_msgpack_engine_roundtrips_and_binary_framing() -> None:
     assert engine.unpackb(b"\xff\xfe\xfd_invalid") is None
     assert engine.unpackb(b"\xc1_invalid_marker") is None
     assert engine.unpackb(b"\x93ZMPK\xff\xfe") is None
+
+    with pytest.raises(ValueError, match="Corrupt MessagePack"):
+        engine.unpackb(b"\xff\xfe\xfd_invalid", strict=True)
+    with pytest.raises(ValueError, match="Trailing bytes"):
+        engine.unpackb(b"\xc0\xc0", strict=True)
+    with pytest.raises(ValueError, match="Corrupt MessagePack"):
+        engine.unpackb(b"\xc1_invalid_marker", strict=True)
+    with pytest.raises(ValueError, match="Invalid legacy"):
+        engine.unpackb(b"\x93ZMPK\xff\xfe", strict=True)
+
+    # Test set, frozenset, and pathlib.Path round-trips
+    set_path_raw = _encode_pytree_to_json_value(
+        {
+            "set_v": {1, 2},
+            "frozenset_v": frozenset({3, 4}),
+            "path_v": pathlib.Path("/tmp/ckpt"),
+        }
+    )
+    set_path_unpacked = engine.unpackb(_pack_msgpack_bytes(set_path_raw))
+    assert set_path_unpacked == {
+        "set_v": {1, 2},
+        "frozenset_v": frozenset({3, 4}),
+        "path_v": pathlib.Path("/tmp/ckpt"),
+    }
 
     # Empty dictionary round-trips losslessly!
     packed_empty = engine.packb({})
@@ -506,6 +569,46 @@ def test_global_array_sharding() -> None:
     assert isinstance(sharded_ser, SerializedArray)
     assert sharded_ser.shape == (2, 1)
     assert sharded_ser.tolist() == [[1], [3]]
+
+    # 2D multi-axis sharding across both "data" and "model" axes (4 total shards)
+    spec_2d_both = PartitionSpec(axes=("data", "model"))
+    mat_4x4 = [
+        [1, 2, 3, 4],
+        [5, 6, 7, 8],
+        [9, 10, 11, 12],
+        [13, 14, 15, 16],
+    ]
+    assert gas.get_local_shard(mat_4x4, 0, num_hosts=4, partition_spec=spec_2d_both, mesh=mesh) == [
+        [1, 2],
+        [5, 6],
+    ]
+    assert gas.get_local_shard(mat_4x4, 1, num_hosts=4, partition_spec=spec_2d_both, mesh=mesh) == [
+        [3, 4],
+        [7, 8],
+    ]
+    assert gas.get_local_shard(mat_4x4, 2, num_hosts=4, partition_spec=spec_2d_both, mesh=mesh) == [
+        [9, 10],
+        [13, 14],
+    ]
+    assert gas.get_local_shard(mat_4x4, 3, num_hosts=4, partition_spec=spec_2d_both, mesh=mesh) == [
+        [11, 12],
+        [15, 16],
+    ]
+
+    # Verify jnp.ndarray and CompilerTensor type preservation
+    jnp_arr = jnp.asarray([10.0, 20.0, 30.0, 40.0], dtype="float32")
+    sharded_jnp = gas.get_local_shard(jnp_arr, 1, num_hosts=2)
+    assert isinstance(sharded_jnp, jnp.ndarray)
+    assert sharded_jnp.tolist() == [30.0, 40.0]
+
+    from zero_orbax.types import array_to_nested_list
+
+    comp_tensor = as_tensor_obj(
+        compiler_ops.asarray([100, 200, 300, 400], dtype=CompilerDType.int32)
+    )
+    sharded_comp = gas.get_local_shard(comp_tensor, 0, num_hosts=2)
+    assert isinstance(sharded_comp, CompilerTensor)
+    assert array_to_nested_list(sharded_comp) == [100, 200]
 
     short_arr = SampleArray([10], shape=(1,), dtype="int32")
     assert gas.get_local_shard(short_arr, 0, num_hosts=2) is short_arr

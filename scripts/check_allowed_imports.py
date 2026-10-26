@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import pkgutil
 import sys
 from collections.abc import Sequence
@@ -135,18 +136,25 @@ def check_file(filepath: str, stdlib_names: frozenset[str] | None = None) -> boo
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the allowed-imports check across CLI file arguments.
+    """Run the allowed-imports check across CLI file or directory arguments.
 
     Args:
-        argv: Optional sequence of file paths to inspect. Defaults to ``sys.argv[1:]``.
+        argv: Optional sequence of file or directory paths to inspect. Defaults to ``sys.argv[1:]``.
 
     Returns:
         int: Exit code (0 if all files pass, 1 if any file fails).
     """
     args_list = list(argv) if argv is not None else sys.argv[1:]
+    if not args_list:
+        args_list = ["src/zero_orbax"]
     success = True
     for arg in args_list:
-        if arg.endswith(".py") and not check_file(arg):
+        if os.path.isdir(arg):
+            for root, _, files in sorted(os.walk(arg)):
+                for file in sorted(files):
+                    if file.endswith(".py") and not check_file(os.path.join(root, file)):
+                        success = False
+        elif arg.endswith(".py") and not check_file(arg):
             success = False
     return 0 if success else 1
 

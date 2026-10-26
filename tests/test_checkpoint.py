@@ -260,6 +260,10 @@ def test_apply_transformations() -> None:
                     return a_val + c_val
         return 0
 
+    assert _sum_ab("not_a_dict") == 0
+    assert _sum_ab({"a": "bad", "b": {}}) == 0
+    assert _sum_ab({"a": 1, "b": {"c": "bad"}}) == 0
+
     orig: PyTree = {"a": 1, "b": {"c": 2}, "d": 4, "layer_0": 99}
     trans: PyTree = {
         "a_new": Transform(original_key="a", value_fn=_add1),
@@ -614,8 +618,7 @@ def test_optax_and_grain_composite_checkpointing(tmp_path: pathlib.Path) -> None
     assert isinstance(gh.restore(gh_dir, args.PyGrainCheckpointRestore(None)), dict)
     assert gh.restore(gh_dir, args.PyGrainCheckpointRestore(data_iter)) is data_iter
 
-    empty_mgr_dir = tmp_path / "empty_step_mgr"
-    empty_mgr = CheckpointManager(empty_mgr_dir)
-    empty_mgr.steps.append(99)
-    empty_mgr.checkpoints[99] = {"fallback": 1}
-    assert empty_mgr.restore(99) == {"fallback": 1}
+    in_mem_mgr = CheckpointManager(None)
+    assert in_mem_mgr.save(99, {"fallback": 1}) is True
+    assert in_mem_mgr.restore(99) == {"fallback": 1}
+    assert in_mem_mgr.item_metadata(99) == {"fallback": 1}

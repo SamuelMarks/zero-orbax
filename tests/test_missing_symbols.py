@@ -6,6 +6,7 @@ import inspect
 import pathlib
 from typing import NamedTuple
 
+import pytest
 from ml_switcheroo_ir import PartitionSpec
 from zero_flax.core import FrozenDict
 import zero_flax.nnx as nnx
@@ -112,11 +113,29 @@ def test_random_key_handler_and_default_registry(tmp_path: pathlib.Path) -> None
     """
     rk_handler = zcp.RandomKeyCheckpointHandler(key_name="rng_state")
     assert rk_handler.checkpoint_save_args(None) == (None, None)
-    val_item, val_sargs = rk_handler.checkpoint_save_args([1, 2])
-    assert val_item == [1, 2]
-    assert isinstance(val_sargs, zcp.SaveArgs)
+    key_item, s_args = rk_handler.checkpoint_save_args([1, 2])
+    assert key_item == [1, 2]
+    assert isinstance(s_args, zcp.SaveArgs)
     r_args = zcp.RestoreArgs(restore_type=list)
     assert rk_handler.checkpoint_restore_args([1, 2], r_args) is r_args
+    auto_r_args = rk_handler.checkpoint_restore_args([1, 2])
+    assert isinstance(auto_r_args, zcp.RestoreArgs) and auto_r_args.restore_type is list
+    auto_arr_r_args = rk_handler.checkpoint_restore_args(jnp.asarray([1, 2], dtype=jnp.int32))
+    assert isinstance(auto_arr_r_args, zcp.ArrayRestoreArgs)
+    assert rk_handler.checkpoint_restore_args(None) is None
+    assert rk_handler.post_restore(None) is None
+    assert rk_handler.post_restore([1, 2], metadata=zcp.RestoreArgs(restore_type=tuple)) == (1, 2)
+    assert rk_handler.post_restore((1, 2), metadata=zcp.RestoreArgs(restore_type=list)) == [1, 2]
+    reconstructed_jnp = rk_handler.post_restore(
+        [1, 2],
+        metadata=zcp.RestoreArgs(restore_type=jnp.ndarray, dtype="int32"),
+    )
+    assert isinstance(reconstructed_jnp, jnp.ndarray)
+    reconstructed_from_tmpl = rk_handler.post_restore(
+        [3, 4],
+        metadata=jnp.asarray([0, 0], dtype=jnp.int32),
+    )
+    assert isinstance(reconstructed_from_tmpl, jnp.ndarray)
     assert rk_handler.post_restore([1, 2]) == [1, 2]
 
     rk_dir = tmp_path / "rk_ckpt"
@@ -232,12 +251,29 @@ def test_checkpoint_utils_and_msgpack_utils(tmp_path: pathlib.Path) -> None:
     assert (
         zcp.checkpoint_utils.wait_for_new_checkpoint(
             empty_wait,
-            until_step=1,
-            seconds_to_sleep=1,
-            timeout=0,
+            seconds_to_sleep=0,
+            timeout=1,
         )
         == -1
     )
+
+    # Test checkpoints_iterator skipping non-step entries, multihost, tree.to_flat_dict, and test_utils.sync_global_processes
+    assert list(zcp.checkpoint_utils.checkpoints_iterator(wait_dir)) == [1, 5]
+    assert list(zcp.checkpoint_utils.checkpoints_iterator(wait_dir, timeout_fn=lambda: True)) == []
+    assert list(zcp.checkpoint_utils.checkpoints_iterator(wait_dir, timeout_fn=lambda: False)) == [
+        1,
+        5,
+    ]
+    assert zcp.multihost.process_index() == 0
+    assert zcp.multihost.process_count() == 1
+    zcp.multihost.sync_global_processes("test_barrier_mh")
+    zcp.test_utils.sync_global_processes("test_barrier_tu")
+    assert zcp.tree.to_flat_dict("not_a_dict") == {}
+    assert zcp.tree.to_flat_dict({"a": {"b": 1, "c": {}}, "d": 2}) == {
+        "a/b": 1,
+        "a/c": {},
+        "d": 2,
+    }
     assert (
         zcp.checkpoint_utils.wait_for_new_checkpoint(
             empty_wait,
@@ -260,14 +296,13 @@ def test_v1_functional_apis(tmp_path: pathlib.Path) -> None:
         tmp_path: Pytest temporary directory fixture.
     """
     p1 = tmp_path / "v1_sync"
+    assert zcp.v1.custom_metadata(p1) is None
     zcp.v1.save_pytree(p1, {"w": [1, 2]}, custom_metadata={"author": "orbax"})
     assert zcp.v1.load_pytree(p1) == {"w": [1, 2]}
+    assert zcp.v1.custom_metadata(p1) == {"author": "orbax"}
 
-    try:
+    with pytest.raises(ValueError, match="already exists"):
         zcp.v1.save_pytree(p1, {"w": [3, 4]}, overwrite=False)
-        raise AssertionError("Expected ValueError when overwrite=False on existing path")
-    except ValueError:
-        pass
 
     zcp.v1.save_pytree(p1, {"w": [3, 4]}, overwrite=True)
     assert zcp.v1.load_pytree(p1) == {"w": [3, 4]}
@@ -276,12 +311,10 @@ def test_v1_functional_apis(tmp_path: pathlib.Path) -> None:
     fut = zcp.v1.save_pytree_async(p2, {"k": 10}, custom_metadata={"tag": "async"})
     fut.result()
     assert zcp.v1.load_pytree(p2) == {"k": 10}
+    assert zcp.v1.custom_metadata(p2) == {"tag": "async"}
 
-    try:
+    with pytest.raises(ValueError, match="already exists"):
         zcp.v1.save_pytree_async(p2, {"k": 20}, overwrite=False)
-        raise AssertionError("Expected ValueError when overwrite=False on existing async path")
-    except ValueError:
-        pass
 
     fut2 = zcp.v1.save_pytree_async(p2, {"k": 20}, overwrite=True)
     fut2.result()
@@ -295,12 +328,10 @@ def test_v1_functional_apis(tmp_path: pathlib.Path) -> None:
     )
     loaded_comp = zcp.v1.load_checkpointables(p3)
     assert loaded_comp == {"model": {"x": 1}, "opt": {"step": 2}}
+    assert zcp.v1.custom_metadata(p3) == {"ver": 1}
 
-    try:
+    with pytest.raises(ValueError, match="already exists"):
         zcp.v1.save_checkpointables(p3, {"model": {"x": 2}}, overwrite=False)
-        raise AssertionError("Expected ValueError when overwrite=False on existing composite path")
-    except ValueError:
-        pass
 
     zcp.v1.save_checkpointables(p3, {"model": {"x": 5}}, overwrite=True)
     assert zcp.v1.load_checkpointables(p3) == {"model": {"x": 5}}
@@ -336,6 +367,9 @@ def test_orbax_export_module(tmp_path: pathlib.Path) -> None:
             if isinstance(scale, (int, float)) and isinstance(bias, (int, float)):
                 return inputs * scale + bias
         return inputs
+
+    assert _linear_apply({"scale": "bad"}, 3) == 3
+    assert _linear_apply("not_dict", 3) == 3
 
     jmod = zexp.JaxModule(
         params={"scale": 2, "bias": 1},
@@ -379,18 +413,12 @@ def test_orbax_export_module(tmp_path: pathlib.Path) -> None:
 
     # Test ServingConfig.bind error branches
     cfg_missing_key = zexp.ServingConfig(signature_key="bad", method_key="nonexistent")
-    try:
+    with pytest.raises(ValueError, match="not found"):
         cfg_missing_key.bind(jmod_multi.methods)
-        raise AssertionError("Expected ValueError for missing method_key")
-    except ValueError:
-        pass
 
     cfg_ambiguous = zexp.ServingConfig(signature_key="ambiguous", method_key=None)
-    try:
+    with pytest.raises(ValueError, match="method_key"):
         cfg_ambiguous.bind(jmod_multi.methods)
-        raise AssertionError("Expected ValueError when method_key is None with multiple methods")
-    except ValueError:
-        pass
 
     cfg_auto_single = zexp.ServingConfig(signature_key="auto", method_key=None)
     bound_auto = cfg_auto_single.bind(jmod.methods)
@@ -408,8 +436,5 @@ def test_orbax_export_module(tmp_path: pathlib.Path) -> None:
     assert loaded["params"] == {"scale": 5, "bias": 0}
     assert "custom_sig" in loaded["signature_keys"]
 
-    try:
+    with pytest.raises(FileNotFoundError, match="not found"):
         mgr.load(tmp_path / "missing_export_dir")
-        raise AssertionError("Expected FileNotFoundError for missing export artifact")
-    except FileNotFoundError:
-        pass

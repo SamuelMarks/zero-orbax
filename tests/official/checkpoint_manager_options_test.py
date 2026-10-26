@@ -34,17 +34,17 @@ class ReadOnlyOptionSpec(TypedDict, total=False):
     should_save_fn: ShouldSaveFn | None
 
 
-def _always_save(step: int, latest: int | None) -> bool:
-    """Return True for any step.
+def _save_every_even_step(step: int, latest: int | None) -> bool:
+    """Return True when ``step`` is even and strictly greater than ``latest``.
 
     Args:
         step: Candidate step.
         latest: Latest step.
 
     Returns:
-        bool: Always True.
+        bool: True if ``step`` is even and greater than ``latest`` (or ``latest is None``).
     """
-    return step >= 0 or latest is None
+    return step % 2 == 0 and (latest is None or step > latest)
 
 
 class CheckpointManagerOptionsTest(parameterized.TestCase):
@@ -98,7 +98,7 @@ class CheckpointManagerOptionsTest(parameterized.TestCase):
             ReadOnlyOptionSpec(
                 save_interval_steps=1,
                 save_on_steps=[1],
-                should_save_fn=_always_save,
+                should_save_fn=_save_every_even_step,
             ),
         ),
     )
@@ -111,6 +111,8 @@ class CheckpointManagerOptionsTest(parameterized.TestCase):
         Args:
             spec: The typed configuration options dictionary to initialize with.
         """
+        self.assertTrue(_save_every_even_step(2, None))
+        self.assertFalse(_save_every_even_step(3, 2))
         options = ocp.CheckpointManagerOptions(
             read_only=True,
             save_interval_steps=spec.get("save_interval_steps", 1),

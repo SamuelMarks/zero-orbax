@@ -20,7 +20,11 @@ from collections.abc import Mapping, Sequence
 from typing import Union
 from typing_extensions import TypeAlias
 
+from ml_switcheroo_compiler import ops as compiler_ops
+from ml_switcheroo_compiler.core.dtype import DType as CompilerDType
+from ml_switcheroo_compiler.core.tensor import Tensor as CompilerTensor, as_tensor_obj
 from ml_switcheroo_ir import LogicalGraph, LogicalMesh, PartitionSpec
+from zero_jax import numpy as jnp
 
 from zero_orbax.types import (
     ArrayProtocol,
@@ -31,10 +35,27 @@ from zero_orbax.types import (
     PyTree,
     PyTreeLeaf,
     array_to_nested_list,
+    infer_array_shape,
     is_array_protocol,
     is_pytree_mapping,
     normalize_path,
 )
+
+_COMPILER_DTYPE_MAP: dict[str, CompilerDType] = {member.name: member for member in CompilerDType}
+
+
+def resolve_compiler_dtype(dtype_str: str) -> CompilerDType:
+    """Resolve a string dtype identifier into a ``CompilerDType`` enum member.
+
+    Args:
+        dtype_str: String representation of the data type (e.g. ``"float32"`` or ``"DType.float32"``).
+
+    Returns:
+        CompilerDType: Corresponding compiler data type enum member.
+    """
+    clean = dtype_str[6:] if dtype_str.startswith("DType.") else dtype_str
+    return _COMPILER_DTYPE_MAP.get(clean, CompilerDType.float32)
+
 
 _VIRTUAL_SCHEMES: tuple[str, ...] = ("gs://", "s3://", "memory://")
 _VFS_FILES_CTX: contextvars.ContextVar[dict[str, bytes] | None] = contextvars.ContextVar(
@@ -312,6 +333,32 @@ class FileSystemIO:
             elif norm.exists():
                 norm.unlink()
 
+    def move(self, src: PathLike, dst: PathLike) -> None:
+        """Move or rename a file or directory tree across local paths or virtual URIs.
+
+        Args:
+            src: Source path or virtual URI.
+            dst: Destination path or virtual URI.
+        """
+        raw_src = _normalize_virtual_key(str(src))
+        raw_dst = _normalize_virtual_key(str(dst))
+        self.remove(dst)
+        if _is_virtual_uri(raw_src) or _is_virtual_uri(raw_dst):
+            exact = self.vfs.pop(raw_src)
+            if exact is not None:
+                self.vfs.put(raw_dst, exact)
+            src_prefix = raw_src.rstrip("/") + "/"
+            dst_prefix = raw_dst.rstrip("/") + "/"
+            for k in self.vfs.keys():
+                if k.startswith(src_prefix):
+                    data = self.vfs.pop(k)
+                    self.vfs.put(dst_prefix + k[len(src_prefix) :], data or b"")
+            return
+        norm_src = normalize_path(src)
+        norm_dst = normalize_path(dst)
+        norm_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(norm_src), str(norm_dst))
+
 
 class AtomicWrite:
     """Atomic file write handler using temporary sibling staging and atomic rename."""
@@ -356,6 +403,81 @@ class AtomicWrite:
         if permission_mode is not None:
             os.chmod(tmp_path, permission_mode)
         os.replace(tmp_path, norm)
+
+
+class AtomicityTemporaryPath:
+    """Atomic temporary staging path manager implementing ``TemporaryPathProtocol``."""
+
+    def __init__(
+        self,
+        temporary_path: PathLike | None = None,
+        final_path: PathLike | None = None,
+        *,
+        permission_mode: int | None = None,
+        vfs: VirtualFileSystem | None = None,
+    ) -> None:
+        """Initialize the AtomicityTemporaryPath.
+
+        Args:
+            temporary_path: Optional explicit temporary staging directory path. Defaults to None.
+            final_path: Optional final committed destination directory path. Defaults to None.
+            permission_mode: Optional octal directory permission mode. Defaults to None.
+            vfs: Optional ``VirtualFileSystem`` instance. Defaults to None.
+        """
+        self.vfs: VirtualFileSystem = vfs if vfs is not None else VirtualFileSystem()
+        self.permission_mode = permission_mode
+        if final_path is not None and temporary_path is None:
+            raw_final = str(final_path).rstrip("/")
+            self._final_str = raw_final
+            self._temp_str = f"{raw_final}.orbax-checkpoint-tmp"
+        elif temporary_path is not None and final_path is not None:
+            self._temp_str = str(temporary_path).rstrip("/")
+            self._final_str = str(final_path).rstrip("/")
+        elif temporary_path is not None:
+            raw_tmp = str(temporary_path).rstrip("/")
+            self._temp_str = raw_tmp
+            self._final_str = raw_tmp.replace(".orbax-checkpoint-tmp", "")
+        else:
+            self._temp_str = "temp_stage.orbax-checkpoint-tmp"
+            self._final_str = "temp_stage"
+
+    def get(self) -> pathlib.Path:
+        """Return the temporary staging directory path.
+
+        Returns:
+            pathlib.Path: Temporary staging path.
+        """
+        return pathlib.Path(self._temp_str)
+
+    def get_final(self) -> pathlib.Path:
+        """Return the final committed destination path.
+
+        Returns:
+            pathlib.Path: Final destination path.
+        """
+        return pathlib.Path(self._final_str)
+
+    def create(self) -> pathlib.Path:
+        """Create and return the temporary staging directory.
+
+        Returns:
+            pathlib.Path: Created temporary directory path.
+        """
+        FileSystemIO(vfs=self.vfs).makedirs(
+            self._temp_str,
+            exist_ok=True,
+            permission_mode=self.permission_mode,
+        )
+        return pathlib.Path(self._temp_str)
+
+    def finalize(self) -> None:
+        """Atomically promote the temporary staging path to the final destination."""
+        io = FileSystemIO(vfs=self.vfs)
+        if self._temp_str == self._final_str or not io.exists(self._temp_str):
+            return
+        io.move(self._temp_str, self._final_str)
+        if not _is_virtual_uri(self._final_str) and self.permission_mode is not None:
+            os.chmod(pathlib.Path(self._final_str), self.permission_mode)
 
 
 class SerializedArray:
@@ -613,14 +735,16 @@ _PackedMsgpackValue: TypeAlias = Union[
 ]
 
 
-def _encode_pytree_to_json_value(node: PyTree) -> _PackedMsgpackValue:
+def _encode_pytree_to_json_value(
+    node: PyTree | set[PyTree] | frozenset[PyTree] | pathlib.Path,
+) -> _PackedMsgpackValue:
     """Recursively encode a PyTree into a tagged MessagePack-serializable structure.
 
     Args:
         node: PyTree node to encode.
 
     Returns:
-        _PackedMsgpackValue: Tagged structure preserving tuples, bytes, arrays, and graphs.
+        _PackedMsgpackValue: Tagged structure preserving tuples, sets, paths, bytes, arrays, and graphs.
 
     Raises:
         TypeError: If ``node`` is an unsupported type.
@@ -629,6 +753,18 @@ def _encode_pytree_to_json_value(node: PyTree) -> _PackedMsgpackValue:
         return node
     if isinstance(node, complex):
         return {"__ztype__": "complex", "real": node.real, "imag": node.imag}
+    if isinstance(node, pathlib.Path):
+        return {"__ztype__": "path", "path": str(node)}
+    if isinstance(node, set):
+        return {
+            "__ztype__": "set",
+            "items": [_encode_pytree_to_json_value(item) for item in sorted(node, key=repr)],
+        }
+    if isinstance(node, frozenset):
+        return {
+            "__ztype__": "frozenset",
+            "items": [_encode_pytree_to_json_value(item) for item in sorted(node, key=repr)],
+        }
     if isinstance(node, LogicalGraph):
         return {
             "__ztype__": "logical_graph",
@@ -636,8 +772,14 @@ def _encode_pytree_to_json_value(node: PyTree) -> _PackedMsgpackValue:
         }
     if isinstance(node, ArrayProtocol):
         raw_bytes = node.tobytes() if isinstance(node, BytesSerializableProtocol) else b""
+        array_kind = (
+            "tensor"
+            if isinstance(node, CompilerTensor)
+            else ("serialized_array" if isinstance(node, SerializedArray) else "jax_array")
+        )
         return {
             "__ztype__": "array",
+            "array_kind": array_kind,
             "shape": [int(d) for d in node.shape],
             "dtype": str(node.dtype),
             "data": _encode_pytree_to_json_value(array_to_nested_list(node)),
@@ -685,6 +827,9 @@ def _decode_json_value_to_pytree(
         hex_val = value.get("hex")
         if tag == "bytes" and isinstance(hex_val, str):
             return bytes.fromhex(hex_val)
+        path_val = value.get("path")
+        if tag == "path" and isinstance(path_val, str):
+            return pathlib.Path(path_val)
         real_val = value.get("real")
         imag_val = value.get("imag")
         if (
@@ -696,6 +841,16 @@ def _decode_json_value_to_pytree(
         items_val = value.get("items")
         if tag == "tuple" and isinstance(items_val, list):
             return tuple(
+                _decode_json_value_to_pytree(item, preserve_array=preserve_array)
+                for item in items_val
+            )
+        if tag == "set" and isinstance(items_val, list):
+            return {
+                _decode_json_value_to_pytree(item, preserve_array=preserve_array)
+                for item in items_val
+            }
+        if tag == "frozenset" and isinstance(items_val, list):
+            return frozenset(
                 _decode_json_value_to_pytree(item, preserve_array=preserve_array)
                 for item in items_val
             )
@@ -1055,14 +1210,19 @@ class MsgpackEngine:
         encoded = _encode_pytree_to_json_value(tree)
         return _pack_msgpack_bytes(encoded)
 
-    def unpackb(self, data: bytes) -> PyTree:
+    def unpackb(self, data: bytes, *, strict: bool = False) -> PyTree:
         """Unpack binary MessagePack bytes (or legacy ``_MSGPACK_MAGIC`` / JSON bytes) into a PyTree.
 
         Args:
             data: Packed binary bytes produced by ``packb``.
+            strict: If True, raise ``ValueError`` when ``data`` is malformed instead of returning ``None``.
+                Defaults to False.
 
         Returns:
-            PyTree: Reconstructed PyTree, or ``None`` if ``data`` is empty or invalid.
+            PyTree: Reconstructed PyTree, or ``None`` if ``data`` is empty or invalid (when ``strict=False``).
+
+        Raises:
+            ValueError: If ``strict=True`` and ``data`` cannot be decoded as valid MessagePack or JSON.
         """
         if not data:
             return None
@@ -1070,12 +1230,15 @@ class MsgpackEngine:
             payload = data[len(_MSGPACK_MAGIC) :]
             try:
                 decoded_legacy: JsonValue = json.loads(payload.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                if strict:
+                    raise ValueError("Invalid legacy _MSGPACK_MAGIC payload.") from exc
                 return None
             return _decode_json_value_to_pytree(
                 decoded_legacy,
                 preserve_array=self.preserve_array,
             )
+        mp_err: Exception | None = None
         try:
             decoded_mp, end_pos = _unpack_msgpack_bytes(data, 0)
             if end_pos == len(data):
@@ -1083,11 +1246,14 @@ class MsgpackEngine:
                     decoded_mp,
                     preserve_array=self.preserve_array,
                 )
-        except (ValueError, UnicodeDecodeError):
-            pass
+            mp_err = ValueError("Trailing bytes in MessagePack buffer.")
+        except (ValueError, UnicodeDecodeError) as exc:
+            mp_err = exc
         try:
             decoded_json: JsonValue = json.loads(data.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if strict:
+                raise ValueError(f"Corrupt MessagePack/JSON buffer: {mp_err}") from exc
             return None
         return _decode_json_value_to_pytree(
             decoded_json,
@@ -1168,23 +1334,7 @@ def _slice_along_axis(
     return data
 
 
-def _infer_nested_shape(data: PyTree) -> tuple[int, ...]:
-    """Infer the shape tuple of a nested Python list/tuple.
-
-    Args:
-        data: Nested list/tuple or scalar.
-
-    Returns:
-        tuple[int, ...]: Inferred dimensions.
-    """
-    dims: list[int] = []
-    curr: PyTree = data
-    while isinstance(curr, (list, tuple)):
-        dims.append(len(curr))
-        if len(curr) == 0:
-            break
-        curr = curr[0]
-    return tuple(dims)
+_infer_nested_shape = infer_array_shape
 
 
 class GlobalArraySharding:
@@ -1201,7 +1351,7 @@ class GlobalArraySharding:
         """Extract the local shard of a global array for a specific host.
 
         Supports 1D and multi-axis ``PartitionSpec`` + ``LogicalMesh`` sharding across
-        lists, tuples, and ``ArrayProtocol`` / ``SerializedArray`` instances.
+        lists, tuples, and ``ArrayProtocol`` / ``SerializedArray`` / ``jnp.ndarray`` / ``CompilerTensor`` instances.
 
         Args:
             array: The global array, sequence, or PyTree to shard.
@@ -1216,42 +1366,85 @@ class GlobalArraySharding:
         Raises:
             ValueError: If ``host_id < 0`` or ``num_hosts <= 0`` or ``host_id >= num_hosts``.
         """
-        effective_hosts = num_hosts
-        target_axis = 0
+        sharded_axes: list[tuple[int, int]] = []
+        spec_hosts = 1
         if mesh is not None and partition_spec is not None and len(partition_spec.axes) > 0:
             for idx, axis_spec in enumerate(partition_spec.axes):
                 if isinstance(axis_spec, str):
                     factor = max(1, mesh.shape.get(axis_spec, 1))
-                    target_axis = idx
-                    effective_hosts = max(effective_hosts, factor)
-                    break
-                if axis_spec is not None:
+                    sharded_axes.append((idx, factor))
+                    spec_hosts *= factor
+                elif axis_spec is not None:
                     axis_factor = 1
                     for axis_name in axis_spec:
                         axis_factor *= max(1, mesh.shape.get(axis_name, 1))
-                    target_axis = idx
-                    effective_hosts = max(effective_hosts, axis_factor)
-                    break
+                    sharded_axes.append((idx, axis_factor))
+                    spec_hosts *= axis_factor
 
+        effective_hosts = max(num_hosts, spec_hosts) if sharded_axes else num_hosts
         if effective_hosts <= 0 or host_id < 0 or host_id >= effective_hosts:
             raise ValueError(f"Invalid host_id={host_id} for num_hosts={effective_hosts}.")
         if array is None:
             return None
-        if effective_hosts == 1 and (partition_spec is None or len(partition_spec.axes) == 0):
+        if effective_hosts == 1 and not sharded_axes:
             return array
+
+        if not sharded_axes:
+            sharded_axes = [(0, effective_hosts)]
+
+        def _apply_multi_axis_slice(seq: PyTree) -> PyTree:
+            """Slice ``seq`` across all partitioned axes using row-major host coordinates.
+
+            Args:
+                seq: Nested list or tuple to slice.
+
+            Returns:
+                PyTree: Multi-axis sliced sequence.
+            """
+            coords: list[tuple[int, int, int]] = []
+            rem = host_id
+            for axis_idx, factor in reversed(sharded_axes):
+                coords.append((axis_idx, rem % factor, factor))
+                rem //= max(1, factor)
+            sliced_curr = seq
+            for axis_idx, coord, factor in reversed(coords):
+                sliced_curr = _slice_along_axis(sliced_curr, axis_idx, coord, factor)
+            return sliced_curr
+
         if isinstance(array, (list, tuple)):
-            return _slice_along_axis(array, target_axis, host_id, effective_hosts)
+            return _apply_multi_axis_slice(array)
         if is_array_protocol(array):
             data_list = array_to_nested_list(array)
+            first_axis = sharded_axes[0][0]
+            first_factor = sharded_axes[0][1]
             if isinstance(data_list, list) and len(data_list) >= (
-                effective_hosts if target_axis == 0 else 1
+                first_factor if first_axis == 0 else 1
             ):
-                sliced_data = _slice_along_axis(data_list, target_axis, host_id, effective_hosts)
+                sliced_data = _apply_multi_axis_slice(data_list)
                 if isinstance(array, SerializedArray):
                     return SerializedArray(
                         data=sliced_data,
-                        shape=_infer_nested_shape(sliced_data),
+                        shape=infer_array_shape(sliced_data),
                         dtype=str(array.dtype),
+                    )
+                if isinstance(array, jnp.ndarray):
+                    raw_jnp = (
+                        sliced_data
+                        if isinstance(sliced_data, (int, float, bool, list, tuple))
+                        else 0.0
+                    )
+                    return jnp.asarray(raw_jnp, dtype=resolve_compiler_dtype(str(array.dtype)))
+                if isinstance(array, CompilerTensor):
+                    raw_ct = (
+                        sliced_data
+                        if isinstance(sliced_data, (int, float, bool, list, tuple))
+                        else 0.0
+                    )
+                    return as_tensor_obj(
+                        compiler_ops.asarray(
+                            raw_ct,
+                            dtype=resolve_compiler_dtype(str(array.dtype)),
+                        )
                     )
                 return sliced_data
         return array
@@ -1259,6 +1452,7 @@ class GlobalArraySharding:
 
 __all__ = [
     "AtomicWrite",
+    "AtomicityTemporaryPath",
     "BarrierSync",
     "FileSystemIO",
     "GlobalArraySharding",
@@ -1267,4 +1461,5 @@ __all__ = [
     "SerializedArray",
     "TensorStoreDriver",
     "VirtualFileSystem",
+    "resolve_compiler_dtype",
 ]
