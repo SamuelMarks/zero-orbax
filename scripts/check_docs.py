@@ -204,13 +204,13 @@ def check_file(path: str, *, strict_sections: bool = False) -> tuple[int, int]:
 
 def run_doc_check(
     target_dirs: Sequence[str] = ("src", "scripts", "tests"),
-    output_json_path: str = "doc_coverage.json",
+    output_json_path: str | None = None,
 ) -> tuple[float, int]:
     """Scan target directories and compute overall documentation coverage percentage.
 
     Args:
         target_dirs: Sequence of directory paths to scan recursively. Defaults to ``("src", "scripts", "tests")``.
-        output_json_path: Path where the coverage JSON report is written. Defaults to ``"doc_coverage.json"``.
+        output_json_path: Optional path where the coverage JSON report is written. Defaults to None.
 
     Returns:
         tuple[float, int]: Tuple of ``(coverage_percentage, total_missing_count)``.
@@ -231,20 +231,21 @@ def run_doc_check(
                     total_items += t
 
     coverage = 100.0 if total_items == 0 else ((total_items - total_missing) / total_items) * 100.0
-    with open(output_json_path, "w", encoding="utf-8") as f:
-        json.dump({"doc_coverage": coverage}, f)
+    if output_json_path is not None:
+        with open(output_json_path, "w", encoding="utf-8") as f:
+            json.dump({"doc_coverage": coverage}, f)
     return coverage, total_missing
 
 
 def main(
     target_dirs: Sequence[str] = ("src", "scripts", "tests"),
-    output_json_path: str = "doc_coverage.json",
+    output_json_path: str | None = None,
 ) -> int:
     """Execute the documentation coverage check CLI.
 
     Args:
         target_dirs: Directories to inspect. Defaults to ``("src", "scripts", "tests")``.
-        output_json_path: Destination JSON file for badge reporting. Defaults to ``"doc_coverage.json"``.
+        output_json_path: Optional destination JSON file for badge reporting. Defaults to None.
 
     Returns:
         int: Process exit code (0 when 100% compliant, 1 otherwise).

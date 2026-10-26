@@ -12,12 +12,22 @@ import datetime
 import os
 import pathlib
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Optional, Protocol, Union, runtime_checkable
+from typing import Optional, Protocol, TypedDict, Union, runtime_checkable
 from typing_extensions import TypeAlias, TypeGuard
 
 from ml_switcheroo_compiler.core.tensor import Tensor as CompilerTensor
 from ml_switcheroo_ir import AttributeValue, DType, LogicalGraph, LogicalMesh, PartitionSpec
-from zero_grain._types import CheckpointStateDict
+
+
+class CheckpointStateDict(TypedDict, total=False):
+    """Typed dictionary representing serialized ``DataLoaderIterator`` state."""
+
+    version: int
+    last_seen_indices: dict[str, int]
+    last_worker_index: int
+    worker_count: int
+    sampler: str
+    data_source: str
 
 
 @runtime_checkable
@@ -649,16 +659,18 @@ class AsyncOptions:
     """Configuration options for asynchronous checkpointing operations.
 
     Attributes:
-        timeout_secs: Timeout duration in seconds for async completion. Defaults to 300.
+        timeout_secs: Timeout duration in seconds for async completion. Defaults to 600.
         barrier_sync_fn: Function for synchronizing barriers across hosts. Defaults to None.
         post_finalization_callback: Callback executed after finalization completes. Defaults to None.
         create_directories_asynchronously: Whether directories may be created asynchronously. Defaults to True.
+        async_origin: Optional origin identifier string for asynchronous operations. Defaults to None.
     """
 
-    timeout_secs: int = 300
+    timeout_secs: int = 600
     barrier_sync_fn: BarrierSyncFn | None = None
     post_finalization_callback: PostFinalizationCallback | None = None
     create_directories_asynchronously: bool = True
+    async_origin: str | None = None
 
 
 @dataclasses.dataclass
@@ -692,6 +704,7 @@ __all__ = [
     "BestFn",
     "BytesSerializableProtocol",
     "CheckpointMetadataStoreProtocol",
+    "CheckpointStateDict",
     "CompositeOptions",
     "DType",
     "FileOptions",

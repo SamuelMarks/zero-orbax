@@ -329,7 +329,7 @@ def test_flax_state_and_frozendict_checkpointing(tmp_path: pathlib.Path) -> None
     Args:
         tmp_path: Temporary pytest directory.
     """
-    import zero_chex as chex
+    import zero_chex.trees as chex
     from zero_flax.core import FrozenDict
     import zero_flax.nnx as nnx
     from zero_jax import numpy as jnp
@@ -512,7 +512,7 @@ def test_optax_and_grain_composite_checkpointing(tmp_path: pathlib.Path) -> None
     Args:
         tmp_path: Temporary pytest directory.
     """
-    import zero_chex as chex
+    import zero_chex.trees as chex
     import zero_flax.nnx as nnx
     import zero_grain as grain
     from zero_jax import numpy as jnp

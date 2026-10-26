@@ -1,213 +1,349 @@
-# Zero-Orbax Exhaustive Audit & Remediation Plan (`TODO_PLAN.md`)
+# Exhaustive Codebase Audit & Conformance Plan (`zero-orbax` -> `ml-ecosystem-snapshots @ v0.0.5`)
 
-This document outlines the exhaustive engineering plan to remediate all code smells, broken abstractions, dunder/global hacks, weak typing, and tautological tests across `zero-orbax`, while strictly preserving:
-- **100% Documentation Coverage** (module, file, class, function, method, and `Args:` parameter docstrings verified via `interrogate` and `scripts/check_docs.py`).
-- **100% Test Coverage** (100% function, line, and branch coverage verified via `pytest --cov=src/zero_orbax --cov=scripts --cov-branch --cov-fail-under=100`).
-- **Strong Typing** (explicit type annotations everywhere; zero `Any`, `object`, `typing.cast`, `getattr`, `setattr`, `hasattr`, `globals()`, `vars()`, `exec()`, or `__dict__` tricks).
-- **Zero New Unapproved Dependencies** (relying strictly on Python stdlib, `pydantic`, `ml-switcheroo-ir`, `cdd-python`, `ml-ecosystem-snapshots`, and `../zero-*` / `../ml-switcheroo-*`).
-- **All Pre-Commit Hooks Passing** (`ruff-format`, `ruff-check`, `mypy`, `lint-typing`, `interrogate`, `check-docs`, `check-allowed-imports`, `check-api-compliance`, `pytest-coverage`, `update-badges`).
+This document captures the comprehensive architectural, API surface, module hierarchy, signature, docstring, typing, and pre-commit compliance audit of `zero-orbax` against `ml-ecosystem-snapshots` v0.0.5 (`https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/tag/v0.0.5`), followed by an exhaustive, itemized checkbox execution plan.
 
 ---
 
-## Phase 1: Eliminate Global Mutable Singletons & Scope-Shadowing Hacks
+## Global Invariants & Quality Gates
 
-### 1.1 Replace Module-Level Mutable State in `src/zero_orbax/core.py` and `src/zero_orbax/checkpoint.py`
-- [x] Replace module-level `_VIRTUAL_FS: dict[str, bytes]` in `src/zero_orbax/core.py` with an encapsulated `VirtualFileSystem` store class (with explicit `reset()` / scoped context support for test isolation instead of tests importing and mutating private `_VIRTUAL_FS`).
-- [x] Replace module-level `_BARRIER_COUNTS: dict[str, int]` in `src/zero_orbax/core.py` with encapsulated state on `BarrierSync` (with an optional shared default store and explicit `reset()` method).
-- [x] Remove module-level `_IN_MEMORY_CHECKPOINTS: dict[str, PyTree]` in `src/zero_orbax/checkpoint.py` so `CheckpointHandler` and `Checkpointer` persist through `FileSystemIO` / `AtomicWrite` (using `memory://` or local disk paths) rather than leaking state across unrelated test cases and handler instances.
-- [x] Remove all test imports of private `_VIRTUAL_FS` and `_IN_MEMORY_CHECKPOINTS` in `tests/test_orbax_primitives.py` and `tests/test_missing_coverage.py`.
-- [x] Eliminate `VirtualFileSystem._default_files` and `BarrierSync._default_counts` class-level mutable dictionaries in `src/zero_orbax/core.py` or provide an explicit `contextvars.ContextVar` / scoped registry factory so default `VirtualFileSystem()` and `BarrierSync()` instances do not leak state across concurrent or sequential test runs when `files=None` or `counts=None`.
-- [x] Add an autouse pytest fixture in `tests/conftest.py` that resets the default `VirtualFileSystem` and `BarrierSync` stores before and after every test to guarantee zero cross-test state pollution.
-- [x] Encapsulate `_SAVE_ARGS_TO_HANDLER`, `_RESTORE_ARGS_TO_HANDLER`, `_HANDLER_TO_SAVE_ARGS`, and `_HANDLER_TO_RESTORE_ARGS` in `src/zero_orbax/checkpoint.py` into a strongly typed `_ArgsHandlerCatalog` class instead of four synchronized module-level mutable dictionaries.
+Every phase and checkbox item in this plan MUST maintain the following repository-wide invariants at all times:
 
-### 1.2 Eliminate `globals()["args"]` & Argument Shadowing in `src/zero_orbax/checkpoint.py`
-- [x] Rename variadic `*pos_args: PyTree` in `CheckpointHandler.save`, `CheckpointHandler.restore`, `AsyncCheckpointHandler.async_save`, `ArrayCheckpointHandler.save`, `PyTreeCheckpointHandler.restore`, `JsonCheckpointHandler.save`, `AbstractCheckpointer.save`, `AbstractCheckpointer.restore`, `Checkpointer.save`, `Checkpointer.restore`, `AsyncCheckpointer.save`, `AsyncCheckpointer.restore`, and `StandardCheckpointer.restore` so that `*args` no longer shadows the module-level `args` namespace class.
-- [x] Rename the `args: args.CheckpointArgs | PyTree = None` parameter internal references or extract a private `_CheckpointArgsBase` class defined above `args` so `isinstance(..., args.CheckpointArgs)` works directly without `globals()["args"]`.
-- [x] Remove all 6 occurrences of `globals()["args"].CheckpointArgs` and `globals()["args"].PyTreeRestore` in `src/zero_orbax/checkpoint.py`.
-- [x] Remove unused re-exported stdlib modules (`asyncio`, `contextlib`, `functools`, `logging`) from the top of `src/zero_orbax/checkpoint.py` if not required by snapshot, or explicitly bind them in dedicated compatibility aliases with clear typing.
-- [x] Fix `NoneType: TypeAlias = None` in `src/zero_orbax/checkpoint.py` to `types.NoneType` (or `type(None)`).
-- [x] Make all `args.*` classes (`ArrayRestore`, `Composite`, `JsonSave`, `JsonRestore`, `ProtoSave`, `ProtoRestore`, `PyTreeSave`, `PyTreeRestore`, `StandardSave`, `StandardRestore`, `JaxRandomKeySave`, `JaxRandomKeyRestore`, `NumpyRandomKeySave`, `NumpyRandomKeyRestore`) inherit directly from `args.CheckpointArgs` instead of `_CheckpointArgsBase` so `isinstance(arg, ocp.args.CheckpointArgs)` returns `True` for every concrete `CheckpointArgs` wrapper (currently only `ArraySave` subclasses `args.CheckpointArgs`).
+- **100% Documentation Coverage**: Every file, module, class, method, function, and parameter (`Args:`, `Returns:`, `Yields:`, `Raises:`, `Attributes:`) across `src/`, `scripts/`, and `tests/` must be documented (`interrogate -vv -f 100 -M -i -c pyproject.toml src scripts tests` at 100.0%, `ruff check --select D` with Google convention, and `python3 scripts/check_docs.py` passing with zero missing/stub docstrings).
+- **100% Test Coverage**: 100% function, line, and branch coverage across `src/zero_orbax` and `scripts` (`pytest --cov=src/zero_orbax --cov=scripts --cov-branch --cov-report=term-missing --cov-fail-under=100`).
+- **Strong Typing & Zero Reflection**: Explicit type annotations on every parameter, return type, and attribute across `src/`, `scripts/`, and `tests/`. Zero `Any` or `object` annotations; zero `typing.cast`, `getattr`, `setattr`, `hasattr`, `delattr`, `vars`, `globals`, `locals`, `exec`, `eval`, or dunder reflection (`__dict__`, `__class__`, `__bases__`, `__mro__`, `__subclasses__`, etc.); zero `# type: ignore` comments (`mypy --strict src tests scripts` and `python3 scripts/lint_typing.py` passing with 0 violations).
+- **No New External Dependencies**: Only standard library modules and explicitly permitted ecosystem packages (`pydantic`, `ml-switcheroo-ir`, `ml-switcheroo-compiler`, `cdd-python` / `cdd`, `ml-ecosystem-snapshots`, and sibling `../zero-*` packages: `zero-jax`, `zero-chex`, `zero-flax`, `zero-grain`, `zero-optax`) are allowed (`python3 scripts/check_allowed_imports.py` passing).
+- **All Pre-Commit Hooks Passing**: `ruff-format`, `ruff-check`, `mypy`, `lint-typing`, `interrogate`, `check-docs`, `check-allowed-imports`, `check-api-compliance`, `pytest-coverage`, and `update-badges` must all pass cleanly.
+- **Never `git push`**: All work remains local; never execute `git push`.
 
 ---
 
-## Phase 2: Strengthen Static Typing, Pydantic Models & AST Linter (`src/zero_orbax/types.py` & `scripts/lint_typing.py`)
+## Architecture & Audit Overview
 
-### 2.1 Modernize Type Annotations & Eliminate `# type: ignore`
-- [x] Replace legacy `typing.Union` and `typing.Optional` in `src/zero_orbax/types.py` with PEP 604 `|` union syntax across all method/function signatures while maintaining Python 3.9 runtime `TypeAlias` compatibility.
-- [x] Narrow `CheckpointHandler.__init__`, `AbstractCheckpointer.__init__`, `AbstractCheckpointManager.__init__`, and `CheckpointHandlerRegistry.__init__` signatures so they do not accept arbitrary untyped `*args: PyTree, **kwargs: PyTree` where concrete parameters exist.
-- [x] Narrow `PyTreeCheckpointHandler.restore` parameter `transforms_default_to_original: bool | PyTree = True`.
-- [x] Convert `SaveArgs`, `RestoreArgs`, `ArrayRestoreArgs`, `AsyncOptions`, and `step_lib.NameFormat` into `@dataclasses.dataclass` classes with explicit field types and validation while preserving `ArrayRestoreArgs.restore_type()` method compatibility.
-- [x] Remove `# type: ignore[arg-type]` in `tests/official/checkpoint_manager_options_test.py` by using a strongly typed `TypedDict` (`ReadOnlyOptionSpec`) for parameterized `CheckpointManagerOptions` kwargs.
-- [x] Remove all `unittest.mock.MagicMock` and `unittest.mock.create_autospec` usages in `tests/official/test_checkpointer_official.py` and `tests/official/checkpoint_manager_options_test.py`, replacing them with strongly typed concrete test doubles (`RecordingCheckpointHandler` and `CustomNameFormat`).
-- [x] Remove `warn_unreachable = false` and restrict `disallow_subclassing_any = false` in `pyproject.toml`.
-- [x] Narrow `PyTreeCheckpointHandler.restore` parameter `transforms_default_to_original` from `bool | PyTree = True` to `bool = True` in `args.PyTreeRestore` while preserving Liskov substitution with `CheckpointHandler.restore`.
-- [x] Narrow `ArrayCheckpointHandler.restore` parameter `restore_args` in `args.ArrayRestore` to `ArrayRestoreArgs | RestoreArgs | None = None` while preserving Liskov substitution with `CheckpointHandler.restore`.
-- [x] Narrow `AbstractCheckpointManager.save`, `AbstractCheckpointManager.restore`, `CheckpointManager.save`, and `CheckpointManager.restore` parameter `args` from `_CheckpointArgsBase | PyTree = None` to `args.CheckpointArgs | None = None`.
-- [x] Narrow `CheckpointManagerOptions.best_mode` from `str = "max"` to `Literal["min", "max"] | str = "max"` (with runtime validation for invalid strings).
-- [x] Narrow `TypeHandlerProtocol.ty` and `TypeHandlerRegistryProtocol` methods (`add`, `get`, `has`, `get_by_typestr`) and `_RegisteredHandlerCls` / `_RegisteredArgsCls` in `src/zero_orbax/checkpoint.py` (`_ArgsHandlerCatalog`, `register_with_handler`, `get_registered_handler_cls`, `get_registered_args_cls`, `has_registered_args`) to bounded `type[CheckpointHandler]` and `type[_CheckpointArgsBase]`.
-- [x] Audit `[[tool.mypy.overrides]]` in `pyproject.toml` so all first-party modules (`src`, `scripts`, `tests`) are checked under strict Mypy without `follow_imports = "skip"`.
+```text
++-----------------------------------------------------------------------------------+
+|                      ml-ecosystem-snapshots @ v0.0.5                              |
+|  1. Release Asset: orbax_checkpoint_v0.12.8.json (31 Griffe-extracted APIs)       |
+|  2. Canonical Extractor: CANONICAL_ORBAX_OPS / _ORBAX_OP_DEFS (58 APIs)           |
+|     - orbax.checkpoint.* (Managers, Checkpointers, Options, Handlers, Transforms) |
+|     - orbax.checkpoint.args.* (16 Declarative Save/Restore CheckpointArgs)        |
+|     - orbax.checkpoint.checkpoint_utils.* (Iterator, Wait, RestoreArgs Helpers)   |
+|     - orbax.checkpoint.msgpack_utils.* (msgpack_serialize, msgpack_restore)       |
+|     - orbax.checkpoint.v1.* (save/load_pytree, save_pytree_async, checkpointables)|
+|     - orbax.export.* (ExportManager, JaxModule, ServingConfig, ObmExportOptions)  |
+|  3. Legacy Structural Snapshot: tests/orbax_api_snapshot.json (62 symbols)        |
++-----------------------------------------+-----------------------------------------+
+                                          |
+                                          v
++-----------------------------------------------------------------------------------+
+|                    scripts/check_compliance.py (Pre-Commit Gate)                  |
+|  - Validates module hierarchy: zero_orbax.{checkpoint,export,core,types}          |
+|    and submodules: args, checkpoint_utils, msgpack_utils, v1, handlers, options,  |
+|    type_handlers, transform_utils, step, step_lib, path, serialization, etc.      |
+|  - Validates minimum required classes, fields, methods, and functions exist       |
+|  - Validates function/constructor parameters: names, ordering, kinds, annotations,|
+|    and default values (allowing additional optional parameters in zero_orbax)     |
+|  - Validates non-empty Google-style docstrings and parameter documentation        |
++-----------------------------------------+-----------------------------------------+
+                                          |
+                                          v
++-----------------------------------------------------------------------------------+
+|                              src/zero_orbax/                                      |
+|  +-- __init__.py   (exports checkpoint, core, export, types)                      |
+|  +-- types.py      (Protocols, Options dataclasses, TypeGuards, Callbacks)        |
+|  +-- core.py       (VFS, FileSystemIO, AtomicWrite, MsgpackEngine, Sharding)      |
+|  +-- checkpoint.py (Handlers, Checkpointers, CheckpointManager, args, v1, utils)  |
+|  +-- export.py     (ExportManager, JaxModule, ServingConfig, ObmExportOptions)    |
++-----------------------------------------------------------------------------------+
+```
 
-### 2.2 Harden `scripts/lint_typing.py` Against Reflection & Dunder Tricks
-- [x] Expand `FORBIDDEN_REFLECTION_CALLS` in `scripts/lint_typing.py` to also forbid `globals`, `locals`, `vars`, `exec`, `eval`, `compile`, `delattr`, and `__import__`.
-- [x] Expand `scripts/lint_typing.py` attribute checks to forbid `.__dict__`, `.__class__`, `.__bases__`, and `.__mro__` manipulation across `src/`, `scripts/`, and `tests/`.
-- [x] Add a token-based check in `scripts/lint_typing.py` that forbids `# type: ignore` comments across `src/`, `scripts/`, and `tests/`.
-- [x] Remove `exec(...)` and `vars(...)` from `tests/test_scripts.py` by importing test fixture modules via `importlib.util.spec_from_file_location`.
-- [x] Expand `FORBIDDEN_DUNDER_ATTRS` in `scripts/lint_typing.py` to also forbid `__subclasses__`, `__globals__`, `__code__`, `__closure__`, `__func__`, and `__self__`.
-- [x] Expand `scripts/lint_typing.py` to detect prohibited imports (`Any`, `cast`, `getattr`, `setattr`, `hasattr`, `delattr`, `vars`, `globals`, `locals`, `exec`, `eval`) via `import builtins` or aliased `from ... import ...`.
-- [x] Expand `scripts/lint_typing.py` to check `TypeAlias` assignments and default parameter values for hidden `Any`/`object` references.
+### Summary of Audit Findings
 
-### 2.3 Harden `scripts/check_docs.py` & `scripts/check_compliance.py`
-- [x] Update `scripts/check_docs.py` to also verify `Returns:` sections on functions/methods with non-`None` return annotations (excluding generator functions using `Yields:`) and `Raises:` sections on functions containing explicit `raise` statements.
-- [x] Update `scripts/check_docs.py` to detect and reject undocumented extra parameters in `Args:` (parameters documented in the docstring that do not exist in the AST function signature).
-- [x] Update `scripts/check_compliance.py` to verify `zero_orbax.checkpoint` against `tests/orbax_api_snapshot.json` and restrict namespace-emulating class exemptions to an explicit `NAMESPACE_EMULATING_CLASSES` allowlist.
-- [x] Remove the overly permissive `(expected_type == "namespace" and actual_type == "class")` bypass in `scripts/check_compliance.py` by restricting it to `NAMESPACE_EMULATING_CLASSES`.
-
----
-
-## Phase 3: Fix Core Serialization & I/O Abstractions (`src/zero_orbax/core.py`)
-
-### 3.1 Real Binary Msgpack / Lossless PyTree Serialization in `MsgpackEngine`
-- [x] Fix `MsgpackEngine.packb({})` so packing an empty dictionary `{}` produces a serialized empty-map payload (`b"\x80"`) that round-trips via `unpackb(packb({})) == {}` instead of returning `b""` and unpacking to `None`.
-- [x] Implement RFC 8949 / MessagePack spec-compliant binary framing in `MsgpackEngine` (supporting fixmap/map16/map32, fixarray/array16/array32, fixstr/str8/str16/str32, int/uint 8/16/32/64, float64, booleans, nil, and tagged structures for `tuple`, `complex`, `ArrayProtocol`, and `LogicalGraph`) while retaining backward-compatible decoding for `_MSGPACK_MAGIC` payloads.
-- [x] Preserve `ArrayProtocol` metadata (`shape`, `dtype`, and `data`/`hex`) on round-trip and reconstruct a concrete `SerializedArray` implementing `ArrayProtocol` and `BytesSerializableProtocol` when `preserve_array=True`.
-- [x] Eliminate silent `str(node)` coercion of unknown objects in `_encode_pytree_to_json_value` and support `GraphProtocol` leaves explicitly.
-- [x] Fix `MsgpackEngine.packb(None)` so that `None` is encoded as the standard MessagePack `nil` byte (`b"\xc0"`) instead of returning `b""` which makes an explicitly saved `None` indistinguishable from a missing or empty file on disk (`FileSystemIO().read(...) == b""`).
-- [x] Implement native MessagePack `bin 8` (`0xc4`), `bin 16` (`0xc5`), and `bin 32` (`0xc6`) binary framing in `_pack_msgpack_bytes` and `_unpack_msgpack_bytes` for raw `bytes` payloads instead of hex-encoding `bytes` into UTF-8 JSON strings.
-- [x] Remove unused `_EXT_TAGGED_JSON = 1` dead constant in `src/zero_orbax/core.py`.
-- [x] Reconstruct a concrete `ReconstructedGraphNode` implementing `GraphProtocol` when decoding `"__ztype__": "graph_protocol"` in `_decode_json_value_to_pytree` instead of returning a plain `dict[str, JsonValue]` that loses `GraphProtocol` attribute access (`node.name`, `node.inputs`, `node.outputs`).
-- [x] Raise an explicit `TypeError` in `_encode_pytree_to_json_value` when encountering an unsupported non-iterable object instead of falling through to `[_encode_pytree_to_json_value(item) for item in node]` which raises an obscure `'X' object is not iterable` error.
-
-### 3.2 Fix `AtomicWrite`, `FileSystemIO`, `TensorStoreDriver`, and `GlobalArraySharding`
-- [x] Fix `AtomicWrite.atomic_write_bytes(path, data)` in `src/zero_orbax/core.py` so that when targeting a local filesystem path whose parent directory does not yet exist (e.g., `step_dir/checkpoint.msgpack`), it creates `parent.mkdir(parents=True, exist_ok=True)` and performs the atomic temp-file write + `os.replace` to disk, rather than silently skipping disk persistence when `parent.exists()` is `False`.
-- [x] Support `FileOptions.path_permission_mode` in `FileSystemIO.makedirs`, `FileSystemIO.write`, and `AtomicWrite.atomic_write_bytes` when specified.
-- [x] Ensure `TensorStoreDriver` writes and reads chunked array metadata (`dtype`, `shape`, `chunks`) consistently on disk and in `memory://` / `gs://` / `s3://` URIs.
-- [x] Enhance `GlobalArraySharding.get_local_shard` to respect multi-axis `PartitionSpec` and `LogicalMesh` shapes from `ml_switcheroo_ir` in addition to 1D host count slicing.
-- [x] Normalize virtual URI keys in `VirtualFileSystem` and `FileSystemIO` (stripping redundant trailing slashes and normalizing `//` path segments after the scheme authority) so `gs://bucket/dir/` and `gs://bucket/dir` resolve deterministically to the same prefix.
-- [x] Support `SerializedArray` and `ArrayProtocol` reconstruction in `TensorStoreDriver.read_tensor(dtype=..., shape=...)` when the stored payload is a list or `SerializedArray`.
-- [x] Support 2D/ND nested list and `SerializedArray` sharding in `GlobalArraySharding.get_local_shard` when `PartitionSpec` specifies sharding along axis > 0 (e.g. `PartitionSpec(axes=(None, "model"))`) and reconstruct a `SerializedArray` with updated local `shape` when the input implements `ArrayProtocol`.
+| ID | Area / Component | Current State in `zero-orbax` | Target Conformance State (`v0.0.5`) | Complexity |
+| :--- | :--- | :--- | :--- | :--- |
+| **A1** | **Dependency & Snapshot Pinning** | `requirements.txt` and `setup_dev_env.sh` reference `ml-ecosystem-snapshots` `v0.0.4`; `orbax_checkpoint_v0.12.8.json` from `v0.0.5` is not bundled/checked. | Upgrade `requirements.txt`, `setup_dev_env.sh`, and `.github/workflows/ci.yml` to `v0.0.5`; bundle/load `v0.0.5` Orbax schema & `CANONICAL_ORBAX_OPS`. | Low |
+| **A2** | **Cross-Repo Circular Import (`zero_chex` <-> `zero_grain` <-> `zero_orbax`)** | Top-level `import zero_chex as _chex` in `checkpoint.py` before `AsyncCheckpointHandler` is defined triggers circular `ImportError` when `zero_chex` imports `zero_grain` which imports `zero_orbax.checkpoint`. | Reorder imports or defer `zero_chex` / `zero_flax` / `zero_grain` imports after core handler definitions (or into helper functions) while keeping `check_allowed_imports.py` and `lint_typing.py` 100% clean. | Medium |
+| **A3** | **Missing Submodules & Hierarchies (`v1`, `export`)** | `zero_orbax.checkpoint.v1` and `zero_orbax.export` (`orbax.export`) do not exist. | Implement `v1` namespace (`save_pytree`, `save_pytree_async`, `load_pytree`, `save_checkpointables`, `load_checkpointables`) and `zero_orbax.export` (`ExportManager`, `JaxModule`, `ServingConfig`, `ObmExportOptions`). | High |
+| **A4** | **Missing Classes & Functions in `checkpoint`** | Missing `MultiprocessingOptions` top-level export in `checkpoint.__all__`, `RandomKeyCheckpointHandler`, `SingleReplicaArrayRestoreArgs`, `create_default_handler_registry`, `checkpoint_utils.{construct_restore_args, restore_args_from_target, wait_for_new_checkpoint}`, and `msgpack_utils.{msgpack_serialize, msgpack_restore}`. | Implement and export all missing classes and functions with full semantic behavior, strict typing, and 100% test/doc coverage. | High |
+| **A5** | **Constructor & Function Signature / Field / Default Alignment** | Several classes (`Checkpointer`, `AsyncCheckpointer`, `PyTreeCheckpointer`, `StandardCheckpointer`, `CheckpointManagerOptions`, `AsyncOptions`, `PyTreeCheckpointHandler`, `StandardCheckpointHandler`, `ArrayCheckpointHandler`, `ProtoCheckpointHandler`, `SaveArgs`, `RestoreArgs`, `ArrayRestoreArgs`, `RestoreTransform`, `args.StandardRestore`) have missing parameters, keyword-only vs positional-or-keyword differences, or field ordering differences relative to `v0.0.5`. | Align all parameter names, ordering, kinds, type annotations, and default values so both `v0.0.5` canonical specs and existing official tests work seamlessly. | High |
+| **A6** | **Pre-Commit Hook & AST Compliance Validator (`scripts/check_compliance.py`)** | `scripts/check_compliance.py` only checks symbol names and method names against `tests/orbax_api_snapshot.json` using `inspect.getmembers` (which is forbidden by `lint_typing.py` if `getattr` is used, and misses module hierarchy, class fields, function args, types, defaults, and docstrings). | Upgrade `scripts/check_compliance.py` and `.pre-commit-config.yaml` to AST-validate module hierarchy, classes, fields, methods, functions, parameter names/kinds/types/defaults, and docstrings against `ml-ecosystem-snapshots @ v0.0.5` + `tests/orbax_api_snapshot.json`. | High |
+| **A7** | **Exhaustive Test & Docstring Coverage Verification** | Existing tests do not cover the new `v0.0.5` symbols (`v1`, `export`, `RandomKeyCheckpointHandler`, `SingleReplicaArrayRestoreArgs`, `checkpoint_utils` helpers, `msgpack_utils` helpers, upgraded `check_compliance.py`). | Add comprehensive unit and integration tests achieving 100% line/branch/function coverage and 100% docstring coverage across all files. | Medium |
 
 ---
 
-## Phase 4: Fix Broken Abstractions in Handlers, Checkpointers & Manager (`src/zero_orbax/checkpoint.py`)
+## Phase 1: Environment, Dependency Upgrade & Circular Import Resolution
 
-### 4.1 Implement Real Concrete `CheckpointHandler` Subclasses
-- [x] **`CompositeCheckpointHandler`**:
-  - [x] Implement `save(directory, args)` to iterate over `args.Composite` items (or `kwargs`), resolve each sub-item's handler via `self._item_handlers` or `self.handler_registry` or `args.get_registered_handler_cls`, create `<directory>/<item_name>`, and delegate `sub_handler.save(...)`.
-  - [x] Implement `async_save(directory, args)` to aggregate `Future` lists across all sub-handlers.
-  - [x] Implement `restore(directory, args)` to restore each sub-item from `<directory>/<item_name>` using its registered/configured handler and return a `dict[str, PyTree]` (or composite structure).
-  - [x] Implement `metadata(directory)`, `structure(directory)`, `finalize(directory)`, and `close()` to delegate across all managed sub-handlers.
-- [x] **`JsonCheckpointHandler`**:
-  - [x] Override `restore(directory, item)` to read and parse `<directory>/<self.filename or 'metadata.json'>` directly using `json.loads` (instead of inheriting `CheckpointHandler.restore` which reads `checkpoint.msgpack`).
-  - [x] Avoid writing redundant `checkpoint.msgpack` in `JsonCheckpointHandler.save` when saving JSON artifacts.
-- [x] **`ArrayCheckpointHandler`**:
-  - [x] Override `restore(directory, item)` to read from `<directory>/<self.checkpoint_name or 'array'>.ts` via `TensorStoreDriver`, applying `ArrayRestoreArgs` (`dtype`, `shape`, `global_shape`, `restore_type`) when provided.
-- [x] **`ProtoCheckpointHandler`**:
-  - [x] Override `save(directory, item)` and `restore(directory, item)` to read and write `<directory>/<self.filename>` deterministically using `AtomicWrite` and `FileSystemIO`.
-- [x] **`JaxRandomKeyCheckpointHandler` & `NumpyRandomKeyCheckpointHandler`**:
-  - [x] Implement `save(directory, item)` and `restore(directory, item)` using `self.key_name` and invoking `checkpoint_save_args`, `checkpoint_restore_args`, and `post_restore`.
-- [x] **`BasePyTreeCheckpointHandler` & `PyTreeCheckpointHandler`**:
-  - [x] Delegate to `self.handler_impl` in `PyTreeCheckpointHandler` when `handler_impl` is provided.
-  - [x] Support custom leaf serialization via `self.type_handler_registry` (`TypeHandlerRegistryProtocol`) when saving and restoring PyTree leaves.
-  - [x] Respect `aggregate_filename` when writing aggregated msgpack files.
-  - [x] Support `SaveArgs` (`dtype`, `aggregate`) and `RestoreArgs` / `ArrayRestoreArgs` (`restore_type`, `dtype`, `shape`) per-leaf trees passed via `PyTreeSave` / `PyTreeRestore` / `StandardSave` / `StandardRestore`.
-- [x] **Fix Asymmetric `type_handler_registry` Deserialization in `PyTreeCheckpointHandler`**:
-  - [x] Add a `get_by_typestr(typestr: str) -> TypeHandlerProtocol | None` lookup in `TypeHandlerRegistryProtocol` and implement `_decode_custom_leaves(node: PyTree) -> PyTree` in `PyTreeCheckpointHandler.restore()` so leaves encoded as `{"__custom_type__": typestr, "__custom_hex__": hex_bytes}` are deserialized back into their domain objects via `th.deserialize(bytes.fromhex(hex_bytes))` instead of returning raw tagged dicts to the caller.
-- [x] **Fix `ProtoCheckpointHandler` Exclusion in Handler Resolution**:
-  - [x] Allow `args.ProtoSave` and `args.ProtoRestore` to carry an optional `filename: str = "proto.pb"` (and default `ProtoCheckpointHandler(filename: str = "proto.pb")`) so `CompositeCheckpointHandler._resolve_handler_for_item` and `CheckpointManager` can instantiate `ProtoCheckpointHandler` via `args.get_registered_handler_cls` instead of hardcoding `and reg_cls is not ProtoCheckpointHandler`.
-- [x] **Honor `SaveArgs` & `ArrayRestoreArgs` in `PyTreeCheckpointHandler`, `StandardCheckpointHandler`, and `ArrayCheckpointHandler`**:
-  - [x] Implement `_apply_save_args_tree(item: PyTree, save_args_tree: PyTree) -> PyTree` in `PyTreeCheckpointHandler.save()` and `StandardCheckpointHandler.save()` to cast leaf `dtype` when `SaveArgs(dtype=...)` is specified.
-  - [x] Validate `array_metadata_validator.validate(...)` in `BasePyTreeCheckpointHandler` / `PyTreeCheckpointHandler` when `self.array_metadata_validator is not None` and `self.enable_post_merge_validation` is `True`.
-  - [x] Order keys using `self.is_prioritized_key_fn` in `BasePyTreeCheckpointHandler` / `PyTreeCheckpointHandler` when saving PyTree dictionaries.
-  - [x] Honor `ArrayRestoreArgs.global_shape`, `ArrayRestoreArgs.shape`, `ArrayRestoreArgs.strict`, `ArrayRestoreArgs.mesh`, and `ArrayRestoreArgs.mesh_axes` in `ArrayCheckpointHandler.restore()` (raising `ValueError` when `strict=True` and the saved array's shape does not match `shape`/`global_shape`, and slicing via `GlobalArraySharding` when `mesh` and `mesh_axes` are provided).
+### 1.1 Upgrade `ml-ecosystem-snapshots` to `v0.0.5`
+- [x] Update `requirements.txt` to pin `ml-ecosystem-snapshots @ https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.5/ml_ecosystem_snapshots-0.0.5-py3-none-any.whl`.
+- [x] Update `setup_dev_env.sh` to install `https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.5/ml_ecosystem_snapshots-0.0.5-py3-none-any.whl || pip install -e ../ml-ecosystem-snapshots`.
+- [x] Check `.github/workflows/ci.yml` and update any `v0.0.4` references or snapshot setup steps to `v0.0.5`.
+- [x] Store or reference the official `v0.0.5` snapshot payload (`tests/orbax_checkpoint_v0.12.8.json` downloaded from `https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.5/orbax_checkpoint_v0.12.8.json`) alongside `tests/orbax_api_snapshot.json` so offline pre-commit hooks can deterministically validate both the `v0.0.5` release dump and the canonical `v0.0.5` operator definitions.
 
-### 4.2 Fix `Checkpointer`, `AsyncCheckpointer`, `PyTreeCheckpointer`, and `StandardCheckpointer`
+### 1.2 Resolve Circular Import Between `zero_orbax`, `zero_chex`, and `zero_grain`
+- [x] Audit import order in `src/zero_orbax/checkpoint.py`:
+  - `src/zero_orbax/__init__.py` imports `checkpoint, core, types`.
+  - `src/zero_orbax/checkpoint.py` imports `zero_chex as _chex` at line 29, before `AsyncCheckpointHandler`, `PyGrainCheckpointHandler`, and `args` are defined.
+  - `zero_chex` imports `zero_grain.shared_memory_array`, which triggers `zero_grain/__init__.py` -> `zero_grain/python/__init__.py` -> `zero_grain/checkpoint.py` -> `from zero_orbax.checkpoint import AsyncCheckpointHandler, PyGrainCheckpointHandler, args`.
+- [x] Fix the circular import cleanly without reflection or lazy `getattr`:
+  - Move `from zero_orbax import core, types, checkpoint` order in `src/zero_orbax/__init__.py` so `types` and `core` load first.
+  - In `src/zero_orbax/checkpoint.py`, place `import zero_chex as _chex` after `AsyncCheckpointHandler`, `PyGrainCheckpointHandler`, and `args` are defined (or import `zero_chex._src.asserts as _chex` / import inside validation helpers), ensuring `zero_grain.checkpoint` can import `AsyncCheckpointHandler`, `PyGrainCheckpointHandler`, and `args` from `zero_orbax.checkpoint` without partial-initialization `ImportError`.
+- [x] Verify `pytest` collects and runs all existing tests without `ImportError`.
+
+---
+
+## Phase 2: Module Hierarchy & Missing Submodules (`v1`, `export`, `checkpoint_utils`, `msgpack_utils`)
+
+### 2.1 Implement `zero_orbax.export` (`orbax.export` Parity)
+- [x] Create `src/zero_orbax/export.py` with module docstring and `__all__ = ["ExportManager", "JaxModule", "ObmExportOptions", "ServingConfig"]`.
+- [x] Export `export` from `src/zero_orbax/__init__.py` (`__all__ = ["checkpoint", "core", "export", "types"]`) and expose `export` under `zero_orbax.checkpoint.orbax.export` and `zero_orbax.checkpoint.export` for full namespace hierarchy parity.
+- [x] Implement `ObmExportOptions` dataclass in `src/zero_orbax/export.py`:
+  - [x] Fields and defaults matching `v0.0.5`:
+    - `enable_auto_layout: bool = False`
+    - `checkpoint_path: str | None = None`
+  - [x] Full Google-style class and attribute docstrings.
+- [x] Implement `ServingConfig` dataclass in `src/zero_orbax/export.py`:
+  - [x] Fields and defaults matching `v0.0.5`:
+    - `signature_key: str`
+    - `input_signature: Sequence[PyTree] | PyTree = None`
+    - `tf_preprocessor: Callable[[PyTree], PyTree] | None = None`
+    - `tf_postprocessor: Callable[[PyTree], PyTree] | None = None`
+    - `extra_trackable_resources: PyTree = None`
+    - `method_key: str | None = None`
+    - `obm_export_options: ObmExportOptions | None = None`
+  - [x] Implement helper methods (`get_signature_keys() -> Sequence[str]`, `get_infer_step(infer_fn: ...) -> Callable[[PyTree], PyTree]`) with full type annotations and docstrings.
+- [x] Implement `JaxModule` class in `src/zero_orbax/export.py`:
+  - [x] Constructor `__init__` signature matching `v0.0.5`:
+    - `params: PyTree`
+    - `apply_fn: Callable[[PyTree, PyTree], PyTree] | Mapping[str, Callable[[PyTree, PyTree], PyTree]]`
+    - `trainable: bool | PyTree = False`
+    - `input_polymorphic_shape: PyTree = None`
+    - `jax2tf_kwargs: Mapping[str, PyTree] | None = None`
+    - `jit_compile: bool | Mapping[str, bool] = True`
+    - `pspecs: PyTree = None`
+    - `allow_multi_axis_sharding_consolidation: bool | None = None`
+    - `export_version: str = "TF_SAVEDMODEL"`
+  - [x] Implement properties and methods:
+    - `apply_fn_map -> Mapping[str, Callable[[PyTree, PyTree], PyTree]]`
+    - `model_params -> PyTree`
+    - `methods -> Mapping[str, Callable[[PyTree], PyTree]]`
+    - `jax_methods -> Mapping[str, Callable[[PyTree], PyTree]]`
+    - `update_variables(params: PyTree) -> None`
+- [x] Implement `ExportManager` class in `src/zero_orbax/export.py`:
+  - [x] Constructor `__init__` signature matching `v0.0.5`:
+    - `module: JaxModule`
+    - `serving_configs: Sequence[ServingConfig]`
+  - [x] Implement methods:
+    - `tf_module -> JaxModule` property
+    - `serving_signatures -> Mapping[str, Callable[[PyTree], PyTree]]` property
+    - `save(model_path: PathLike, save_options: PyTree = None, signature_overrides: Mapping[str, Callable[[PyTree], PyTree]] | None = None) -> None` (persisting serialized module parameters and serving config metadata via `AtomicWrite` / `MsgpackEngine` and `FileSystemIO`)
+    - `load(model_path: PathLike, **kwargs: PyTree) -> PyTree` (restoring the persisted artifact from `model_path`)
+
+### 2.2 Implement `zero_orbax.checkpoint.v1` (`orbax.checkpoint.v1` Functional APIs)
+- [x] Implement the `v1` namespace class/submodule in `src/zero_orbax/checkpoint.py` and include `"v1"` in `zero_orbax.checkpoint.__all__` and `NAMESPACE_EMULATING_CLASSES`.
+- [x] Implement `v1.save_pytree`:
+  - [x] Signature matching `v0.0.5`: `save_pytree(path: PathLike, pytree: PyTree, *, overwrite: bool = False, custom_metadata: Mapping[str, JsonValue] | None = None) -> None`
+  - [x] Semantics: Check if `path` already exists when `overwrite=False` (raise `ValueError` if it exists); if `overwrite=True` and `path` exists, remove existing checkpoint first; save `pytree` via `PyTreeCheckpointer` / `PyTreeCheckpointHandler` and persist `custom_metadata` if provided.
+- [x] Implement `v1.save_pytree_async`:
+  - [x] Signature matching `v0.0.5`: `save_pytree_async(path: PathLike, pytree: PyTree, *, overwrite: bool = False, custom_metadata: Mapping[str, JsonValue] | None = None) -> Future`
+  - [x] Semantics: Validate `overwrite`, initiate an asynchronous save via `AsyncCheckpointer(PyTreeCheckpointHandler())`, write `custom_metadata` on commit, and return the `Future` instance.
+- [x] Implement `v1.load_pytree`:
+  - [x] Signature matching `v0.0.5`: `load_pytree(path: PathLike, abstract_pytree: PyTree = None) -> PyTree`
+  - [x] Semantics: Restore and unpack the PyTree from `path` using `PyTreeCheckpointer().restore(path, item=abstract_pytree)`.
+- [x] Implement `v1.save_checkpointables`:
+  - [x] Signature matching `v0.0.5`: `save_checkpointables(path: PathLike, checkpointables: Mapping[str, PyTree], *, overwrite: bool = False, custom_metadata: Mapping[str, JsonValue] | None = None) -> None`
+  - [x] Semantics: Validate `overwrite`, save named dictionary of checkpointables via `CompositeCheckpointHandler`, and persist `custom_metadata` if provided.
+- [x] Implement `v1.load_checkpointables`:
+  - [x] Signature matching `v0.0.5`: `load_checkpointables(path: PathLike, abstract_checkpointables: Mapping[str, PyTree] | None = None) -> dict[str, PyTree]`
+  - [x] Semantics: Restore named composite checkpointables from `path` using `CompositeCheckpointHandler().restore(path, item=abstract_checkpointables)`.
+- [x] Export `save_pytree`, `save_pytree_async`, `load_pytree`, `save_checkpointables`, and `load_checkpointables` both on `zero_orbax.checkpoint.v1` and at top-level `zero_orbax.checkpoint` if needed.
+
+### 2.3 Expand `zero_orbax.checkpoint.checkpoint_utils`
+- [x] Implement `checkpoint_utils.restore_args_from_target`:
+  - [x] Signature matching `v0.0.5`: `restore_args_from_target(target: PyTree, sharding_tree: PyTree = None) -> PyTree`
+  - [x] Semantics: Recursively traverse `target` (and matching `sharding_tree`) to construct `ArrayRestoreArgs` (for array leaves with shape/dtype/sharding) or `RestoreArgs(restore_type=type(leaf), dtype=...)` for scalar leaves.
+- [x] Implement `checkpoint_utils.construct_restore_args`:
+  - [x] Signature matching `v0.0.5`: `construct_restore_args(target: PyTree, sharding_tree: PyTree = None, set_global_shape: bool = True) -> PyTree`
+  - [x] Semantics: Recursively construct `ArrayRestoreArgs` / `RestoreArgs` from `target` (including `FlaxStateProtocol`, `FrozenDictProtocol`, `NamedTupleProtocol`, `ArrayProtocol`, `SerializedArray`, dicts, lists, tuples, and scalars), setting `global_shape` and `shape` when `set_global_shape=True`.
+- [x] Implement `checkpoint_utils.wait_for_new_checkpoint`:
+  - [x] Signature matching `v0.0.5`: `wait_for_new_checkpoint(checkpoint_dir: PathLike, *, until_step: int | None = None, seconds_to_sleep: int = 1, timeout: int | None = None, step_prefix: str | None = None, step_format_fixed_length: int | None = None, step_name_format: step_lib.NameFormat | None = None) -> int`
+  - [x] Semantics: Poll `checkpoint_dir` using `step_name_format` (or `standard_name_format(step_prefix=step_prefix, step_format_fixed_length=step_format_fixed_length)`) until a step `>= until_step` (or any step if `until_step is None`) is found, returning the discovered latest step integer (or `-1` if timeout expires without finding a matching step).
+- [x] Ensure `checkpoint_utils.checkpoints_iterator` remains intact and tested.
+
+### 2.4 Expand `zero_orbax.checkpoint.msgpack_utils`
+- [x] Implement `msgpack_utils.msgpack_serialize`:
+  - [x] Signature matching `v0.0.5`: `msgpack_serialize(pytree: PyTree, in_place: bool = False) -> bytes`
+  - [x] Semantics: Serialize `pytree` into RFC 8949 / MessagePack bytes via `MsgpackEngine().packb(pytree)`.
+- [x] Implement `msgpack_utils.msgpack_restore`:
+  - [x] Signature matching `v0.0.5`: `msgpack_restore(encoded_pytree: bytes) -> PyTree`
+  - [x] Semantics: Deserialize `encoded_pytree` bytes back into a Python `PyTree` via `MsgpackEngine().unpackb(encoded_pytree)`.
+- [x] Keep `msgpack_utils.packb` and `msgpack_utils.unpackb` for backward compatibility.
+
+---
+
+## Phase 3: Classes, Fields, Signatures & Defaults Conformance (`orbax.checkpoint`)
+
+### 3.1 Missing Classes & Factory Functions in `zero_orbax.checkpoint`
+- [x] Export `MultiprocessingOptions` in `zero_orbax.checkpoint.__all__` (currently imported from `zero_orbax.types` and exposed on `options.MultiprocessingOptions`, but missing from `checkpoint.__all__`).
+- [x] Implement `RandomKeyCheckpointHandler(AsyncCheckpointHandler)`:
+  - [x] Constructor signature matching `v0.0.5`: `__init__(self, key_name: str | None = None) -> None`
+  - [x] Semantics: Save and restore both JAX and NumPy random keys under `key_name or "random_key"`.
+  - [x] Expose on `zero_orbax.checkpoint`, `zero_orbax.checkpoint.handlers`, and `zero_orbax.checkpoint.__all__`.
+- [x] Implement `SingleReplicaArrayRestoreArgs(ArrayRestoreArgs)`:
+  - [x] Fields/constructor signature matching `v0.0.5`:
+    - `restore_type: type | str | None = None`
+    - `mesh: LogicalMesh | None = None`
+    - `mesh_axes: PartitionSpec | Sequence[str | None] | None = None`
+    - `sharding: PartitionSpec | str | None = None`
+    - `global_shape: tuple[int, ...] | None = None`
+    - `shape: tuple[int, ...] | None = None`
+    - `dtype: str | DType | type | None = None`
+    - `strict: bool = True`
+    - `single_replica_sharding: PartitionSpec | str | None = None`
+  - [x] Expose on `zero_orbax.checkpoint`, `zero_orbax.checkpoint.type_handlers`, and `zero_orbax.checkpoint.__all__`.
+- [x] Implement `create_default_handler_registry`:
+  - [x] Signature matching `v0.0.5`: `create_default_handler_registry(**items_and_handlers: CheckpointHandler | None) -> CheckpointHandlerRegistry`
+  - [x] Semantics: Create a `DefaultCheckpointHandlerRegistry` pre-populated with any passed `items_and_handlers` mappings and default standard handlers.
+  - [x] Expose on `zero_orbax.checkpoint`, `zero_orbax.checkpoint.handlers`, and `zero_orbax.checkpoint.__all__`.
+
+### 3.2 Align Constructor & Function Signatures, Types, and Defaults with `v0.0.5`
+- [x] **`AbstractCheckpointManager` & `AbstractCheckpointer`**:
+  - [x] Update `AbstractCheckpointManager.__init__(self, *args: PyTree, **kwargs: PyTree) -> None` and `AbstractCheckpointer.__init__(self, *args: PyTree, **kwargs: PyTree) -> None` so they satisfy `orbax_checkpoint_v0.12.8.json` (`*args`, `**kwargs`) while remaining 100% compatible with zero-arg `super().__init__()` calls.
 - [x] **`Checkpointer`**:
-  - [x] Ensure handler-less fallback persists to disk via `AtomicWrite` / `FileSystemIO`.
-  - [x] Call `self.handler.finalize(path)` during `save`.
-  - [x] Read and write metadata via `self.checkpoint_metadata_store` (`CheckpointMetadataStoreProtocol`) when configured.
+  - [x] Update `Checkpointer.__init__` to support all `v0.0.5` canonical parameters as well as existing options:
+    - `handler: CheckpointHandler | None = None`
+    - `*,`
+    - `primary_host: int | None = 0`
+    - `active_processes: set[int] | None = None`
+    - `barrier_sync_fn: BarrierSyncFn | None = None`
+    - `path_permission_mode: int | None = None`
+    - `checkpoint_metadata_store: CheckpointMetadataStoreProtocol | None = None`
+    - `temporary_path_cls: type[TemporaryPathProtocol] | None = None`
+    - `multiprocessing_options: MultiprocessingOptions | None = None`
+    - `file_options: FileOptions | None = None`
+    - `atomicity_options: AtomicityOptions | None = None`
+    - `temporary_path_class: type[TemporaryPathProtocol] | None = None`
+  - [x] Wire `primary_host`, `active_processes`, `path_permission_mode`, and `temporary_path_cls` into `self.multiprocessing_options`, `self.file_options`, and `self.temporary_path_class` when provided.
 - [x] **`AsyncCheckpointer`**:
-  - [x] Delegate `save` to `self.handler.async_save(...)` when `isinstance(self.handler, AsyncCheckpointHandler)` and wire a real `commit_callback` on the returned `Future` that invokes `self.handler.finalize(path)`, `barrier_sync_fn`, and `post_finalization_callback`.
-  - [x] Ensure `AsyncCheckpointer.restore` and `StandardCheckpointer.restore` operate deterministically against on-disk checkpoints.
-- [x] **Honor `temporary_path_class` and `file_options` in `Checkpointer` and `AsyncCheckpointer`**:
-  - [x] When `self.temporary_path_class is not None`, instantiate `temp_path = self.temporary_path_class()`, call `temp_path.create()`, save to `temp_path.get()`, and call `temp_path.finalize()` on commit so custom `TemporaryPathProtocol` implementations are exercised during `Checkpointer.save` and `AsyncCheckpointer.save`.
-  - [x] Forward `self.file_options.path_permission_mode` when creating checkpoint directories in `Checkpointer.save`.
-- [x] **Honor `StandardCheckpointer` Handler Options**:
-  - [x] Forward `save_concurrent_gb`, `restore_concurrent_gb`, `pytree_metadata_options`, and `use_ocdbt` from `StandardCheckpointer.__init__` to `StandardCheckpointHandler(...)` instead of storing them unused in `self.extra_kwargs`.
-  - [x] Ensure `StandardCheckpointHandler` inherits from `PyTreeCheckpointHandler` so `StandardRestore(restore_args=...)` and `StandardSave(save_args=...)` apply per-leaf `RestoreArgs` and `SaveArgs` coercions.
-
-### 4.3 Fix `CheckpointManager` Delegation, Dual-State Cache & Retention Policies
-- [x] **Step Naming Format Integration**:
-  - [x] Compute step directory names in `CheckpointManager` using `options.step_name_format.build_name(step)` or `step_lib.standard_name_format(step_prefix=options.step_prefix, step_format_fixed_length=options.step_format_fixed_length).build_name(step)` instead of hardcoding `f"{directory}/{step}"`.
-  - [x] Update `CheckpointManager.reload()` and `checkpoint_utils.checkpoints_iterator()` to parse formatted step directory names (including `step_prefix` and zero-padded step numbers).
-- [x] **Checkpointer & Handler Delegation**:
-  - [x] Route `CheckpointManager.save()` and `CheckpointManager.restore()` through configured `self.checkpointers`, `self.item_handlers`, `self.handler_registry`, or `CompositeCheckpointHandler` (when `item_names` / multiple items or `args.Composite` are used) instead of bypassing them and calling `MsgpackEngine().packb` directly.
-  - [x] Propagate `save_kwargs` and `restore_kwargs` to the underlying checkpointer/handler.
-  - [x] Support the `directory` override parameter in `CheckpointManager.restore(step, items, restore_kwargs, directory=...)`.
-  - [x] Persist and reload root metadata (`save_root_metadata`) and per-step metrics (`metrics.json` unless `prevent_write_metrics=True`) on disk so `reload()` restores `_step_metrics` and `_metadata`.
-- [x] **Retention & Preservation Policies**:
-  - [x] Implement `keep_period` in `CheckpointManager.save()` so steps where `step % keep_period == 0` are exempt from `max_to_keep` pruning.
-  - [x] Implement `should_keep_fn(step, timestamp)` and `preservation_policy.should_preserve(steps)` in `CheckpointManager` pruning logic.
-  - [x] Implement `keep_checkpoints_without_metrics` and `best_fn` interaction during pruning (protecting the top `max_to_keep` best steps when `best_fn` is set, rather than FIFO-evicting the best step).
-  - [x] Support `todelete_subdir` and `todelete_full_path` by moving pruned checkpoints into the deletion subdirectory when configured.
-  - [x] Implement `enable_should_save_is_saving_in_progress_check` in `CheckpointManager.should_save()`.
-  - [x] Expand `CheckpointManagerOptions.replace(**kwargs)` to accept `step_prefix`, `step_format_fixed_length`, `keep_period`, `read_only`, `best_mode`, `create`, `save_interval_steps`, and `max_to_keep`.
-- [x] **Transformations (`apply_transformations`)**:
-  - [x] Implement `Transform.use_fallback` and `Transform.multi_value_fn_input_args` in `apply_transformations`.
-  - [x] Support regex key matching in `Transform.original_key` and key paths when transforming PyTrees.
-- [x] **Eliminate Dual In-Memory Cache Shadowing in `CheckpointManager.restore()`**:
-  - [x] Fix `CheckpointManager.restore()` so that when `self.directory is not None`, it always restores from disk (`self._restore_step_from_disk(...)`) rather than returning the un-serialized in-memory reference from `self.checkpoints[target_step]` when `checkpointers` and `item_handlers` are `None`.
-  - [x] Support `CheckpointManager.restore(step, directory=custom_dir)` even when `step` is not in `self.checkpoints` of the current manager instance by checking if the step directory exists under `custom_dir` on disk.
-  - [x] Automatically call `self.reload()` in `CheckpointManager.__init__` when `self.directory is not None` and `not (self.options and self.options.lightweight_initialize)` so a newly constructed `CheckpointManager` on an existing checkpoint directory immediately discovers existing steps without requiring a manual `reload()` or `all_steps(read=True)` call.
-  - [x] If `self.options.cleanup_tmp_directories` is `True` during `CheckpointManager.__init__`, remove any `*.orbax-checkpoint-tmp` or `.tmp.` directories inside `self.directory`.
-- [x] **Track Async Futures in `CheckpointManager`**:
-  - [x] Collect `Future` instances returned by `AsyncCheckpointer.save` or `AsyncCheckpointHandler.async_save` during `CheckpointManager.save()`, set `self._saving_in_progress = True` while futures are pending, and implement `CheckpointManager.wait_until_finished()` and `CheckpointManager.check_for_errors()` to await all pending futures and clear `self._saving_in_progress = False`.
-- [x] **Implement `keep_time_interval` in `CheckpointManager`**:
-  - [x] Record step creation timestamps `self._step_timestamps: dict[int, datetime.datetime]` and preserve steps spaced by at least `self.options.keep_time_interval` during `CheckpointManager.save()` pruning, passing each step's recorded timestamp to `should_keep_fn(step, timestamp)`.
-- [x] **Fix Dead Ternary and Shallow Merge in Transformations (`src/zero_orbax/checkpoint.py`)**:
-  - [x] Fix the dead ternary `fallback_val = o if (t.use_fallback or t.original_key is None) else o` in `apply_transformations` so that when `t.original_key is not None` and `t.use_fallback is False`, a missing `original_key` resolves to `new_val` rather than silently falling back to `o` identically in both branches.
-  - [x] Fix `merge_trees` in `src/zero_orbax/checkpoint.py` to merge nested dictionaries **recursively** (`res[k] = merge_trees(existing, v)`) instead of performing a 1-level shallow `new_val.update(v)` that overwrites 2nd-level nested dictionaries.
-
----
-
-## Phase 5: Replace Tautological Tests with Behavioral & Property Assertions (`tests/`)
-
-### 5.1 Overhaul `tests/test_missing_symbols.py`
-- [x] Replace `assert cls_name in exported_members` and `assert inspect.signature(cls_obj) is not None` with behavioral contract tests that instantiate exported classes and invoke their methods to verify post-conditions.
-- [x] Add a test comparing `zero_orbax.checkpoint` against `ml_ecosystem_snapshots` v0.0.4 (in addition to `tests/orbax_api_snapshot.json`) via `scripts/check_compliance.py`.
-- [x] Remove the remaining tautological `assert len(sig.parameters) >= 0` check in `tests/test_missing_symbols.py` (since `len(...) >= 0` is mathematically always true for any sequence) and replace it with explicit parameter name assertions for each of the 14 core Orbax classes.
-
-### 5.2 Overhaul `tests/official/` Tautological Tests
-- [x] **`tests/official/test_args_official.py`**:
-  - [x] Replace `assertIsNotNone(ocp.args.Composite(a=1, b=2))` and `assertIsNotNone(ocp.args.PyTreeSave(item=1))` with round-trip save/restore tests through `CompositeCheckpointHandler`, `PyTreeCheckpointHandler`, `StandardCheckpointHandler`, and `ArrayCheckpointHandler` using `args.Composite`, `args.PyTreeSave`, `args.PyTreeRestore`, `args.StandardSave`, `args.StandardRestore`, `args.JsonSave`, `args.JsonRestore`, `args.ArraySave`, and `args.ArrayRestore`.
-- [x] **`tests/official/test_checkpointer_official.py`**:
-  - [x] Remove `mock.MagicMock()` from `CheckpointerTest.setUp`.
-  - [x] Test `Checkpointer`, `AsyncCheckpointer`, `PyTreeCheckpointer`, and `StandardCheckpointer` against real `tempfile.TemporaryDirectory()` directories verifying on-disk file creation, async barrier/finalization callbacks, and PyTree value round-tripping.
-- [x] **`tests/official/test_pytree_checkpoint_handler_official.py`**:
-  - [x] Instantiate `ocp.PyTreeCheckpointHandler` (instead of base `CheckpointHandler`), save nested PyTrees with arrays/scalars to `TemporaryDirectory`, and restore them with `Transform` rules.
-- [x] **`tests/official/test_checkpoint_manager_official.py`**:
-  - [x] Replace hardcoded `/tmp/mock_ckpt_dir` with isolated `tempfile.TemporaryDirectory()` directories.
-  - [x] Add tests for multi-item `checkpointers={"params": ..., "config": ...}`, `keep_period`, `best_fn` retention (ensuring best step is not evicted by `max_to_keep`), `step_prefix`, `step_format_fixed_length`, and `reload()` restoring steps from disk.
-- [x] **`tests/official/checkpoint_manager_options_test.py`**:
-  - [x] Replace `MOCK_STEP_NAME_FORMAT = mock.create_autospec(ocp.step.NameFormat)` with a concrete typed `CustomNameFormat(ocp.step.NameFormat)` subclass.
-- [x] Add tests in `tests/official/test_pytree_checkpoint_handler_official.py` verifying 3-level deep `merge_trees` recursion and `Transform(original_key=..., use_fallback=False)` vs `use_fallback=True` behavior when `original_key` is absent from the source tree.
-- [x] Add tests in `tests/official/test_args_official.py` verifying `isinstance(arg, ocp.args.CheckpointArgs)` is `True` across all 15 `ocp.args.*` argument wrapper classes.
-
-### 5.3 Strengthen `tests/test_missing_handlers.py`, `tests/test_missing_coverage.py`, and `tests/test_checkpoint.py`
-- [x] In `tests/test_missing_handlers.py`, test actual disk round-trips for `CompositeCheckpointHandler`, `ProtoCheckpointHandler`, `JaxRandomKeyCheckpointHandler`, `NumpyRandomKeyCheckpointHandler`, `ArrayCheckpointHandler` (verifying `.ts` file restoration), and `JsonCheckpointHandler` (verifying `.json` file restoration when `checkpoint.msgpack` is absent).
-- [x] In `tests/test_checkpoint.py`, add tests for `MsgpackEngine().unpackb(MsgpackEngine().packb({})) == {}` and `CheckpointManager.save(1, {})` round-tripping an empty dictionary on disk.
-- [x] In `tests/test_missing_coverage.py`, update `test_pytree_checkpoint_handler_custom_impl_and_type_registry` to assert that `pt_th.restore(tmp_path / "th")` deserializes custom leaves via `IntTypeHandler.deserialize` back into `{"num": 42}` rather than asserting the leaked internal `{"__custom_type__": "custom_int", ...}` representation.
-- [x] Add unit tests in `tests/test_missing_coverage.py` covering `CheckpointManager` auto-discovery on init (`lightweight_initialize=False` vs `True`), `cleanup_tmp_directories=True`, `keep_time_interval`, async `wait_until_finished()` propagation from `CheckpointManager` to `AsyncCheckpointer`, and `TemporaryPathProtocol` lifecycle in `Checkpointer`.
+  - [x] Update `AsyncCheckpointer.__init__` so the first positional parameter is named `handler: CheckpointHandler | None = None` and the second positional-or-keyword parameter is `timeout_secs: int = 300`, followed by keyword-only arguments matching `v0.0.5`:
+    - `handler: CheckpointHandler | None = None`
+    - `timeout_secs: int = 300`
+    - `*,`
+    - `primary_host: int | None = 0`
+    - `active_processes: set[int] | None = None`
+    - `barrier_sync_fn: BarrierSyncFn | None = None`
+    - `post_finalization_callback: Callable[[], None] | None = None`
+    - `path_permission_mode: int | None = None`
+    - `async_options: AsyncOptions | None = None`
+    - `multiprocessing_options: MultiprocessingOptions | None = None`
+    - `temporary_path_cls: type[TemporaryPathProtocol] | None = None`
+    - `file_options: FileOptions | None = None`
+    - `checkpoint_metadata_store: CheckpointMetadataStoreProtocol | None = None`
+    - `atomicity_options: AtomicityOptions | None = None`
+    - `temporary_path_class: type[TemporaryPathProtocol] | None = None`
+  - [x] Ensure `barrier_sync_fn` and `post_finalization_callback` passed directly to `AsyncCheckpointer` are invoked during `save()` commit and `wait_until_finished()` even when `async_options` is `None`.
+- [x] **`PyTreeCheckpointer`**:
+  - [x] Update `PyTreeCheckpointer.__init__` signature to support positional or keyword `primary_host: int | None = 0`, `use_ocdbt: bool = True`, `use_zarr3: bool = False`, `use_compression: bool = True`.
+- [x] **`StandardCheckpointer`**:
+  - [x] Update `StandardCheckpointer.__init__` to accept `primary_host: int | None = 0` as the first positional-or-keyword parameter (defaulting to `0`), followed by keyword-only `async_options`, `multiprocessing_options`, `file_options`, `atomicity_options`, `checkpoint_metadata_store`, `temporary_path_class`, `save_concurrent_gb`, `restore_concurrent_gb`, `pytree_metadata_options`, `use_ocdbt`, and `**kwargs: PyTree`.
+- [x] **`AsyncOptions`**:
+  - [x] Add `async_origin: str | None = None` field to `AsyncOptions` in `src/zero_orbax/types.py` (after `create_directories_asynchronously: bool = True`), and update `timeout_secs: int = 600` (matching `v0.0.5` canonical default `'600'`).
+- [x] **`CheckpointManagerOptions`**:
+  - [x] Ensure `should_save_fn: ShouldSaveFn | None = None` is ordered at position 5 (immediately after `keep_period`, before `best_fn`) to match `v0.0.5` canonical parameter ordering (`save_interval_steps`, `max_to_keep`, `keep_time_interval`, `keep_period`, `should_save_fn`, `best_fn`, `best_mode`, `keep_checkpoints_without_metrics`, `step_prefix`, `step_format_fixed_length`, `step_name_format`, `create`, `cleanup_tmp_directories`, `save_on_steps`, `single_host_load_and_broadcast`, `todelete_subdir`, `enable_background_delete`, `read_only`, `enable_async_checkpointing`, `async_options`, `multiprocessing_options`, `save_decision_policy`, `preservation_policy`, plus additional optional fields).
+- [x] **`PyTreeCheckpointHandler`**:
+  - [x] Update `PyTreeCheckpointHandler.__init__` to accept `primary_host: int | None = 0` and allow `use_ocdbt`, `use_zarr3`, `primary_host`, `type_handler_registry`, `handler_impl`, `save_concurrent_gb`, `restore_concurrent_gb` to be passed either positionally or by keyword while preserving all 15 `v0.12.8` parameters (`save_device_host_concurrent_gb`, `memory_limit_options`, `use_compression`, `multiprocessing_options`, `pytree_metadata_options`, `array_metadata_validator`, `enable_pinned_host_transfer`, `is_prioritized_key_fn`).
+- [x] **`StandardCheckpointHandler`**:
+  - [x] Allow `save_concurrent_gb: int | None = 96` and `restore_concurrent_gb: int | None = 96` to be passed either positionally or by keyword, followed by keyword-only `multiprocessing_options`, `pytree_metadata_options`, and `use_ocdbt`.
+- [x] **`ArrayCheckpointHandler`**:
+  - [x] Add `*, multiprocessing_options: MultiprocessingOptions | None = None` to `ArrayCheckpointHandler.__init__(self, checkpoint_name: str | None = None, *, multiprocessing_options: MultiprocessingOptions | None = None) -> None` and store `self.multiprocessing_options = multiprocessing_options`.
+- [x] **`SaveArgs`**:
+  - [x] Add `ocdbt_target_data_file_size: int | None = None` to `SaveArgs`:
+    - `aggregate: bool = False`
+    - `dtype: str | DType | type | None = None`
+    - `chunk_byte_size: int | None = None`
+    - `ocdbt_target_data_file_size: int | None = None`
+    - `shard_axes: tuple[int, ...] = ()`
+- [x] **`RestoreArgs`**:
+  - [x] Add `strict: bool = True` to `RestoreArgs`:
+    - `restore_type: type | str | None = None`
+    - `dtype: str | DType | type | None = None`
+    - `strict: bool = True`
+- [x] **`ArrayRestoreArgs`**:
+  - [x] Update parameter/field ordering of `ArrayRestoreArgs` to match `v0.0.5` (`restore_type`, `mesh`, `mesh_axes`, `sharding`, `global_shape`, `shape`, `dtype`, `strict`).
+- [x] **`RestoreTransform`**:
+  - [x] Align `RestoreTransform.__init__` parameter order with `Transform` and `v0.0.5`:
+    - `original_key: str | Sequence[str] | None = None`
+    - `use_fallback: bool = False`
+    - `value_fn: ValueTransformFn | None = None`
+    - `multi_value_fn: MultiValueTransformFn | None = None`
+    - `multi_value_fn_input_args: Mapping[str, RestoreArgs] | None = None`
+- [x] **`args.StandardRestore`**:
+  - [x] Add `strict: bool = True` parameter to `args.StandardRestore.__init__(self, item: PyTree = None, restore_args: PyTree = None, strict: bool = True) -> None` (or `strict: bool = True` alongside `restore_args`) and store `self.strict = strict`.
 
 ---
 
-## Phase 6: Final Verification & Pre-Commit Gate
+## Phase 4: Pre-Commit Hooks & AST Compliance Verification (`scripts/check_compliance.py`)
 
-- [x] Run `ruff format --check .` and `ruff check .` with zero warnings or errors.
-- [x] Run `mypy --strict src tests scripts` with zero errors and zero `# type: ignore` comments.
-- [x] Run `python3 scripts/lint_typing.py` with zero typing or reflection violations.
-- [x] Run `interrogate -vv -f 100 -M -i -c pyproject.toml src scripts tests` and `python3 scripts/check_docs.py` confirming 100.0% docstring coverage across all modules, classes, functions, and arguments.
-- [x] Run `python3 scripts/check_allowed_imports.py src/zero_orbax/__init__.py src/zero_orbax/types.py src/zero_orbax/core.py src/zero_orbax/checkpoint.py` confirming zero disallowed imports.
-- [x] Run `python3 scripts/check_compliance.py` confirming 100% API snapshot compliance.
-- [x] Run `pytest --cov=src/zero_orbax --cov=scripts --cov-branch --cov-report=term-missing --cov-fail-under=100` confirming 100% line, function, and branch test coverage.
-- [x] Run `pre-commit run --all-files` to verify all 10 pre-commit hooks pass cleanly.
-- [x] Ensure `git push` is NEVER executed.
+### 4.1 Upgrade `scripts/check_compliance.py` for `ml-ecosystem-snapshots @ v0.0.5`
+- [x] Refactor `scripts/check_compliance.py` so it performs a multi-layered compliance audit without any reflection (`getattr`, `hasattr`, `__dict__`):
+  - [x] **Layer 1: Legacy Structural Snapshot Parity (`tests/orbax_api_snapshot.json`)**:
+    - Retain `dump_api` and `verify_snapshot_compliance` so all 62 top-level symbols, classes, methods, and namespaces in `tests/orbax_api_snapshot.json` continue to be verified.
+  - [x] **Layer 2: Official `v0.0.5` Release Asset (`tests/orbax_checkpoint_v0.12.8.json`)**:
+    - Verify all 31 classes and functions in `orbax_checkpoint_v0.12.8.json` exist in `zero_orbax.checkpoint`.
+    - Verify via AST / `inspect.signature` that every required parameter name in `orbax_checkpoint_v0.12.8.json` is accepted by the implementation (allowing `zero_orbax` to define additional optional parameters beyond the minimum required).
+    - Verify that every class and function has a non-empty docstring and that all parameters are documented in `Args:` / `Attributes:`.
+  - [x] **Layer 3: Official `v0.0.5` Canonical API & Module Hierarchy (`CANONICAL_ORBAX_OPS` / `_ORBAX_OP_DEFS` from `ml_ecosystem_snapshots.frameworks.orbax_checkpoint`)**:
+    - Verify module hierarchy existence:
+      - `zero_orbax.checkpoint` (`orbax.checkpoint`)
+      - `zero_orbax.checkpoint.args` (`orbax.checkpoint.args`)
+      - `zero_orbax.checkpoint.checkpoint_utils` (`orbax.checkpoint.checkpoint_utils`)
+      - `zero_orbax.checkpoint.msgpack_utils` (`orbax.checkpoint.msgpack_utils`)
+      - `zero_orbax.checkpoint.v1` (`orbax.checkpoint.v1`)
+      - `zero_orbax.export` (`orbax.export`)
+      - All 28 sub-namespaces (`handlers`, `options`, `type_handlers`, `transform_utils`, `step`, `step_lib`, `path`, `serialization`, etc.)
+    - Verify all 58 canonical operations (`class`es and `function`s) exist at their canonical hierarchical paths.
+    - Verify that every canonical parameter (`name`, `kind`, `default` presence, and explicit type annotation) is present on the corresponding class constructor / dataclass fields / function signature (while permitting additional optional parameters in `zero_orbax`).
+    - Verify docstring presence and parameter documentation on every canonical class and function.
+- [x] Update `scripts/generate_snapshot.py` if needed to stay synchronized with `scripts/check_compliance.py`.
+
+### 4.2 Update `.pre-commit-config.yaml` and `scripts/check_allowed_imports.py`
+- [x] Update `.pre-commit-config.yaml`:
+  - [x] Update `check-allowed-imports` entry to include `src/zero_orbax/export.py`:
+    `python3 scripts/check_allowed_imports.py src/zero_orbax/__init__.py src/zero_orbax/types.py src/zero_orbax/core.py src/zero_orbax/checkpoint.py src/zero_orbax/export.py`
+  - [x] Ensure `check-api-compliance` (`python3 scripts/check_compliance.py`) validates the `ml-ecosystem-snapshots @ v0.0.5` schema and module hierarchy.
+- [x] Update `.github/workflows/ci.yml` if `check_allowed_imports.py` is invoked with explicit file paths there.
+
+---
+
+## Phase 5: Exhaustive Unit & Integration Testing (100% Line, Branch & Function Coverage)
+
+### 5.1 Unit Tests for New `v0.0.5` APIs
+- [x] Expand `tests/test_missing_symbols.py` and `tests/test_missing_handlers.py`:
+  - [x] Test `RandomKeyCheckpointHandler` save, restore, `checkpoint_save_args`, `checkpoint_restore_args`, and `post_restore` (both with `directory` and with `directory=None`).
+  - [x] Test `SingleReplicaArrayRestoreArgs` construction, field defaults, `single_replica_sharding`, and `restore_type()`.
+  - [x] Test `create_default_handler_registry` with and without custom keyword handlers.
+  - [x] Test `checkpoint_utils.restore_args_from_target` and `checkpoint_utils.construct_restore_args` across nested PyTrees, `ArrayProtocol` leaves, `SerializedArray` leaves, `FlaxState`, `FrozenDict`, `NamedTuple`, lists, tuples, and scalars (with `set_global_shape=True` and `False`, and with/without `sharding_tree`).
+  - [x] Test `checkpoint_utils.wait_for_new_checkpoint` across existing checkpoints, `until_step` filtering, empty directories with `timeout=0`, and custom `step_name_format` / `step_prefix`.
+  - [x] Test `msgpack_utils.msgpack_serialize` and `msgpack_utils.msgpack_restore` round-trips.
+  - [x] Test `v1.save_pytree`, `v1.save_pytree_async`, `v1.load_pytree`, `v1.save_checkpointables`, and `v1.load_checkpointables` (including `overwrite=False` raising `ValueError` on existing path, `overwrite=True` replacing existing checkpoint, and `custom_metadata` persistence).
+  - [x] Test `zero_orbax.export` (`ObmExportOptions`, `ServingConfig`, `JaxModule`, `ExportManager`) covering single `apply_fn` and mapping `apply_fn`, `trainable` flags, `update_variables`, `get_signature_keys`, `get_infer_step` (with and without `tf_preprocessor` / `tf_postprocessor`), `ExportManager.save`, `ExportManager.load`, `tf_module`, and `serving_signatures`.
+  - [x] Test updated `Checkpointer`, `AsyncCheckpointer`, `StandardCheckpointer`, `PyTreeCheckpointHandler`, `ArrayCheckpointHandler`, `SaveArgs`, `RestoreArgs`, `ArrayRestoreArgs`, `RestoreTransform`, and `args.StandardRestore` parameter combinations.
+
+### 5.2 Unit Tests for Updated Compliance Script (`tests/test_scripts.py`)
+- [x] Update `tests/test_scripts.py` to test all branches of the upgraded `scripts/check_compliance.py`:
+  - [x] Passing compliance check against both `tests/orbax_api_snapshot.json` and `tests/orbax_checkpoint_v0.12.8.json` / `v0.0.5` canonical definitions.
+  - [x] Failure branches for missing module/submodule, missing class/function, missing required parameter, missing docstring, and missing snapshot file.
+  - [x] Verify `test_requirements_txt_contains_griffe` also asserts `ml-ecosystem-snapshots` `v0.0.5` is pinned in `requirements.txt`.
+
+---
+
+## Phase 6: Final Quality Gates & Pre-Commit Verification
+
+- [x] Run `ruff format --check .` and `ruff check .` (0 errors, including `D` Google docstring rules).
+- [x] Run `mypy --strict src tests scripts` (0 errors across all files).
+- [x] Run `python3 scripts/lint_typing.py` (0 typing or reflection violations).
+- [x] Run `interrogate -vv -f 100 -M -i -c pyproject.toml src scripts tests` (100.0% docstring coverage).
+- [x] Run `python3 scripts/check_docs.py` (100.0% granular docstring & argument coverage, 0 missing/stub items).
+- [x] Run `python3 scripts/check_allowed_imports.py src/zero_orbax/__init__.py src/zero_orbax/types.py src/zero_orbax/core.py src/zero_orbax/checkpoint.py src/zero_orbax/export.py` (0 disallowed imports).
+- [x] Run `python3 scripts/check_compliance.py` (100% API & `v0.0.5` snapshot compliance).
+- [x] Run `pytest --cov=src/zero_orbax --cov=scripts --cov-branch --cov-report=term-missing --cov-fail-under=100` (100.0% line, branch, and function coverage).
+- [x] Run `python3 scripts/update_badges.py` and verify `README.md` badges are 100% up to date.
+- [x] Confirm `git status` and `git diff` are clean and never run `git push`.

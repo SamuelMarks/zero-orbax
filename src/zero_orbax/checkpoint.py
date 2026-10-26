@@ -17,6 +17,7 @@ import logging as _stdlib_logging
 import pathlib
 import re
 import shutil
+import time
 from collections.abc import Callable, Container, Iterator, Mapping, Sequence
 from types import TracebackType
 from typing import Literal, TypeVar
@@ -26,7 +27,6 @@ from ml_switcheroo_compiler import ops as compiler_ops
 from ml_switcheroo_compiler.core.dtype import DType as CompilerDType
 from ml_switcheroo_compiler.core.tensor import Tensor as CompilerTensor, as_tensor_obj
 from ml_switcheroo_ir import DType, LogicalMesh, PartitionSpec
-from zero_chex import assert_shape, assert_trees_all_equal_structs, assert_type
 from zero_flax.nnx.variables import (
     BatchStat,
     Cache,
@@ -39,9 +39,9 @@ from zero_flax.nnx.variables import (
     VariableValue,
 )
 from zero_flax.types import MetadataValue
-from zero_grain._types import CheckpointStateDict
 from zero_jax import numpy as jnp
 
+from zero_orbax import export as _export_module
 from zero_orbax.core import (
     AtomicWrite,
     BarrierSync,
@@ -59,6 +59,7 @@ from zero_orbax.types import (
     BarrierSyncFn,
     BestFn,
     CheckpointMetadataStoreProtocol,
+    CheckpointStateDict,
     CompositeOptions,
     FileOptions,
     FlaxStateProtocol,
@@ -234,12 +235,14 @@ class SaveArgs:
         aggregate: Whether to aggregate the leaf into a consolidated msgpack file. Defaults to False.
         dtype: Optional target data type to cast to when saving. Defaults to None.
         chunk_byte_size: Optional target byte size per storage chunk. Defaults to None.
+        ocdbt_target_data_file_size: Optional target OCDBT data file size in bytes. Defaults to None.
         shard_axes: Tuple of axis indices along which to shard. Defaults to ``()``.
     """
 
     aggregate: bool = False
     dtype: str | DType | type | None = None
     chunk_byte_size: int | None = None
+    ocdbt_target_data_file_size: int | None = None
     shard_axes: tuple[int, ...] = ()
 
 
@@ -250,10 +253,12 @@ class RestoreArgs:
     Attributes:
         restore_type: Target Python type or type identifier for restoration. Defaults to None.
         dtype: Target element data type for restoration. Defaults to None.
+        strict: Whether to enforce strict restoration validation. Defaults to True.
     """
 
     restore_type: type | str | None = None
     dtype: str | DType | type | None = None
+    strict: bool = True
 
 
 @dataclasses.dataclass
@@ -266,8 +271,8 @@ class ArrayRestoreArgs:
     sharding: PartitionSpec | str | None = None
     global_shape: tuple[int, ...] | None = None
     shape: tuple[int, ...] | None = None
-    strict: bool = True
     dtype: str | DType | type | None = None
+    strict: bool = True
 
     def __init__(
         self,
@@ -277,8 +282,8 @@ class ArrayRestoreArgs:
         sharding: PartitionSpec | str | None = None,
         global_shape: tuple[int, ...] | None = None,
         shape: tuple[int, ...] | None = None,
-        strict: bool = True,
         dtype: str | DType | type | None = None,
+        strict: bool = True,
     ) -> None:
         """Initialize the ArrayRestoreArgs instance.
 
@@ -289,8 +294,8 @@ class ArrayRestoreArgs:
             sharding: Optional explicit sharding descriptor. Defaults to None.
             global_shape: Optional global array shape across all hosts. Defaults to None.
             shape: Optional local or target array shape. Defaults to None.
-            strict: Whether to strictly validate shape and sharding metadata. Defaults to True.
             dtype: Optional target element data type. Defaults to None.
+            strict: Whether to strictly validate shape and sharding metadata. Defaults to True.
         """
         self._restore_type = restore_type
         self.mesh = mesh
@@ -298,8 +303,8 @@ class ArrayRestoreArgs:
         self.sharding = sharding
         self.global_shape = global_shape
         self.shape = shape
-        self.strict = strict
         self.dtype = dtype
+        self.strict = strict
 
     def restore_type(self) -> type | str | None:
         """Return the configured restore type for the array.
@@ -308,6 +313,50 @@ class ArrayRestoreArgs:
             type | str | None: The configured restore type.
         """
         return self._restore_type
+
+
+@dataclasses.dataclass
+class SingleReplicaArrayRestoreArgs(ArrayRestoreArgs):
+    """Restore arguments reading array shards on a single replica and broadcasting across replicas."""
+
+    single_replica_sharding: PartitionSpec | str | None = None
+
+    def __init__(
+        self,
+        restore_type: type | str | None = None,
+        mesh: LogicalMesh | None = None,
+        mesh_axes: PartitionSpec | Sequence[str | None] | None = None,
+        sharding: PartitionSpec | str | None = None,
+        global_shape: tuple[int, ...] | None = None,
+        shape: tuple[int, ...] | None = None,
+        dtype: str | DType | type | None = None,
+        strict: bool = True,
+        single_replica_sharding: PartitionSpec | str | None = None,
+    ) -> None:
+        """Initialize the SingleReplicaArrayRestoreArgs instance.
+
+        Args:
+            restore_type: Target array type or identifier for restoration. Defaults to None.
+            mesh: Optional ``LogicalMesh`` device topology. Defaults to None.
+            mesh_axes: Optional ``PartitionSpec`` or axis names for mesh sharding. Defaults to None.
+            sharding: Optional explicit sharding descriptor. Defaults to None.
+            global_shape: Optional global array shape across all hosts. Defaults to None.
+            shape: Optional local or target array shape. Defaults to None.
+            dtype: Optional target element data type. Defaults to None.
+            strict: Whether to strictly validate shape and sharding metadata. Defaults to True.
+            single_replica_sharding: Optional sharding on the single reading replica. Defaults to None.
+        """
+        super().__init__(
+            restore_type=restore_type,
+            mesh=mesh,
+            mesh_axes=mesh_axes,
+            sharding=sharding,
+            global_shape=global_shape,
+            shape=shape,
+            dtype=dtype,
+            strict=strict,
+        )
+        self.single_replica_sharding = single_replica_sharding
 
 
 class args:
@@ -542,15 +591,18 @@ class args:
             self,
             item: PyTree = None,
             restore_args: PyTree = None,
+            strict: bool = True,
         ) -> None:
             """Initialize the StandardRestore arguments.
 
             Args:
                 item: Optional target PyTree structure to restore into. Defaults to None.
                 restore_args: Optional per-leaf ``RestoreArgs`` tree. Defaults to None.
+                strict: Whether to enforce strict PyTree structure validation. Defaults to True.
             """
             super().__init__(item=item)
             self.restore_args = restore_args
+            self.strict = strict
 
     class JaxRandomKeySave(CheckpointArgs):
         """Arguments for saving a JAX PRNG random key."""
@@ -821,13 +873,18 @@ class Future:
         self,
         result: PyTree = None,
         commit_callback: Callable[[], None] | None = None,
+        *args: PyTree,
+        **kwargs: PyTree,
     ) -> None:
         """Initialize the Future wrapper.
 
         Args:
             result: The result value to wrap. Defaults to None.
             commit_callback: Optional callback invoked once when ``result()`` is awaited. Defaults to None.
+            *args: Optional additional positional arguments.
+            **kwargs: Optional additional keyword arguments.
         """
+        _ = (args, kwargs)
         self._result = result
         self._commit_callback = commit_callback
         self._done = commit_callback is None
@@ -884,8 +941,14 @@ def _unwrap_checkpoint_arg(
 class CheckpointHandler:
     """Base class for handlers that manage checkpoint reading, writing, and metadata."""
 
-    def __init__(self) -> None:
-        """Initialize the base CheckpointHandler."""
+    def __init__(self, *args: PyTree, **kwargs: PyTree) -> None:
+        """Initialize the base CheckpointHandler.
+
+        Args:
+            *args: Optional positional initialization arguments.
+            **kwargs: Optional keyword initialization arguments.
+        """
+        _ = (args, kwargs)
         self._closed: bool = False
         self._last_metadata: dict[str, JsonValue] | None = None
 
@@ -994,6 +1057,15 @@ class CheckpointHandler:
 class AsyncCheckpointHandler(CheckpointHandler):
     """Base class for checkpoint handlers supporting asynchronous save operations."""
 
+    def __init__(self, *args: PyTree, **kwargs: PyTree) -> None:
+        """Initialize the base AsyncCheckpointHandler.
+
+        Args:
+            *args: Optional positional initialization arguments.
+            **kwargs: Optional keyword initialization arguments.
+        """
+        super().__init__(*args, **kwargs)
+
     def async_save(
         self,
         directory: PathLike | None = None,
@@ -1042,14 +1114,21 @@ def _infer_array_shape(val: PyTree) -> tuple[int, ...]:
 class ArrayCheckpointHandler(AsyncCheckpointHandler):
     """Handler for saving and restoring single arrays or sharded tensors."""
 
-    def __init__(self, checkpoint_name: str | None = None) -> None:
+    def __init__(
+        self,
+        checkpoint_name: str | None = None,
+        *,
+        multiprocessing_options: MultiprocessingOptions | None = None,
+    ) -> None:
         """Initialize the ArrayCheckpointHandler.
 
         Args:
             checkpoint_name: Optional filename for the serialized array inside the step directory. Defaults to None.
+            multiprocessing_options: Optional ``MultiprocessingOptions``. Defaults to None.
         """
         super().__init__()
         self.checkpoint_name = checkpoint_name
+        self.multiprocessing_options = multiprocessing_options
 
     def save(
         self,
@@ -1675,13 +1754,15 @@ def _apply_restore_args_tree(restored: PyTree, restore_args_tree: PyTree) -> PyT
         coerced_inner = _apply_restore_args_tree(restored.value, restore_args_tree)
         return restored.replace(value=_coerce_flax_variable_value(coerced_inner))
     if isinstance(restore_args_tree, ArrayRestoreArgs) and is_array_protocol(restored):
+        import zero_chex.assertions as _chex_assertions
+
         expected_shape = (
             restore_args_tree.shape
             if restore_args_tree.shape is not None
             else restore_args_tree.global_shape
         )
         if restore_args_tree.strict and expected_shape is not None:
-            assert_shape(restored, expected_shape)
+            _chex_assertions.assert_shape(restored, expected_shape)
         if restore_args_tree.dtype is not None:
             resolved_dt = _resolve_compiler_dtype(str(restore_args_tree.dtype))
             nested_data = array_to_nested_list(restored)
@@ -1690,7 +1771,7 @@ def _apply_restore_args_tree(restored: PyTree, restore_args_tree: PyTree) -> PyT
             )
             restored = jnp.reshape(jnp.asarray(raw_in, dtype=resolved_dt), restored.shape)
             if restore_args_tree.strict:
-                assert_type(restored, resolved_dt)
+                _chex_assertions.assert_type(restored, resolved_dt)
         return restored
     target_type: type | str | None = (
         restore_args_tree.restore_type
@@ -1731,17 +1812,18 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
     def __init__(
         self,
         aggregate_filename: str | None = None,
-        *,
-        save_concurrent_gb: int | None = None,
-        restore_concurrent_gb: int | None = None,
-        save_device_host_concurrent_gb: int | None = None,
-        memory_limit_options: MemoryLimitOptions | None = None,
         use_ocdbt: bool = True,
         use_zarr3: bool = False,
-        use_compression: bool = True,
-        multiprocessing_options: MultiprocessingOptions | None = None,
+        primary_host: int | None = 0,
         type_handler_registry: TypeHandlerRegistryProtocol | None = None,
         handler_impl: BasePyTreeCheckpointHandler | None = None,
+        save_concurrent_gb: int | None = None,
+        restore_concurrent_gb: int | None = None,
+        *,
+        save_device_host_concurrent_gb: int | None = None,
+        memory_limit_options: MemoryLimitOptions | None = None,
+        use_compression: bool = True,
+        multiprocessing_options: MultiprocessingOptions | None = None,
         pytree_metadata_options: PyTreeMetadataOptions | None = None,
         array_metadata_validator: ArrayMetadataValidatorProtocol | None = None,
         enable_pinned_host_transfer: bool | None = None,
@@ -1751,27 +1833,29 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
 
         Args:
             aggregate_filename: Optional filename for aggregated msgpack checkpoints. Defaults to None.
+            use_ocdbt: Whether to enable OCDBT storage. Defaults to True.
+            use_zarr3: Whether to enable Zarr v3 storage. Defaults to False.
+            primary_host: Primary host ID for metadata writes. Defaults to 0.
+            type_handler_registry: Optional ``TypeHandlerRegistryProtocol``. Defaults to None.
+            handler_impl: Optional custom ``BasePyTreeCheckpointHandler`` delegate. Defaults to None.
             save_concurrent_gb: Max concurrent GB during save. Defaults to None.
             restore_concurrent_gb: Max concurrent GB during restore. Defaults to None.
             save_device_host_concurrent_gb: Max concurrent device-to-host GB. Defaults to None.
             memory_limit_options: Optional ``MemoryLimitOptions``. Defaults to None.
-            use_ocdbt: Whether to enable OCDBT storage. Defaults to True.
-            use_zarr3: Whether to enable Zarr v3 storage. Defaults to False.
             use_compression: Whether to enable chunk compression. Defaults to True.
             multiprocessing_options: Optional ``MultiprocessingOptions``. Defaults to None.
-            type_handler_registry: Optional ``TypeHandlerRegistryProtocol``. Defaults to None.
-            handler_impl: Optional custom ``BasePyTreeCheckpointHandler`` delegate. Defaults to None.
             pytree_metadata_options: Optional ``PyTreeMetadataOptions``. Defaults to None.
             array_metadata_validator: Optional ``ArrayMetadataValidatorProtocol``. Defaults to None.
             enable_pinned_host_transfer: Whether to enable pinned host memory transfer. Defaults to None.
             is_prioritized_key_fn: Optional key prioritization function. Defaults to None.
         """
+        resolved_mp = multiprocessing_options or MultiprocessingOptions(primary_host=primary_host)
         super().__init__(
             memory_limit_options=memory_limit_options,
             use_ocdbt=use_ocdbt,
             use_zarr3=use_zarr3,
             use_compression=use_compression,
-            multiprocessing_options=multiprocessing_options,
+            multiprocessing_options=resolved_mp,
             type_handler_registry=type_handler_registry,
             pytree_metadata_options=pytree_metadata_options,
             array_metadata_validator=array_metadata_validator,
@@ -1779,6 +1863,7 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
             is_prioritized_key_fn=is_prioritized_key_fn,
         )
         self.aggregate_filename = aggregate_filename
+        self.primary_host = primary_host
         self.save_concurrent_gb = save_concurrent_gb
         self.restore_concurrent_gb = restore_concurrent_gb
         self.save_device_host_concurrent_gb = save_device_host_concurrent_gb
@@ -1956,7 +2041,9 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
             and isinstance(target_item, (FlaxStateProtocol, FrozenDictProtocol, NamedTupleProtocol))
             and isinstance(restored, (FlaxStateProtocol, FrozenDictProtocol, NamedTupleProtocol))
         ):
-            assert_trees_all_equal_structs(restored, target_item)
+            import zero_chex.trees as _chex_trees
+
+            _chex_trees.assert_trees_all_equal_structs(restored, target_item)
         return restored
 
 
@@ -1965,9 +2052,9 @@ class StandardCheckpointHandler(PyTreeCheckpointHandler):
 
     def __init__(
         self,
+        save_concurrent_gb: int | None = 96,
+        restore_concurrent_gb: int | None = 96,
         *,
-        save_concurrent_gb: int = 96,
-        restore_concurrent_gb: int = 96,
         multiprocessing_options: MultiprocessingOptions | None = None,
         pytree_metadata_options: PyTreeMetadataOptions | None = None,
         use_ocdbt: bool = True,
@@ -2358,6 +2445,118 @@ class NumpyRandomKeyCheckpointHandler(AsyncCheckpointHandler):
         return self.post_restore(template)
 
 
+class RandomKeyCheckpointHandler(AsyncCheckpointHandler):
+    """Handler for saving and restoring JAX or NumPy PRNG random keys and states."""
+
+    def __init__(self, key_name: str | None = None) -> None:
+        """Initialize the RandomKeyCheckpointHandler.
+
+        Args:
+            key_name: Optional filename/key identifier for the saved random key. Defaults to None.
+        """
+        super().__init__()
+        self.key_name = key_name
+
+    def checkpoint_restore_args(
+        self,
+        item: PyTree,
+        restore_args: RestoreArgs | None = None,
+    ) -> RestoreArgs | None:
+        """Construct ``RestoreArgs`` for restoring a random key.
+
+        Args:
+            item: Target random key item or structure.
+            restore_args: Optional explicit ``RestoreArgs``. Defaults to None.
+
+        Returns:
+            RestoreArgs | None: The resolved ``RestoreArgs``, or ``None``.
+        """
+        _ = item
+        return restore_args
+
+    def checkpoint_save_args(
+        self,
+        item: PyTree,
+    ) -> tuple[PyTree, SaveArgs | None]:
+        """Construct ``(item, SaveArgs)`` tuple for saving a random key.
+
+        Args:
+            item: Random key item to save.
+
+        Returns:
+            tuple[PyTree, SaveArgs | None]: Tuple of ``(None, None)`` or ``(item, SaveArgs)``.
+        """
+        if item is None:
+            return (None, None)
+        return (item, SaveArgs())
+
+    def post_restore(self, item: PyTree, metadata: PyTree = None) -> PyTree:
+        """Apply post-restoration formatting to a restored random key.
+
+        Args:
+            item: Restored raw key data.
+            metadata: Optional key metadata. Defaults to None.
+
+        Returns:
+            PyTree: Post-processed random key.
+        """
+        _ = metadata
+        return item
+
+    def save(
+        self,
+        directory: PathLike | None = None,
+        item: PyTree = None,
+        *pos_args: PyTree,
+        **kwargs: PyTree,
+    ) -> None:
+        """Save a random key into ``directory/<key_name>.msgpack``.
+
+        Args:
+            directory: Target directory path. Defaults to None.
+            item: Random key or ``CheckpointArgs`` wrapper. Defaults to None.
+            *pos_args: Additional positional save arguments.
+            **kwargs: Additional keyword save arguments.
+        """
+        _ = pos_args
+        if directory is not None:
+            raw_payload = _unwrap_checkpoint_arg(item, kwargs)
+            key_item, _ = self.checkpoint_save_args(raw_payload)
+            fname = f"{self.key_name or 'random_key'}.msgpack"
+            AtomicWrite().atomic_write_bytes(
+                f"{str(directory).rstrip('/')}/{fname}",
+                MsgpackEngine().packb(key_item),
+            )
+
+    def restore(
+        self,
+        directory: PathLike | None = None,
+        item: PyTree = None,
+        *pos_args: PyTree,
+        **kwargs: PyTree,
+    ) -> PyTree:
+        """Restore a random key from ``directory/<key_name>.msgpack``.
+
+        Args:
+            directory: Source directory path. Defaults to None.
+            item: Optional template key or ``CheckpointArgs`` wrapper. Defaults to None.
+            *pos_args: Additional positional restore arguments.
+            **kwargs: Additional keyword restore arguments.
+
+        Returns:
+            PyTree: Restored random key.
+        """
+        _ = pos_args
+        template = _unwrap_checkpoint_arg(item, kwargs)
+        self.checkpoint_restore_args(template)
+        if directory is not None:
+            fname = f"{self.key_name or 'random_key'}.msgpack"
+            raw = FileSystemIO().read(f"{str(directory).rstrip('/')}/{fname}")
+            if raw:
+                return self.post_restore(MsgpackEngine().unpackb(raw))
+        return self.post_restore(template)
+
+
 class PyGrainCheckpointHandler(AsyncCheckpointHandler):
     """Handler for saving and restoring ``zero_grain`` dataset and data loader iterators."""
 
@@ -2421,8 +2620,14 @@ class PyGrainCheckpointHandler(AsyncCheckpointHandler):
 class CheckpointHandlerRegistry:
     """Base interface for mapping checkpoint items and argument types to handlers."""
 
-    def __init__(self) -> None:
-        """Initialize the CheckpointHandlerRegistry."""
+    def __init__(self, *args: PyTree, **kwargs: PyTree) -> None:
+        """Initialize the CheckpointHandlerRegistry.
+
+        Args:
+            *args: Optional positional initialization arguments.
+            **kwargs: Optional keyword initialization arguments.
+        """
+        _ = (args, kwargs)
         self._entries: dict[tuple[str | None, type | None], CheckpointHandler] = {}
 
     def add(
@@ -2526,6 +2731,28 @@ class DefaultCheckpointHandlerRegistry(CheckpointHandlerRegistry):
         self.other_registry = other_registry
         if other_registry is not None:
             self._entries.update(other_registry.get_all_entries())
+
+
+def create_default_handler_registry(
+    **items_and_handlers: CheckpointHandler | None,
+) -> CheckpointHandlerRegistry:
+    """Create a ``DefaultCheckpointHandlerRegistry`` populated with default and custom item handlers.
+
+    Args:
+        **items_and_handlers: Optional keyword mapping from item names to ``CheckpointHandler`` instances.
+
+    Returns:
+        CheckpointHandlerRegistry: Initialized registry with standard and custom handlers registered.
+    """
+    registry = DefaultCheckpointHandlerRegistry()
+    for save_cls, handler_cls in _CATALOG.save_args_to_handler.items():
+        registry.add(None, save_cls, handler_cls, override=True)
+    for restore_cls, handler_cls in _CATALOG.restore_args_to_handler.items():
+        registry.add(None, restore_cls, handler_cls, override=True)
+    for item_name, handler_inst in items_and_handlers.items():
+        if handler_inst is not None:
+            registry.add(item_name, None, handler_inst, override=True)
+    return registry
 
 
 class CompositeCheckpointHandler(AsyncCheckpointHandler):
@@ -2801,8 +3028,14 @@ for _r_cls, _h_cls in (
 class AbstractCheckpointer:
     """Abstract base class for synchronous and asynchronous checkpointers."""
 
-    def __init__(self) -> None:
-        """Initialize the AbstractCheckpointer."""
+    def __init__(self, *args: PyTree, **kwargs: PyTree) -> None:
+        """Initialize the AbstractCheckpointer.
+
+        Args:
+            *args: Optional positional initialization arguments.
+            **kwargs: Optional keyword initialization arguments.
+        """
+        _ = (args, kwargs)
         self._closed = False
 
     def save(
@@ -2908,29 +3141,57 @@ class Checkpointer(AbstractCheckpointer):
         self,
         handler: CheckpointHandler | None = None,
         *,
+        primary_host: int | None = 0,
+        active_processes: set[int] | None = None,
+        barrier_sync_fn: BarrierSyncFn | None = None,
+        path_permission_mode: int | None = None,
+        checkpoint_metadata_store: CheckpointMetadataStoreProtocol | None = None,
+        temporary_path_cls: type[TemporaryPathProtocol] | None = None,
         multiprocessing_options: MultiprocessingOptions | None = None,
         file_options: FileOptions | None = None,
         atomicity_options: AtomicityOptions | None = None,
-        checkpoint_metadata_store: CheckpointMetadataStoreProtocol | None = None,
         temporary_path_class: type[TemporaryPathProtocol] | None = None,
     ) -> None:
         """Initialize the synchronous Checkpointer.
 
         Args:
             handler: The ``CheckpointHandler`` used to save and restore items. Defaults to None.
+            primary_host: Primary host index for multi-process metadata writes. Defaults to 0.
+            active_processes: Optional set of active process indices. Defaults to None.
+            barrier_sync_fn: Optional barrier synchronization callback. Defaults to None.
+            path_permission_mode: Optional octal permission mode for created directories. Defaults to None.
+            checkpoint_metadata_store: Optional metadata store implementation. Defaults to None.
+            temporary_path_cls: Optional class used to manage temporary staging paths. Defaults to None.
             multiprocessing_options: Optional ``MultiprocessingOptions``. Defaults to None.
             file_options: Optional ``FileOptions``. Defaults to None.
             atomicity_options: Optional ``AtomicityOptions``. Defaults to None.
-            checkpoint_metadata_store: Optional metadata store implementation. Defaults to None.
-            temporary_path_class: Optional class used to manage temporary staging paths. Defaults to None.
+            temporary_path_class: Optional alias for ``temporary_path_cls``. Defaults to None.
         """
         super().__init__()
         self.handler = handler
-        self.multiprocessing_options = multiprocessing_options
-        self.file_options = file_options
+        self.primary_host = primary_host
+        self.active_processes = active_processes
+        self.barrier_sync_fn = barrier_sync_fn
+        self.path_permission_mode = path_permission_mode
+        self.multiprocessing_options = multiprocessing_options or (
+            MultiprocessingOptions(
+                primary_host=primary_host,
+                active_processes=active_processes,
+            )
+            if (primary_host != 0 or active_processes is not None)
+            else None
+        )
+        self.file_options = file_options or (
+            FileOptions(path_permission_mode=path_permission_mode)
+            if path_permission_mode is not None
+            else None
+        )
         self.atomicity_options = atomicity_options
         self.checkpoint_metadata_store = checkpoint_metadata_store
-        self.temporary_path_class = temporary_path_class
+        self.temporary_path_cls = (
+            temporary_path_cls if temporary_path_cls is not None else temporary_path_class
+        )
+        self.temporary_path_class = self.temporary_path_cls
 
     def save(
         self,
@@ -3061,13 +3322,19 @@ class AsyncCheckpointer(Checkpointer):
 
     def __init__(
         self,
-        _handler: CheckpointHandler | None = None,
-        *,
         handler: CheckpointHandler | None = None,
-        multiprocessing_options: MultiprocessingOptions | None = None,
-        async_options: AsyncOptions | None = None,
-        file_options: FileOptions | None = None,
         timeout_secs: int = 300,
+        *,
+        _handler: CheckpointHandler | None = None,
+        primary_host: int | None = 0,
+        active_processes: set[int] | None = None,
+        barrier_sync_fn: BarrierSyncFn | None = None,
+        post_finalization_callback: Callable[[], None] | None = None,
+        path_permission_mode: int | None = None,
+        async_options: AsyncOptions | None = None,
+        multiprocessing_options: MultiprocessingOptions | None = None,
+        temporary_path_cls: type[TemporaryPathProtocol] | None = None,
+        file_options: FileOptions | None = None,
         checkpoint_metadata_store: CheckpointMetadataStoreProtocol | None = None,
         atomicity_options: AtomicityOptions | None = None,
         temporary_path_class: type[TemporaryPathProtocol] | None = None,
@@ -3075,27 +3342,39 @@ class AsyncCheckpointer(Checkpointer):
         """Initialize the AsyncCheckpointer.
 
         Args:
-            _handler: Optional positional ``CheckpointHandler`` (for backward compatibility). Defaults to None.
-            handler: Keyword ``CheckpointHandler`` instance. Defaults to None.
-            multiprocessing_options: Optional ``MultiprocessingOptions``. Defaults to None.
-            async_options: Optional ``AsyncOptions``. Defaults to None.
-            file_options: Optional ``FileOptions``. Defaults to None.
+            handler: ``CheckpointHandler`` instance for saving and restoring. Defaults to None.
             timeout_secs: Timeout in seconds for async operations. Defaults to 300.
+            _handler: Optional alternate ``CheckpointHandler`` keyword parameter. Defaults to None.
+            primary_host: Primary host index for multi-process metadata writes. Defaults to 0.
+            active_processes: Optional set of active process indices. Defaults to None.
+            barrier_sync_fn: Optional barrier synchronization callback. Defaults to None.
+            post_finalization_callback: Optional callback invoked after async finalization. Defaults to None.
+            path_permission_mode: Optional octal permission mode for created directories. Defaults to None.
+            async_options: Optional ``AsyncOptions``. Defaults to None.
+            multiprocessing_options: Optional ``MultiprocessingOptions``. Defaults to None.
+            temporary_path_cls: Optional temporary path class. Defaults to None.
+            file_options: Optional ``FileOptions``. Defaults to None.
             checkpoint_metadata_store: Optional metadata store implementation. Defaults to None.
             atomicity_options: Optional ``AtomicityOptions``. Defaults to None.
-            temporary_path_class: Optional temporary path class. Defaults to None.
+            temporary_path_class: Optional alias for ``temporary_path_cls``. Defaults to None.
         """
         resolved_handler = handler if handler is not None else _handler
         super().__init__(
             handler=resolved_handler,
+            primary_host=primary_host,
+            active_processes=active_processes,
+            barrier_sync_fn=barrier_sync_fn,
+            path_permission_mode=path_permission_mode,
+            checkpoint_metadata_store=checkpoint_metadata_store,
+            temporary_path_cls=temporary_path_cls,
             multiprocessing_options=multiprocessing_options,
             file_options=file_options,
             atomicity_options=atomicity_options,
-            checkpoint_metadata_store=checkpoint_metadata_store,
             temporary_path_class=temporary_path_class,
         )
         self.async_options = async_options
         self.timeout_secs = timeout_secs
+        self.post_finalization_callback = post_finalization_callback
         self._pending_futures: list[Future] = []
 
     def save(
@@ -3131,11 +3410,16 @@ class AsyncCheckpointer(Checkpointer):
                     sf.result(timeout=float(self.timeout_secs))
                 if temp_obj is not None:
                     temp_obj.finalize()
-                if (
-                    self.async_options is not None
-                    and self.async_options.barrier_sync_fn is not None
-                ):
-                    self.async_options.barrier_sync_fn(str(path), self.timeout_secs)
+                active_barrier = (
+                    self.async_options.barrier_sync_fn
+                    if (
+                        self.async_options is not None
+                        and self.async_options.barrier_sync_fn is not None
+                    )
+                    else self.barrier_sync_fn
+                )
+                if active_barrier is not None:
+                    active_barrier(str(path), self.timeout_secs)
 
             fut = Future(result=None, commit_callback=_commit)
         else:
@@ -3177,11 +3461,16 @@ class AsyncCheckpointer(Checkpointer):
         for fut in self._pending_futures:
             fut.result()
         self._pending_futures.clear()
-        if (
-            self.async_options is not None
-            and self.async_options.post_finalization_callback is not None
-        ):
-            self.async_options.post_finalization_callback()
+        active_post_cb = (
+            self.async_options.post_finalization_callback
+            if (
+                self.async_options is not None
+                and self.async_options.post_finalization_callback is not None
+            )
+            else self.post_finalization_callback
+        )
+        if active_post_cb is not None:
+            active_post_cb()
 
 
 class PyTreeCheckpointer(Checkpointer):
@@ -3223,6 +3512,7 @@ class StandardCheckpointer(AsyncCheckpointer):
 
     def __init__(
         self,
+        primary_host: int | None = 0,
         *,
         async_options: AsyncOptions | None = None,
         multiprocessing_options: MultiprocessingOptions | None = None,
@@ -3239,6 +3529,7 @@ class StandardCheckpointer(AsyncCheckpointer):
         """Initialize the StandardCheckpointer.
 
         Args:
+            primary_host: Primary host index for metadata writes. Defaults to 0.
             async_options: Optional ``AsyncOptions``. Defaults to None.
             multiprocessing_options: Optional ``MultiprocessingOptions``. Defaults to None.
             file_options: Optional ``FileOptions``. Defaults to None.
@@ -3251,15 +3542,17 @@ class StandardCheckpointer(AsyncCheckpointer):
             use_ocdbt: Whether to use OCDBT storage format. Defaults to True.
             **kwargs: Additional keyword options for ``StandardCheckpointHandler``.
         """
+        resolved_mp = multiprocessing_options or MultiprocessingOptions(primary_host=primary_host)
         super().__init__(
             handler=StandardCheckpointHandler(
                 save_concurrent_gb=save_concurrent_gb,
                 restore_concurrent_gb=restore_concurrent_gb,
-                multiprocessing_options=multiprocessing_options,
+                multiprocessing_options=resolved_mp,
                 pytree_metadata_options=pytree_metadata_options,
                 use_ocdbt=use_ocdbt,
             ),
-            multiprocessing_options=multiprocessing_options,
+            primary_host=primary_host,
+            multiprocessing_options=resolved_mp,
             async_options=async_options,
             file_options=file_options,
             atomicity_options=atomicity_options,
@@ -3297,6 +3590,7 @@ class CheckpointManagerOptions:
     max_to_keep: int | None = None
     keep_time_interval: datetime.timedelta | None = None
     keep_period: int | None = None
+    should_save_fn: ShouldSaveFn | None = None
     best_fn: BestFn | None = None
     best_mode: Literal["min", "max"] | str = "max"
     keep_checkpoints_without_metrics: bool = True
@@ -3315,7 +3609,6 @@ class CheckpointManagerOptions:
     enable_async_checkpointing: bool = True
     async_options: AsyncOptions | None = None
     multiprocessing_options: MultiprocessingOptions | None = None
-    should_save_fn: ShouldSaveFn | None = None
     should_keep_fn: ShouldKeepFn | None = None
     file_options: FileOptions | None = None
     atomicity_options: AtomicityOptions | None = None
@@ -3446,8 +3739,14 @@ CheckpointHandlersDict: TypeAlias = dict[str, CheckpointHandler]
 class AbstractCheckpointManager:
     """Abstract interface for managing multi-step checkpoints over training runs."""
 
-    def __init__(self) -> None:
-        """Initialize the AbstractCheckpointManager."""
+    def __init__(self, *args: PyTree, **kwargs: PyTree) -> None:
+        """Initialize the AbstractCheckpointManager.
+
+        Args:
+            *args: Optional positional initialization arguments.
+            **kwargs: Optional keyword initialization arguments.
+        """
+        _ = (args, kwargs)
         self._closed: bool = False
 
     def save(
@@ -4325,20 +4624,20 @@ class RestoreTransform(Transform):
 
     def __init__(
         self,
+        original_key: str | Sequence[str] | None = None,
+        use_fallback: bool = False,
         value_fn: ValueTransformFn | None = None,
         multi_value_fn: MultiValueTransformFn | None = None,
         multi_value_fn_input_args: Mapping[str, RestoreArgs] | None = None,
-        original_key: str | Sequence[str] | None = None,
-        use_fallback: bool = False,
     ) -> None:
         """Initialize the RestoreTransform rule.
 
         Args:
+            original_key: Key or path in the original structure to map from. Defaults to None.
+            use_fallback: Whether to use fallback resolution logic. Defaults to False.
             value_fn: Function applied to a single restored value. Defaults to None.
             multi_value_fn: Function deriving a restored value from the full original tree. Defaults to None.
             multi_value_fn_input_args: Optional mapping of input keys to ``RestoreArgs``. Defaults to None.
-            original_key: Key or path in the original structure to map from. Defaults to None.
-            use_fallback: Whether to use fallback resolution logic. Defaults to False.
         """
         super().__init__(
             original_key=original_key,
@@ -4542,10 +4841,15 @@ class options:
 class orbax:
     """Compat namespace mirroring the top-level ``orbax`` package hierarchy."""
 
+    export = _export_module
+
     class checkpoint:
         """Compat namespace mirroring ``orbax.checkpoint``."""
 
         options = options
+
+
+export = _export_module
 
 
 class atomicity:
@@ -4682,6 +4986,190 @@ class checkpoint_utils:
                 steps.append(parsed)
         yield from sorted(steps)
 
+    @staticmethod
+    def construct_restore_args(
+        target: PyTree,
+        sharding_tree: PyTree = None,
+        set_global_shape: bool = True,
+    ) -> PyTree:
+        """Construct a PyTree of ``RestoreArgs`` or ``ArrayRestoreArgs`` matching ``target``.
+
+        Args:
+            target: Target PyTree providing leaf types, shapes, and dtypes.
+            sharding_tree: Optional PyTree of sharding specifications matching ``target``. Defaults to None.
+            set_global_shape: Whether to populate ``global_shape`` and ``shape`` on ``ArrayRestoreArgs``. Defaults to True.
+
+        Returns:
+            PyTree: PyTree of ``RestoreArgs`` / ``ArrayRestoreArgs`` matching the structure of ``target``.
+        """
+        if isinstance(target, FlaxStateProtocol):
+            sharding_dict = sharding_tree if is_pytree_dict(sharding_tree) else {}
+            return {
+                str(k): checkpoint_utils.construct_restore_args(
+                    v,
+                    sharding_dict.get(str(k)),
+                    set_global_shape=set_global_shape,
+                )
+                for k, v in target.items()
+            }
+        if isinstance(target, FrozenDictProtocol):
+            raw_fd = target.unfreeze()
+            sharding_fd = sharding_tree if is_pytree_dict(sharding_tree) else {}
+            return {
+                str(k): checkpoint_utils.construct_restore_args(
+                    v,
+                    sharding_fd.get(str(k)),
+                    set_global_shape=set_global_shape,
+                )
+                for k, v in raw_fd.items()
+            }
+        if isinstance(target, NamedTupleProtocol):
+            nt_dict = target._asdict()
+            sharding_seq = (
+                sharding_tree
+                if isinstance(sharding_tree, (list, tuple))
+                else [None] * len(target._fields)
+            )
+            return {
+                field_name: checkpoint_utils.construct_restore_args(
+                    nt_dict.get(field_name),
+                    sharding_seq[idx] if idx < len(sharding_seq) else None,
+                    set_global_shape=set_global_shape,
+                )
+                for idx, field_name in enumerate(target._fields)
+            }
+        if is_pytree_dict(target):
+            sharding_sub = sharding_tree if is_pytree_dict(sharding_tree) else {}
+            return {
+                k: checkpoint_utils.construct_restore_args(
+                    v,
+                    sharding_sub.get(k),
+                    set_global_shape=set_global_shape,
+                )
+                for k, v in target.items()
+            }
+        if isinstance(target, list):
+            sharding_list = sharding_tree if isinstance(sharding_tree, (list, tuple)) else []
+            return [
+                checkpoint_utils.construct_restore_args(
+                    v,
+                    sharding_list[idx] if idx < len(sharding_list) else None,
+                    set_global_shape=set_global_shape,
+                )
+                for idx, v in enumerate(target)
+            ]
+        if isinstance(target, tuple):
+            sharding_tup = sharding_tree if isinstance(sharding_tree, (list, tuple)) else ()
+            return tuple(
+                checkpoint_utils.construct_restore_args(
+                    v,
+                    sharding_tup[idx] if idx < len(sharding_tup) else None,
+                    set_global_shape=set_global_shape,
+                )
+                for idx, v in enumerate(target)
+            )
+        if isinstance(target, FlaxVariableProtocol):
+            return checkpoint_utils.construct_restore_args(
+                target.value,
+                sharding_tree,
+                set_global_shape=set_global_shape,
+            )
+        sharding_val: PartitionSpec | str | None = (
+            sharding_tree if isinstance(sharding_tree, (PartitionSpec, str)) else None
+        )
+        if isinstance(target, SerializedArray):
+            shape_val = target.shape if set_global_shape else None
+            return ArrayRestoreArgs(
+                restore_type=SerializedArray,
+                sharding=sharding_val,
+                global_shape=shape_val,
+                shape=shape_val,
+                dtype=target.dtype,
+            )
+        if is_array_protocol(target) or isinstance(target, CompilerTensor):
+            arr_shape = tuple(int(d) for d in target.shape) if set_global_shape else None
+            return ArrayRestoreArgs(
+                restore_type=type(target),
+                sharding=sharding_val,
+                global_shape=arr_shape,
+                shape=arr_shape,
+                dtype=str(target.dtype),
+            )
+        if target is None:
+            return RestoreArgs(restore_type=None, dtype=None)
+        return RestoreArgs(restore_type=type(target), dtype=type(target))
+
+    @staticmethod
+    def restore_args_from_target(
+        target: PyTree,
+        sharding_tree: PyTree = None,
+    ) -> PyTree:
+        """Construct ``RestoreArgs`` or ``ArrayRestoreArgs`` from a target PyTree structure.
+
+        Args:
+            target: Target PyTree providing leaf types, shapes, and dtypes.
+            sharding_tree: Optional PyTree of sharding specifications matching ``target``. Defaults to None.
+
+        Returns:
+            PyTree: PyTree of ``RestoreArgs`` / ``ArrayRestoreArgs`` matching ``target``.
+        """
+        return checkpoint_utils.construct_restore_args(
+            target=target,
+            sharding_tree=sharding_tree,
+            set_global_shape=True,
+        )
+
+    @staticmethod
+    def wait_for_new_checkpoint(
+        checkpoint_dir: PathLike,
+        until_step: int | None = None,
+        seconds_to_sleep: int = 1,
+        timeout: int | None = None,
+        step_prefix: str | None = None,
+        step_format_fixed_length: int | None = None,
+        step_name_format: step_lib.NameFormat | None = None,
+    ) -> int:
+        """Wait until a new checkpoint step is present in ``checkpoint_dir``.
+
+        Args:
+            checkpoint_dir: Directory containing step checkpoint subdirectories.
+            until_step: Optional minimum step number to wait for. Defaults to None.
+            seconds_to_sleep: Sleep interval in seconds between directory checks. Defaults to 1.
+            timeout: Optional timeout in seconds before returning ``-1``. Defaults to None.
+            step_prefix: Optional step prefix for directory parsing. Defaults to None.
+            step_format_fixed_length: Optional zero-padded digit width for step directories. Defaults to None.
+            step_name_format: Optional custom ``step_lib.NameFormat``. Defaults to None.
+
+        Returns:
+            int: Discovered checkpoint step number, or ``-1`` if no matching checkpoint is found before timeout.
+        """
+        active_format = (
+            step_name_format
+            if step_name_format is not None
+            else step_lib.standard_name_format(
+                step_prefix=step_prefix,
+                step_format_fixed_length=step_format_fixed_length,
+            )
+        )
+        start_time = time.monotonic()
+        while True:
+            steps: list[int] = []
+            for name in FileSystemIO().listdir(checkpoint_dir):
+                parsed = active_format.parse_step(name)
+                if parsed is not None:
+                    steps.append(parsed)
+            if steps:
+                latest = max(steps)
+                if until_step is None or latest >= until_step:
+                    return latest
+            if (
+                timeout is None
+                or (time.monotonic() - start_time) >= timeout
+                or seconds_to_sleep <= 0
+            ):
+                return -1
+            time.sleep(min(seconds_to_sleep, 0.01))
+
 
 class checkpointer:
     """Namespace exporting synchronous ``Checkpointer``."""
@@ -4709,9 +5197,11 @@ class handlers:
     ProtoCheckpointHandler = ProtoCheckpointHandler
     PyGrainCheckpointHandler = PyGrainCheckpointHandler
     PyTreeCheckpointHandler = PyTreeCheckpointHandler
+    RandomKeyCheckpointHandler = RandomKeyCheckpointHandler
     StandardCheckpointHandler = StandardCheckpointHandler
     CheckpointHandlerRegistry = CheckpointHandlerRegistry
     DefaultCheckpointHandlerRegistry = DefaultCheckpointHandlerRegistry
+    create_default_handler_registry = staticmethod(create_default_handler_registry)
 
 
 class metadata:
@@ -4726,6 +5216,181 @@ class msgpack_utils:
 
     packb = staticmethod(MsgpackEngine().packb)
     unpackb = staticmethod(MsgpackEngine().unpackb)
+
+    @staticmethod
+    def msgpack_serialize(pytree: PyTree, in_place: bool = False) -> bytes:
+        """Serialize a Python PyTree into MessagePack binary format.
+
+        Args:
+            pytree: The PyTree structure to encode.
+            in_place: Whether to serialize array leaves in-place. Defaults to False.
+
+        Returns:
+            bytes: Encoded MessagePack byte string.
+        """
+        _ = in_place
+        return MsgpackEngine().packb(pytree)
+
+    @staticmethod
+    def msgpack_restore(encoded_pytree: bytes) -> PyTree:
+        """Restore a Python PyTree from MessagePack binary bytes.
+
+        Args:
+            encoded_pytree: MessagePack byte payload produced by ``msgpack_serialize``.
+
+        Returns:
+            PyTree: Decoded Python PyTree structure.
+        """
+        return MsgpackEngine().unpackb(encoded_pytree)
+
+
+class v1:
+    """Namespace providing Orbax v1 functional checkpointing APIs."""
+
+    @staticmethod
+    def save_pytree(
+        path: PathLike,
+        pytree: PyTree,
+        *,
+        overwrite: bool = False,
+        custom_metadata: Mapping[str, JsonValue] | None = None,
+    ) -> None:
+        """Synchronously save a PyTree to ``path`` using the Orbax v1 functional interface.
+
+        Args:
+            path: Target checkpoint directory path.
+            pytree: PyTree object to save.
+            overwrite: Whether to overwrite an existing checkpoint at ``path``. Defaults to False.
+            custom_metadata: Optional custom JSON metadata dictionary to store alongside the checkpoint. Defaults to None.
+
+        Raises:
+            ValueError: If ``path`` already exists and ``overwrite`` is False.
+        """
+        io = FileSystemIO()
+        if io.exists(path):
+            if not overwrite:
+                raise ValueError(f"Checkpoint path already exists: {path}")
+            io.remove(path)
+        PyTreeCheckpointer().save(path, pytree, force=overwrite, custom_metadata=custom_metadata)
+        if custom_metadata is not None:
+            meta_file = f"{str(path).rstrip('/')}/_custom_metadata.json"
+            AtomicWrite().atomic_write_bytes(
+                meta_file,
+                json.dumps(dict(custom_metadata)).encode("utf-8"),
+            )
+
+    @staticmethod
+    def save_pytree_async(
+        path: PathLike,
+        pytree: PyTree,
+        *,
+        overwrite: bool = False,
+        custom_metadata: Mapping[str, JsonValue] | None = None,
+    ) -> Future:
+        """Asynchronously save a PyTree to ``path`` and return a ``Future``.
+
+        Args:
+            path: Target checkpoint directory path.
+            pytree: PyTree object to save.
+            overwrite: Whether to overwrite an existing checkpoint at ``path``. Defaults to False.
+            custom_metadata: Optional custom JSON metadata dictionary. Defaults to None.
+
+        Returns:
+            Future: Asynchronous completion handle for the background save operation.
+
+        Raises:
+            ValueError: If ``path`` already exists and ``overwrite`` is False.
+        """
+        io = FileSystemIO()
+        if io.exists(path):
+            if not overwrite:
+                raise ValueError(f"Checkpoint path already exists: {path}")
+            io.remove(path)
+        checkpointer_async = AsyncCheckpointer(PyTreeCheckpointHandler())
+        fut = checkpointer_async.save(
+            path, pytree, force=overwrite, custom_metadata=custom_metadata
+        )
+        if custom_metadata is not None:
+            meta_file = f"{str(path).rstrip('/')}/_custom_metadata.json"
+            AtomicWrite().atomic_write_bytes(
+                meta_file,
+                json.dumps(dict(custom_metadata)).encode("utf-8"),
+            )
+        return fut
+
+    @staticmethod
+    def load_pytree(
+        path: PathLike,
+        abstract_pytree: PyTree = None,
+    ) -> PyTree:
+        """Load and restore a PyTree from ``path``.
+
+        Args:
+            path: Source checkpoint directory path.
+            abstract_pytree: Optional target PyTree structure or ``RestoreArgs`` template. Defaults to None.
+
+        Returns:
+            PyTree: Restored PyTree matching ``abstract_pytree`` if provided.
+        """
+        return PyTreeCheckpointer().restore(path, item=abstract_pytree)
+
+    @staticmethod
+    def save_checkpointables(
+        path: PathLike,
+        checkpointables: Mapping[str, PyTree],
+        *,
+        overwrite: bool = False,
+        custom_metadata: Mapping[str, JsonValue] | None = None,
+    ) -> None:
+        """Save a dictionary of named checkpointable items to ``path``.
+
+        Args:
+            path: Target checkpoint directory path.
+            checkpointables: Mapping from item name to checkpointable PyTree or state object.
+            overwrite: Whether to overwrite an existing checkpoint at ``path``. Defaults to False.
+            custom_metadata: Optional custom JSON metadata dictionary. Defaults to None.
+
+        Raises:
+            ValueError: If ``path`` already exists and ``overwrite`` is False.
+        """
+        io = FileSystemIO()
+        if io.exists(path):
+            if not overwrite:
+                raise ValueError(f"Checkpoint path already exists: {path}")
+            io.remove(path)
+        comp_handler = CompositeCheckpointHandler(*checkpointables.keys())
+        comp_handler.save(path, args.Composite(**dict(checkpointables)))
+        if custom_metadata is not None:
+            meta_file = f"{str(path).rstrip('/')}/_custom_metadata.json"
+            AtomicWrite().atomic_write_bytes(
+                meta_file,
+                json.dumps(dict(custom_metadata)).encode("utf-8"),
+            )
+
+    @staticmethod
+    def load_checkpointables(
+        path: PathLike,
+        abstract_checkpointables: Mapping[str, PyTree] | None = None,
+    ) -> dict[str, PyTree]:
+        """Load a dictionary of named checkpointable items from ``path``.
+
+        Args:
+            path: Source checkpoint directory path.
+            abstract_checkpointables: Optional mapping of item names to target templates. Defaults to None.
+
+        Returns:
+            dict[str, PyTree]: Dictionary mapping item names to restored objects.
+        """
+        comp_handler = CompositeCheckpointHandler()
+        restored = comp_handler.restore(path, item=abstract_checkpointables)
+        return dict(restored) if is_pytree_dict(restored) else {}
+
+
+save_pytree = v1.save_pytree
+save_pytree_async = v1.save_pytree_async
+load_pytree = v1.load_pytree
+save_checkpointables = v1.save_checkpointables
+load_checkpointables = v1.load_checkpointables
 
 
 class path:
@@ -4790,6 +5455,7 @@ class type_handlers:
     SaveArgs = SaveArgs
     RestoreArgs = RestoreArgs
     ArrayRestoreArgs = ArrayRestoreArgs
+    SingleReplicaArrayRestoreArgs = SingleReplicaArrayRestoreArgs
     TypeHandler = TypeHandlerProtocol
     TypeHandlerRegistry = TypeHandlerRegistryProtocol
 
@@ -4821,14 +5487,17 @@ __all__ = [
     "Future",
     "JaxRandomKeyCheckpointHandler",
     "JsonCheckpointHandler",
+    "MultiprocessingOptions",
     "NumpyRandomKeyCheckpointHandler",
     "ProtoCheckpointHandler",
     "PyGrainCheckpointHandler",
     "PyTreeCheckpointHandler",
     "PyTreeCheckpointer",
+    "RandomKeyCheckpointHandler",
     "RestoreArgs",
     "RestoreTransform",
     "SaveArgs",
+    "SingleReplicaArrayRestoreArgs",
     "StandardCheckpointHandler",
     "StandardCheckpointer",
     "Transform",
@@ -4850,10 +5519,14 @@ __all__ = [
     "checkpoint_utils",
     "checkpointer",
     "contextlib",
+    "create_default_handler_registry",
     "epath",
+    "export",
     "functools",
     "future",
     "handlers",
+    "load_checkpointables",
+    "load_pytree",
     "logging",
     "merge_trees",
     "metadata",
@@ -4864,6 +5537,9 @@ __all__ = [
     "orbax",
     "path",
     "pytree_checkpointer",
+    "save_checkpointables",
+    "save_pytree",
+    "save_pytree_async",
     "serialization",
     "standard_checkpointer",
     "step",
@@ -4873,4 +5549,5 @@ __all__ = [
     "tree",
     "type_handlers",
     "utils",
+    "v1",
 ]

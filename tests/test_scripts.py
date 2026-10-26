@@ -103,7 +103,7 @@ def test_check_docs(tmp_path: pathlib.Path) -> None:
     empty_dir.mkdir()
     cov, missing = check_docs.run_doc_check(
         target_dirs=[str(empty_dir)],
-        output_json_path=str(out_json),
+        output_json_path=None,
     )
     assert cov == 100.0
     assert missing == 0
@@ -216,6 +216,7 @@ def test_check_compliance_and_generate_snapshot(tmp_path: pathlib.Path) -> None:
         tmp_path: Pytest temporary directory fixture.
     """
     assert check_compliance.main() == 0
+    assert generate_snapshot.main(output_path=None) == 0
 
     snap_out = tmp_path / "snap.json"
     assert generate_snapshot.main(output_path=str(snap_out)) == 0
@@ -262,6 +263,55 @@ def test_check_compliance_and_generate_snapshot(tmp_path: pathlib.Path) -> None:
         encoding="utf-8",
     )
     assert check_compliance.main(snapshot_path=str(bad_snap_file)) == 1
+
+    # Test collect_ast_definitions with non-existent file and custom AST source
+    custom_src = tmp_path / "custom_defs.py"
+    custom_src.write_text(
+        NL.join(
+            [
+                "def Checkpointer():",
+                "    pass",
+                "class AsyncCheckpointer:",
+                "    def __init__(self, handler, timeout_secs: int = 300):",
+                "        pass",
+                "class PyTreeCheckpointer:",
+                '    """Doc without args."""',
+                "    def __init__(self, primary_host: int = 0, use_ocdbt: bool = True, *, use_zarr3: bool = False):",
+                "        pass",
+            ]
+        )
+        + NL,
+        encoding="utf-8",
+    )
+    defs = check_compliance.collect_ast_definitions(
+        [str(tmp_path / "does_not_exist.py"), str(custom_src)]
+    )
+    v005_errs_missing_json = check_compliance.verify_v005_compliance(
+        defs,
+        v005_release_snapshot_path=str(tmp_path / "missing_v005.json"),
+    )
+    assert any("Kind mismatch" in e for e in v005_errs_missing_json)
+    assert any("Missing docstring on" in e for e in v005_errs_missing_json)
+    assert any("Missing parameter" in e for e in v005_errs_missing_json)
+    assert any("Missing type annotation" in e for e in v005_errs_missing_json)
+    assert any("Missing docstring entry" in e for e in v005_errs_missing_json)
+    assert any("v0.0.5 release snapshot not found" in e for e in v005_errs_missing_json)
+
+    bad_v005_json = tmp_path / "bad_v005.json"
+    bad_v005_json.write_text(
+        '{"categories": {"array": ['
+        '{"api_path": "orbax.checkpoint.MissingRel", "name": "MissingRel", "params": []},'
+        '{"api_path": "orbax.checkpoint.AsyncCheckpointer", "name": "AsyncCheckpointer", "params": [{"name": "missing_req_param"}]}'
+        "]}}",
+        encoding="utf-8",
+    )
+    v005_errs_rel = check_compliance.verify_v005_compliance(
+        defs,
+        v005_release_snapshot_path=str(bad_v005_json),
+    )
+    assert any("Missing v0.12.8 release symbol" in e for e in v005_errs_rel)
+    assert any("Missing docstring on v0.12.8 symbol" in e for e in v005_errs_rel)
+    assert any("Missing v0.12.8 parameter" in e for e in v005_errs_rel)
 
 
 def test_update_badges(tmp_path: pathlib.Path) -> None:
@@ -334,5 +384,9 @@ def test_requirements_txt_contains_griffe() -> None:
     )
     assert (
         "griffecli @ git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffecli"
+        in req_txt
+    )
+    assert (
+        "ml-ecosystem-snapshots @ https://github.com/SamuelMarks/ml-ecosystem-snapshots/releases/download/v0.0.5/ml_ecosystem_snapshots-0.0.5-py3-none-any.whl"
         in req_txt
     )

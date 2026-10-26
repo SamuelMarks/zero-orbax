@@ -7,6 +7,6 @@ saving and restoring machine learning models and their associated states.
 
 from __future__ import annotations
 
-from zero_orbax import checkpoint, core, types
+from zero_orbax import types, core, export, checkpoint
 
-__all__ = ["checkpoint", "core", "types"]
+__all__ = ["checkpoint", "core", "export", "types"]
