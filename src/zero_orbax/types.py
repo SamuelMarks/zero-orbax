@@ -186,6 +186,14 @@ class FlaxStateProtocol(Protocol):
         """
         ...
 
+    def update(self, other: FlaxStateProtocol) -> None:
+        """Update this state in-place from another state mapping.
+
+        Args:
+            other: Source ``State`` mapping.
+        """
+        ...
+
 
 @runtime_checkable
 class FrozenDictProtocol(Protocol):
@@ -266,12 +274,59 @@ class GrainIteratorProtocol(Protocol):
         ...
 
 
+@runtime_checkable
+class MaskedNodeProtocol(Protocol):
+    """Protocol matching ``zero_optax.MaskedNode`` sentinel leaves."""
+
+    def __chex_field_names__(self) -> tuple[str, ...]:
+        """Return empty tuple of field names for ``zero_chex`` traversal.
+
+        Returns:
+            tuple[str, ...]: Empty tuple.
+        """
+        ...
+
+    def __chex_field_values__(self) -> tuple[PyTree, ...]:
+        """Return empty tuple of field values for ``zero_chex`` traversal.
+
+        Returns:
+            tuple[PyTree, ...]: Empty tuple.
+        """
+        ...
+
+
+@runtime_checkable
+class FlaxModuleProtocol(Protocol):
+    """Protocol matching ``zero_flax.nnx.Module`` instances."""
+
+    _variables: dict[str, PyTree]
+    _children: dict[str, PyTree]
+
+
+@runtime_checkable
+class FlaxGraphDefProtocol(Protocol):
+    """Protocol matching ``zero_flax.nnx.GraphDef`` blueprint instances."""
+
+    def apply(self, state: PyTree, *other_states: PyTree) -> FlaxModuleProtocol:
+        """Merge states into a reconstructed module copy.
+
+        Args:
+            state: Primary ``State`` mapping.
+            *other_states: Additional ``State`` mappings.
+
+        Returns:
+            FlaxModuleProtocol: Reconstructed module instance.
+        """
+        ...
+
+
 PyTreeLeaf: TypeAlias = Union[
     ScalarLeaf,
     ArrayProtocol,
     CompilerTensor,
     FlaxVariableProtocol,
     GrainIteratorProtocol,
+    MaskedNodeProtocol,
     LogicalGraph,
     GraphProtocol,
 ]
@@ -281,6 +336,8 @@ PyTreeTuple: TypeAlias = tuple["PyTree", ...]
 PyTree: TypeAlias = Union[
     PyTreeLeaf,
     FlaxStateProtocol,
+    FlaxModuleProtocol,
+    FlaxGraphDefProtocol,
     FrozenDictProtocol,
     NamedTupleProtocol,
     PyTreeDict,
@@ -301,14 +358,14 @@ def array_to_nested_list(value: ArrayProtocol) -> PyTree:
     Returns:
         PyTree: Nested Python list or scalar value.
     """
-    if isinstance(value, ToListProtocol):
-        return value.tolist()
-    if isinstance(value, ToUnderscoreListProtocol):
-        return value.to_list()
     if isinstance(value, CompilerTensor):
         if value.ndim == 0:
             return value.item()
         return [array_to_nested_list(sub) for sub in value]
+    if isinstance(value, ToListProtocol):
+        return value.tolist()
+    if isinstance(value, ToUnderscoreListProtocol):
+        return value.to_list()
     return []
 
 
@@ -729,6 +786,8 @@ __all__ = [
     "CompositeOptions",
     "DType",
     "FileOptions",
+    "FlaxGraphDefProtocol",
+    "FlaxModuleProtocol",
     "FlaxStateProtocol",
     "FlaxVariableProtocol",
     "FrozenDictProtocol",
@@ -739,6 +798,7 @@ __all__ = [
     "JsonValue",
     "LogicalGraph",
     "LogicalMesh",
+    "MaskedNodeProtocol",
     "MemoryLimitOptions",
     "MultiValueTransformFn",
     "MultiprocessingOptions",

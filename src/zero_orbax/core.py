@@ -24,7 +24,15 @@ from ml_switcheroo_compiler import ops as compiler_ops
 from ml_switcheroo_compiler.core.dtype import DType as CompilerDType
 from ml_switcheroo_compiler.core.tensor import Tensor as CompilerTensor, as_tensor_obj
 from ml_switcheroo_ir import LogicalGraph, LogicalMesh, PartitionSpec
-from zero_jax import numpy as jnp
+import zero_jax
+from zero_jax import numpy as jnp, tree_util as jax_tree_util
+from zero_jax.sharding import (
+    Mesh as JaxMesh,
+    NamedSharding as JaxNamedSharding,
+    PartitionSpec as JaxPartitionSpec,
+    Sharding as JaxSharding,
+    SingleDeviceSharding as JaxSingleDeviceSharding,
+)
 
 from zero_orbax.types import (
     ArrayProtocol,
@@ -521,6 +529,27 @@ class SerializedArray:
         """
         return self._dtype
 
+    @property
+    def ndim(self) -> int:
+        """Return the number of dimensions of the array.
+
+        Returns:
+            int: Number of array dimensions.
+        """
+        return len(self._shape)
+
+    @property
+    def size(self) -> int:
+        """Return the total number of elements in the array.
+
+        Returns:
+            int: Total element count.
+        """
+        total = 1
+        for dim in self._shape:
+            total *= dim
+        return total
+
     def tolist(self) -> PyTree:
         """Return the underlying nested list or scalar representation.
 
@@ -553,6 +582,9 @@ class SerializedArray:
                 and self._data == other._data
             )
         return bool(self._data == other)
+
+
+jax_tree_util.register_static(SerializedArray)
 
 
 @dataclasses.dataclass(eq=False)
@@ -1286,6 +1318,7 @@ class BarrierSync:
         """
         if timeout < 0:
             raise ValueError(f"Barrier timeout must be non-negative, got {timeout}.")
+        _ = (zero_jax.process_index(), zero_jax.process_count())
         self._counts[id_str] = self._counts.get(id_str, 0) + 1
 
     def count(self, id_str: str) -> int:
@@ -1302,6 +1335,9 @@ class BarrierSync:
     def reset(self) -> None:
         """Reset all recorded barrier counts."""
         self._counts.clear()
+
+
+SyncBarrier = BarrierSync
 
 
 def _slice_along_axis(
@@ -1338,27 +1374,105 @@ _infer_nested_shape = infer_array_shape
 
 
 class GlobalArraySharding:
-    """Global array sharding utility for extracting host-local tensor shards."""
+    """Global array sharding utility for extracting host-local tensor shards and applying JAX shardings."""
+
+    @staticmethod
+    def resolve_jax_sharding(
+        sharding: JaxSharding | JaxNamedSharding | PartitionSpec | JaxPartitionSpec | str | None = (
+            None
+        ),
+        mesh: LogicalMesh | JaxMesh | None = None,
+        mesh_axes: PartitionSpec | JaxPartitionSpec | Sequence[str | None] | None = None,
+    ) -> JaxSharding | None:
+        """Resolve sharding, mesh, and mesh_axes arguments into a ``zero_jax.sharding.Sharding`` instance.
+
+        Args:
+            sharding: Optional explicit ``zero_jax.sharding.Sharding`` or ``PartitionSpec`` or string descriptor. Defaults to None.
+            mesh: Optional ``LogicalMesh`` or ``zero_jax.sharding.Mesh`` topology. Defaults to None.
+            mesh_axes: Optional ``PartitionSpec`` or sequence of axis names. Defaults to None.
+
+        Returns:
+            JaxSharding | None: Resolved ``zero_jax.sharding.Sharding`` instance, or None if unsharded.
+        """
+        if isinstance(sharding, JaxSharding):
+            return sharding
+        jax_mesh: JaxMesh | None = None
+        if isinstance(mesh, JaxMesh):
+            jax_mesh = mesh
+        elif isinstance(mesh, LogicalMesh):
+            axes_items = list(mesh.shape.items())
+            if axes_items:
+                axis_names = tuple(k for k, _ in axes_items)
+                total_devs = 1
+                for _, sz in axes_items:
+                    total_devs *= max(1, sz)
+                base_devs = zero_jax.devices()
+                devs = [base_devs[i % len(base_devs)] for i in range(total_devs)]
+                jax_mesh = JaxMesh(devs, axis_names)
+        raw_spec = mesh_axes if mesh_axes is not None else sharding
+        if jax_mesh is not None:
+            if isinstance(raw_spec, JaxPartitionSpec):
+                spec_obj = raw_spec
+            elif isinstance(raw_spec, PartitionSpec):
+                spec_obj = JaxPartitionSpec(*raw_spec.axes)
+            elif isinstance(raw_spec, str):
+                spec_obj = JaxPartitionSpec(raw_spec)
+            elif isinstance(raw_spec, Sequence):
+                spec_obj = JaxPartitionSpec(*raw_spec)
+            else:
+                spec_obj = JaxPartitionSpec()
+            return JaxNamedSharding(jax_mesh, spec_obj)
+        if isinstance(sharding, (PartitionSpec, JaxPartitionSpec, str)):
+            return JaxSingleDeviceSharding(zero_jax.devices()[0])
+        return None
+
+    def apply_sharding(
+        self,
+        array: PyTree,
+        sharding: JaxSharding | JaxNamedSharding | PartitionSpec | JaxPartitionSpec | str | None = (
+            None
+        ),
+        mesh: LogicalMesh | JaxMesh | None = None,
+        mesh_axes: PartitionSpec | JaxPartitionSpec | Sequence[str | None] | None = None,
+    ) -> PyTree:
+        """Place a ``zero_jax.numpy.ndarray`` leaf onto the resolved ``zero_jax`` sharding and device.
+
+        Args:
+            array: Target array or PyTree leaf.
+            sharding: Optional explicit ``Sharding`` or ``PartitionSpec``. Defaults to None.
+            mesh: Optional ``LogicalMesh`` or ``zero_jax.sharding.Mesh``. Defaults to None.
+            mesh_axes: Optional ``PartitionSpec`` or sequence of axis names. Defaults to None.
+
+        Returns:
+            PyTree: Array placed on the target ``zero_jax`` sharding via ``zero_jax.device_put``.
+        """
+        resolved = self.resolve_jax_sharding(sharding=sharding, mesh=mesh, mesh_axes=mesh_axes)
+        if resolved is not None and isinstance(array, jnp.ndarray):
+            return zero_jax.device_put(array, device=resolved)
+        return array
 
     def get_local_shard(
         self,
         array: PyTree,
         host_id: int,
         num_hosts: int = 1,
-        partition_spec: PartitionSpec | None = None,
-        mesh: LogicalMesh | None = None,
+        partition_spec: PartitionSpec | JaxPartitionSpec | None = None,
+        mesh: LogicalMesh | JaxMesh | None = None,
+        sharding: JaxSharding | JaxNamedSharding | None = None,
     ) -> PyTree:
         """Extract the local shard of a global array for a specific host.
 
-        Supports 1D and multi-axis ``PartitionSpec`` + ``LogicalMesh`` sharding across
-        lists, tuples, and ``ArrayProtocol`` / ``SerializedArray`` / ``jnp.ndarray`` / ``CompilerTensor`` instances.
+        Supports 1D and multi-axis ``PartitionSpec`` + ``LogicalMesh`` / ``zero_jax.sharding.Mesh``
+        and ``NamedSharding`` sharding across lists, tuples, and ``ArrayProtocol`` /
+        ``SerializedArray`` / ``jnp.ndarray`` / ``CompilerTensor`` instances.
 
         Args:
             array: The global array, sequence, or PyTree to shard.
             host_id: The host index to extract the shard for.
             num_hosts: Total number of hosts in the mesh. Defaults to 1.
-            partition_spec: Optional ``ml_switcheroo_ir.PartitionSpec`` describing axis partitioning.
-            mesh: Optional ``ml_switcheroo_ir.LogicalMesh`` defining mesh axis sizes. Defaults to None.
+            partition_spec: Optional ``PartitionSpec`` describing axis partitioning. Defaults to None.
+            mesh: Optional ``LogicalMesh`` or ``zero_jax.sharding.Mesh`` defining mesh axis sizes. Defaults to None.
+            sharding: Optional ``zero_jax.sharding.Sharding`` or ``NamedSharding``. Defaults to None.
 
         Returns:
             PyTree: The local shard corresponding to ``host_id``, or ``None`` if ``array`` is ``None``.
@@ -1366,18 +1480,26 @@ class GlobalArraySharding:
         Raises:
             ValueError: If ``host_id < 0`` or ``num_hosts <= 0`` or ``host_id >= num_hosts``.
         """
+        active_mesh: LogicalMesh | JaxMesh | None = mesh
+        active_spec: PartitionSpec | JaxPartitionSpec | None = partition_spec
+        if isinstance(sharding, JaxNamedSharding):
+            if active_mesh is None:
+                active_mesh = sharding.mesh
+            if active_spec is None:
+                active_spec = sharding.spec
         sharded_axes: list[tuple[int, int]] = []
         spec_hosts = 1
-        if mesh is not None and partition_spec is not None and len(partition_spec.axes) > 0:
-            for idx, axis_spec in enumerate(partition_spec.axes):
+        if active_mesh is not None and active_spec is not None and len(active_spec.axes) > 0:
+            mesh_shape: Mapping[str, int] = active_mesh.shape
+            for idx, axis_spec in enumerate(active_spec.axes):
                 if isinstance(axis_spec, str):
-                    factor = max(1, mesh.shape.get(axis_spec, 1))
+                    factor = max(1, mesh_shape.get(axis_spec, 1))
                     sharded_axes.append((idx, factor))
                     spec_hosts *= factor
                 elif axis_spec is not None:
                     axis_factor = 1
                     for axis_name in axis_spec:
-                        axis_factor *= max(1, mesh.shape.get(axis_name, 1))
+                        axis_factor *= max(1, mesh_shape.get(axis_name, 1))
                     sharded_axes.append((idx, axis_factor))
                     spec_hosts *= axis_factor
 
@@ -1387,7 +1509,12 @@ class GlobalArraySharding:
         if array is None:
             return None
         if effective_hosts == 1 and not sharded_axes:
-            return array
+            return self.apply_sharding(
+                array,
+                sharding=sharding,
+                mesh=active_mesh,
+                mesh_axes=active_spec,
+            )
 
         if not sharded_axes:
             sharded_axes = [(0, effective_hosts)]
@@ -1433,7 +1560,16 @@ class GlobalArraySharding:
                         if isinstance(sliced_data, (int, float, bool, list, tuple))
                         else 0.0
                     )
-                    return jnp.asarray(raw_jnp, dtype=resolve_compiler_dtype(str(array.dtype)))
+                    shard_arr = jnp.asarray(
+                        raw_jnp,
+                        dtype=resolve_compiler_dtype(str(array.dtype)),
+                    )
+                    return self.apply_sharding(
+                        shard_arr,
+                        sharding=sharding,
+                        mesh=active_mesh,
+                        mesh_axes=active_spec,
+                    )
                 if isinstance(array, CompilerTensor):
                     raw_ct = (
                         sliced_data
@@ -1459,6 +1595,7 @@ __all__ = [
     "MsgpackEngine",
     "ReconstructedGraphNode",
     "SerializedArray",
+    "SyncBarrier",
     "TensorStoreDriver",
     "VirtualFileSystem",
     "resolve_compiler_dtype",

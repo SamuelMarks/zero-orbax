@@ -31,6 +31,7 @@ from zero_orbax.types import (
     AtomicityOptions,
     BestFn,
     FileOptions,
+    GrainIteratorProtocol,
     JsonValue,
     MultiprocessingOptions,
     PathLike,
@@ -555,7 +556,16 @@ class CheckpointManager(AbstractCheckpointManager):
             FileSystemIO().makedirs(step_dir, exist_ok=True, permission_mode=perm_mode)
 
         try:
-            if isinstance(args_obj, _CompositeArgsCls):
+            if isinstance(args_obj, _CompositeArgsCls) or (
+                is_pytree_dict(items)
+                and (
+                    bool(self.item_names)
+                    or any(
+                        isinstance(v, (_CheckpointArgsBase, GrainIteratorProtocol))
+                        for v in items.values()
+                    )
+                )
+            ):
                 comp_handler = CompositeCheckpointHandler(
                     *(self.item_names or ()),
                     handler_registry=self.handler_registry,
@@ -563,7 +573,8 @@ class CheckpointManager(AbstractCheckpointManager):
                 if isinstance(self.item_handlers, Mapping):
                     for k, h in self.item_handlers.items():
                         comp_handler._item_handlers[k] = h
-                comp_handler.save(active_step_dir, args_obj)
+                comp_target = args_obj if isinstance(args_obj, _CompositeArgsCls) else items
+                comp_handler.save(active_step_dir, comp_target)
                 return
 
             if isinstance(self.checkpointers, Mapping) and is_pytree_dict(items):

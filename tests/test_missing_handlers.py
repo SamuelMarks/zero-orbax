@@ -214,3 +214,55 @@ def test_composite_checkpoint_handler_and_registry(tmp_path: pathlib.Path) -> No
         "extra": {"raw": 99},
     }
     comp.close()
+
+
+def test_composite_handler_grain_flax_optax(tmp_path: pathlib.Path) -> None:
+    """Test CompositeCheckpointHandler with zero_flax State, zero_optax OptState, and zero_grain iterator.
+
+    Args:
+        tmp_path: Pytest temporary directory fixture.
+    """
+    import zero_chex
+    import zero_flax.nnx as nnx
+    import zero_grain as grain
+    from zero_jax import numpy as jnp
+    import zero_optax as optax
+
+    lin = nnx.Linear(3, 2, rngs=nnx.Rngs(0))
+    _, state = nnx.split(lin)
+    tx = optax.adamw(1e-2)
+    opt_state = tx.init({"w": jnp.ones((3, 2), dtype=jnp.float32)})
+    loader = grain.DataLoader(
+        data_source=grain.RangeDataSource(0, 6, 1),
+        sampler=grain.SequentialSampler(num_records=6),
+    )
+    dl_iter = iter(loader)
+    assert next(dl_iter) == 0
+
+    comp = zcp.CompositeCheckpointHandler("state", "opt_state", "dataloader")
+    step_dir = tmp_path / "step_0"
+    comp.save(
+        step_dir,
+        zcp.args.Composite(
+            state=zcp.args.StandardSave(state, check_finite=True),
+            opt_state=zcp.args.PyTreeSave(opt_state, check_finite=True),
+            dataloader=zcp.args.GrainCheckpointSave(dl_iter),
+        ),
+    )
+    assert next(dl_iter) == 1
+
+    fresh_lin = nnx.Linear(3, 2, rngs=nnx.Rngs(9))
+    _, fresh_state = nnx.split(fresh_lin)
+    fresh_opt_state = tx.init({"w": jnp.zeros((3, 2), dtype=jnp.float32)})
+    restored = comp.restore(
+        step_dir,
+        zcp.args.Composite(
+            state=zcp.args.StandardRestore(fresh_state, strict=True),
+            opt_state=zcp.args.PyTreeRestore(fresh_opt_state, strict=True),
+            dataloader=zcp.args.GrainCheckpointRestore(dl_iter),
+        ),
+    )
+    assert isinstance(restored, dict)
+    zero_chex.assert_trees_all_close(restored["state"], state)
+    zero_chex.assert_trees_all_close(restored["opt_state"], opt_state)
+    assert next(dl_iter) == 1

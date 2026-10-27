@@ -317,6 +317,7 @@ class args:
             item: PyTree = None,
             save_args: PyTree = None,
             ocdbt_target_data_file_size: int | None = None,
+            check_finite: bool = False,
         ) -> None:
             """Initialize the PyTreeSave arguments.
 
@@ -324,10 +325,12 @@ class args:
                 item: PyTree structure to save. Defaults to None.
                 save_args: Optional PyTree of ``SaveArgs``. Defaults to None.
                 ocdbt_target_data_file_size: Optional target OCDBT file size in bytes. Defaults to None.
+                check_finite: Whether to validate that all array values are finite on save via ``zero_chex``. Defaults to False.
             """
             super().__init__(item=item)
             self.save_args = save_args
             self.ocdbt_target_data_file_size = ocdbt_target_data_file_size
+            self.check_finite = check_finite
 
     class PyTreeRestore(CheckpointArgs):
         """Arguments for restoring a PyTree structure."""
@@ -339,6 +342,7 @@ class args:
             restore_args: PyTree = None,
             transforms: PyTree = None,
             transforms_default_to_original: bool = True,
+            strict: bool = True,
         ) -> None:
             """Initialize the PyTreeRestore arguments.
 
@@ -348,12 +352,14 @@ class args:
                 restore_args: Optional PyTree of ``RestoreArgs``. Defaults to None.
                 transforms: Optional PyTree of ``Transform`` / ``RestoreTransform`` rules. Defaults to None.
                 transforms_default_to_original: Whether untransformed keys default to original values. Defaults to True.
+                strict: Whether to enforce strict PyTree structure, shape, and dtype validation. Defaults to True.
             """
             super().__init__(item=item)
             self.save_args = save_args
             self.restore_args = restore_args
             self.transforms = transforms
             self.transforms_default_to_original = transforms_default_to_original
+            self.strict = strict
 
     class StandardSave(CheckpointArgs):
         """Arguments for standard PyTree saving operations."""
@@ -362,15 +368,18 @@ class args:
             self,
             item: PyTree = None,
             save_args: PyTree = None,
+            check_finite: bool = False,
         ) -> None:
             """Initialize the StandardSave arguments.
 
             Args:
                 item: PyTree structure to save. Defaults to None.
                 save_args: Optional per-leaf ``SaveArgs`` tree. Defaults to None.
+                check_finite: Whether to validate that all array values are finite on save via ``zero_chex``. Defaults to False.
             """
             super().__init__(item=item)
             self.save_args = save_args
+            self.check_finite = check_finite
 
     class StandardRestore(CheckpointArgs):
         """Arguments for standard PyTree restoration operations."""
@@ -457,6 +466,9 @@ class args:
                 item: ``GrainIteratorProtocol`` instance to restore in-place. Defaults to None.
             """
             super().__init__(item=item)
+
+    GrainCheckpointSave = PyGrainCheckpointSave
+    GrainCheckpointRestore = PyGrainCheckpointRestore
 
     @staticmethod
     def get_registered_handler_cls(

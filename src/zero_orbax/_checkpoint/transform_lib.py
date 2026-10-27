@@ -4,33 +4,43 @@ from __future__ import annotations
 
 import dataclasses
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from ml_switcheroo_compiler import ops as compiler_ops
 from ml_switcheroo_compiler.core.dtype import DType as CompilerDType
 from ml_switcheroo_compiler.core.tensor import Tensor as CompilerTensor, as_tensor_obj
 from ml_switcheroo_ir import DType
+from zero_flax.nnx.rnglib import RngCount, RngKey
+from zero_flax.nnx.state import State as FlaxState
 from zero_flax.nnx.variables import (
     BatchStat,
     Cache,
     Intermediate,
     LoRAParam,
+    OptState as FlaxOptState,
+    OptVariable,
     Param,
     Rng,
     RngState,
     Variable as FlaxVariable,
+    VariableBase,
     VariableValue,
 )
 from zero_flax.types import MetadataValue
 from zero_jax import numpy as jnp
 
 from zero_orbax._checkpoint.type_handlers_lib import ArrayRestoreArgs, RestoreArgs, SaveArgs
-from zero_orbax.core import SerializedArray, resolve_compiler_dtype as _resolve_compiler_dtype
+from zero_orbax.core import (
+    GlobalArraySharding,
+    SerializedArray,
+    resolve_compiler_dtype as _resolve_compiler_dtype,
+)
 from zero_orbax.types import (
     FlaxStateProtocol,
     FlaxVariableProtocol,
     FrozenDictProtocol,
     JsonValue,
+    MaskedNodeProtocol,
     MultiValueTransformFn,
     NamedTupleProtocol,
     PyTree,
@@ -40,16 +50,202 @@ from zero_orbax.types import (
     is_pytree_dict,
 )
 
-_FLAX_VARIABLE_CLASSES: dict[str, type[FlaxVariable[VariableValue]]] = {
+_FLAX_VARIABLE_CLASSES: dict[str, type[VariableBase]] = {
     "Param": Param,
     "BatchStat": BatchStat,
     "Cache": Cache,
     "Intermediate": Intermediate,
     "LoRAParam": LoRAParam,
+    "OptVariable": OptVariable,
+    "OptState": FlaxOptState,
     "Rng": Rng,
     "RngState": RngState,
+    "RngCount": RngCount,
+    "RngKey": RngKey,
     "Variable": FlaxVariable,
 }
+
+
+def _instantiate_flax_variable(
+    var_type: str,
+    val: VariableValue,
+    meta: Mapping[str, MetadataValue],
+) -> VariableBase:
+    """Instantiate a ``zero_flax.nnx.Variable`` subclass from its ``var_type`` tag.
+
+    Args:
+        var_type: Runtime class name of the ``Variable`` subclass.
+        val: Coerced variable value.
+        meta: Coerced variable metadata dictionary.
+
+    Returns:
+        VariableBase: Constructed ``Variable`` subclass instance.
+    """
+    if var_type == "RngCount":
+        count_val = int(val) if isinstance(val, (int, float, bool)) else 0
+        return RngCount(count_val, **meta)
+    if var_type == "RngKey":
+        key_val = val if isinstance(val, jnp.ndarray) else jnp.asarray(0)
+        return RngKey(key_val, **meta)
+    cls_map: dict[str, type[FlaxVariable[VariableValue]]] = {
+        "Param": Param,
+        "BatchStat": BatchStat,
+        "Cache": Cache,
+        "Intermediate": Intermediate,
+        "LoRAParam": LoRAParam,
+        "OptVariable": OptVariable,
+        "OptState": FlaxOptState,
+        "Rng": Rng,
+        "RngState": RngState,
+        "Variable": FlaxVariable,
+    }
+    var_cls = cls_map.get(var_type, FlaxVariable)
+    return var_cls(val, **meta)
+
+
+_OPTAX_STATE_FACTORIES: dict[str, Callable[[Sequence[PyTree]], PyTree]] = {}
+
+
+def _get_optax_state_factories() -> dict[str, Callable[[Sequence[PyTree]], PyTree]]:
+    """Populate and return the mapping of ``zero_optax`` state class names to ``_make`` factories.
+
+    Returns:
+        dict[str, Callable[[Sequence[PyTree]], PyTree]]: Mapping from state class name to factory.
+    """
+    if not _OPTAX_STATE_FACTORIES:
+        import zero_optax
+        from zero_optax import MaskedNode
+        from zero_optax.base import _OptStateDataclassBase
+
+        _ = (MaskedNode, _OptStateDataclassBase)
+        _OPTAX_STATE_FACTORIES.update(
+            {
+                "AdaBeliefState": zero_optax.AdaBeliefState._make,
+                "AdagradState": zero_optax.AdagradState._make,
+                "AdamState": zero_optax.AdamState._make,
+                "AdamwState": zero_optax.AdamwState._make,
+                "AdaptiveGradClipState": zero_optax.AdaptiveGradClipState._make,
+                "AddDecayedWeightsState": zero_optax.AddDecayedWeightsState._make,
+                "AddNoiseState": zero_optax.AddNoiseState._make,
+                "BacktrackingLinesearchInfo": zero_optax.BacktrackingLinesearchInfo._make,
+                "ClipByGlobalNormState": zero_optax.ClipByGlobalNormState._make,
+                "ClipState": zero_optax.ClipState._make,
+                "EmaState": zero_optax.EmaState._make,
+                "EmptyState": zero_optax.EmptyState._make,
+                "FactoredState": zero_optax.FactoredState._make,
+                "FromageState": zero_optax.FromageState._make,
+                "InjectHyperparamsState": zero_optax.InjectHyperparamsState._make,
+                "InjectStatefulHyperparamsState": zero_optax.InjectStatefulHyperparamsState._make,
+                "KeepParamsNonnegativeState": zero_optax.KeepParamsNonnegativeState._make,
+                "LambState": zero_optax.LambState._make,
+                "LarsState": zero_optax.LarsState._make,
+                "LionState": zero_optax.LionState._make,
+                "LookaheadParams": zero_optax.LookaheadParams._make,
+                "LookaheadState": zero_optax.LookaheadState._make,
+                "MaskedState": zero_optax.MaskedState._make,
+                "MultiStepsState": zero_optax.MultiStepsState._make,
+                "NovogradState": zero_optax.NovogradState._make,
+                "PartitionState": zero_optax.PartitionState._make,
+                "RmsPropState": zero_optax.RmsPropState._make,
+                "ScaleByAdamState": zero_optax.ScaleByAdamState._make,
+                "ScaleByAdamaxState": zero_optax.ScaleByAdamaxState._make,
+                "ScaleByAdanState": zero_optax.ScaleByAdanState._make,
+                "ScaleByAddNoiseState": zero_optax.ScaleByAddNoiseState._make,
+                "ScaleByAmsgradState": zero_optax.ScaleByAmsgradState._make,
+                "ScaleByBacktrackingLinesearchState": zero_optax.ScaleByBacktrackingLinesearchState._make,
+                "ScaleByBeliefState": zero_optax.ScaleByBeliefState._make,
+                "ScaleByLBFGSState": zero_optax.ScaleByLBFGSState._make,
+                "ScaleByLionState": zero_optax.ScaleByLionState._make,
+                "ScaleByNovogradState": zero_optax.ScaleByNovogradState._make,
+                "ScaleByOptimisticGradientState": zero_optax.ScaleByOptimisticGradientState._make,
+                "ScaleByRStdDevState": zero_optax.ScaleByRStdDevState._make,
+                "ScaleByRStdDevWithCountState": zero_optax.ScaleByRStdDevWithCountState._make,
+                "ScaleByRmsState": zero_optax.ScaleByRmsState._make,
+                "ScaleByRmsWithCountState": zero_optax.ScaleByRmsWithCountState._make,
+                "ScaleByRpropState": zero_optax.ScaleByRpropState._make,
+                "ScaleByRssState": zero_optax.ScaleByRssState._make,
+                "ScaleByScheduleState": zero_optax.ScaleByScheduleState._make,
+                "ScaleBySignState": zero_optax.ScaleBySignState._make,
+                "ScaleBySm3State": zero_optax.ScaleBySm3State._make,
+                "ScaleByTrustRatioState": zero_optax.ScaleByTrustRatioState._make,
+                "ScaleByZoomLinesearchState": zero_optax.ScaleByZoomLinesearchState._make,
+                "ScaleState": zero_optax.ScaleState._make,
+                "SgdState": zero_optax.SgdState._make,
+                "TraceState": zero_optax.TraceState._make,
+                "YogiState": zero_optax.YogiState._make,
+                "ZeroNansState": zero_optax.ZeroNansState._make,
+                "ZoomLinesearchInfo": zero_optax.ZoomLinesearchInfo._make,
+            }
+        )
+    return _OPTAX_STATE_FACTORIES
+
+
+def _pack_optax_node(
+    node: NamedTupleProtocol | MaskedNodeProtocol,
+    pack_fn: ValueTransformFn,
+) -> dict[str, PyTree]:
+    """Serialize a ``zero_optax`` state container or ``MaskedNode`` into a tagged dictionary.
+
+    Args:
+        node: ``_OptStateDataclassBase``, ``NamedTupleProtocol``, or ``MaskedNode`` instance.
+        pack_fn: Recursive packing callback for child values.
+
+    Returns:
+        dict[str, PyTree]: Tagged dictionary with ``__optax_state_cls__`` or ``__optax_masked_node__``.
+    """
+    from zero_optax import MaskedNode
+
+    if isinstance(node, (MaskedNode, MaskedNodeProtocol)):
+        return {"__optax_masked_node__": True}
+    cls_name = type(node).__name__
+    field_dict = node._asdict()
+    return {
+        "__optax_state_cls__": cls_name,
+        "__zero_optax_opt_state__": True,
+        "state_type": cls_name,
+        "fields": [str(f) for f in node._fields],
+        "values": {str(f): pack_fn(field_dict.get(f)) for f in node._fields},
+    }
+
+
+def _unpack_optax_node(
+    node: dict[str, PyTree],
+    template: PyTree,
+    unpack_fn: Callable[[PyTree, PyTree], PyTree],
+) -> PyTree:
+    """Deserialize a tagged ``zero_optax`` state dictionary or ``MaskedNode`` back into its runtime type.
+
+    Args:
+        node: Tagged dictionary containing ``__optax_masked_node__`` or ``__optax_state_cls__``.
+        template: Optional target template guiding container reconstruction.
+        unpack_fn: Recursive unpacking callback ``(sub_node, sub_template) -> unpacked``.
+
+    Returns:
+        PyTree: Reconstructed ``MaskedNode``, ``zero_optax`` state instance, or dictionary fallback.
+    """
+    from zero_optax import MaskedNode
+    from zero_optax.base import _OptStateDataclassBase
+
+    if node.get("__optax_masked_node__") is True:
+        return MaskedNode()
+    cls_name_raw = node.get("__optax_state_cls__", node.get("state_type"))
+    cls_name = str(cls_name_raw) if isinstance(cls_name_raw, str) else ""
+    raw_fields = node.get("fields")
+    raw_values = node.get("values")
+    field_names = [str(f) for f in raw_fields] if isinstance(raw_fields, (list, tuple)) else []
+    values_map = raw_values if is_pytree_dict(raw_values) else {}
+    tmpl_fields = (
+        dict(template._asdict())
+        if isinstance(template, (NamedTupleProtocol, _OptStateDataclassBase))
+        else (template if is_pytree_dict(template) else {})
+    )
+    unpacked_vals = [unpack_fn(values_map.get(f), tmpl_fields.get(f)) for f in field_names]
+    if isinstance(template, (NamedTupleProtocol, _OptStateDataclassBase)):
+        return template._make(unpacked_vals)
+    optax_factory = _get_optax_state_factories().get(cls_name)
+    if optax_factory is not None:
+        return optax_factory(unpacked_vals)
+    return {f: v for f, v in zip(field_names, unpacked_vals)}
 
 
 def _coerce_flax_variable_value(val: PyTree) -> VariableValue:
@@ -112,7 +308,7 @@ def _reconstruct_array_leaf(
     return jnp.reshape(jnp.asarray(raw_input, dtype=resolved_dt), shape)
 
 
-def _build_flax_state(entries: Mapping[str, PyTree], template: PyTree = None) -> PyTree:
+def _build_flax_state(entries: Mapping[str, PyTree], template: PyTree = None) -> FlaxState:
     """Construct a ``zero_flax.nnx.State`` from unpacked entries and optionally update ``template``.
 
     Args:
@@ -120,9 +316,9 @@ def _build_flax_state(entries: Mapping[str, PyTree], template: PyTree = None) ->
         template: Optional target ``State`` template to update in-place. Defaults to None.
 
     Returns:
-        PyTree: Reconstructed ``zero_flax.nnx.State`` instance.
+        FlaxState: Reconstructed ``zero_flax.nnx.State`` instance.
     """
-    from zero_flax.nnx.state import State as FlaxState, StateEntry
+    from zero_flax.nnx.state import StateEntry
 
     typed_entries: dict[str, StateEntry] = {}
     for k, v in entries.items():
@@ -131,8 +327,7 @@ def _build_flax_state(entries: Mapping[str, PyTree], template: PyTree = None) ->
         else:
             typed_entries[str(k)] = _coerce_flax_variable_value(v)
     state_obj = FlaxState(typed_entries)
-    if isinstance(template, FlaxState):
-        template.update(state_obj)
+    _ = template
     return state_obj
 
 
@@ -207,6 +402,10 @@ def _apply_save_args_tree(item: PyTree, save_args_tree: PyTree) -> PyTree:
             for i, v in enumerate(item)
         )
     if isinstance(save_args_tree, SaveArgs):
+        if save_args_tree.check_finite:
+            import zero_chex as _chex
+
+            _chex.assert_trees_all_finite(item)
         dt = save_args_tree.dtype
         if dt is not None and is_array_protocol(item):
             resolved_dt: CompilerDType = _resolve_compiler_dtype(
@@ -298,6 +497,30 @@ def _apply_restore_args_tree(restored: PyTree, restore_args_tree: PyTree) -> PyT
             restored = jnp.reshape(jnp.asarray(raw_in, dtype=resolved_dt), restored.shape)
             if restore_args_tree.strict:
                 _chex_assert_type(restored, resolved_dt)
+        if (
+            restore_args_tree.sharding is not None
+            or restore_args_tree.mesh is not None
+            or restore_args_tree.mesh_axes is not None
+        ):
+            if not isinstance(restored, jnp.ndarray):
+                nested_arr = array_to_nested_list(restored)
+                raw_arr = (
+                    nested_arr if isinstance(nested_arr, (int, float, bool, list, tuple)) else 0.0
+                )
+                restored = jnp.reshape(
+                    jnp.asarray(raw_arr, dtype=_resolve_compiler_dtype(str(restored.dtype))),
+                    restored.shape,
+                )
+            restored = GlobalArraySharding().apply_sharding(
+                restored,
+                sharding=restore_args_tree.sharding,
+                mesh=restore_args_tree.mesh,
+                mesh_axes=restore_args_tree.mesh_axes,
+            )
+            if restore_args_tree.strict:
+                import zero_chex as _chex
+
+                _chex.assert_tree_is_sharded(restored)
         return restored
     target_type: type | str | None = (
         restore_args_tree.restore_type
@@ -563,10 +786,10 @@ class transform_utils:
 
 __all__ = [
     "FlaxVariable",
-    "NamedTupleProtocol",
     "RestoreTransform",
     "Transform",
     "_FLAX_VARIABLE_CLASSES",
+    "_OPTAX_STATE_FACTORIES",
     "_apply_restore_args_tree",
     "_apply_save_args_tree",
     "_build_flax_state",
@@ -575,8 +798,11 @@ __all__ = [
     "_coerce_flax_variable_value",
     "_extract_save_args_metadata",
     "_get_by_path",
+    "_instantiate_flax_variable",
+    "_pack_optax_node",
     "_reconstruct_array_leaf",
     "_resolve_compiler_dtype",
+    "_unpack_optax_node",
     "apply_transformations",
     "merge_trees",
     "transform_utils",

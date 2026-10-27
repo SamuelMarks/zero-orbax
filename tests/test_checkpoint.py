@@ -540,8 +540,12 @@ def test_optax_and_grain_composite_checkpointing(tmp_path: pathlib.Path) -> None
     opt_dir = tmp_path / "opt_ckpt"
     pt_cp.save(opt_dir, updated_opt_state)
 
-    restored_opt_dict = pt_cp.restore(opt_dir)
-    assert isinstance(restored_opt_dict, dict)
+    restored_opt_typeless = pt_cp.restore(opt_dir)
+    assert isinstance(restored_opt_typeless, optax.AdamwState)
+    chex.assert_trees_all_close(
+        restored_opt_typeless.adam_state.mu,
+        updated_opt_state.adam_state.mu,
+    )
 
     fresh_opt_state = tx.init(params)
     restored_opt = pt_cp.restore(opt_dir, item=fresh_opt_state)
@@ -555,6 +559,90 @@ def test_optax_and_grain_composite_checkpointing(tmp_path: pathlib.Path) -> None
         updated_opt_state.scale_state,
     )
     assert type(unpacked_plain_opt) is type(updated_opt_state.scale_state)
+    unpacked_unknown_opt = base_h._unpack_pytree(
+        {
+            "__optax_state_cls__": "UnknownCustomState",
+            "fields": ["x"],
+            "values": {"x": 42},
+        },
+        None,
+    )
+    assert unpacked_unknown_opt == {"x": 42}
+    unpacked_non_str_cls = base_h._unpack_pytree(
+        {
+            "__zero_optax_opt_state__": True,
+            "state_type": 123,
+            "fields": "not_list",
+            "values": "not_dict",
+        },
+        None,
+    )
+    assert unpacked_non_str_cls == {}
+
+    def _call_init(fn: optax.TransformInitFn[PyTree] | None) -> PyTree:
+        """Invoke an optax ``init`` callable after asserting it is non-None.
+
+        Args:
+            fn: Optional ``TransformInitFn`` from a gradient transformation.
+
+        Returns:
+            PyTree: Initialized optimizer state.
+        """
+        assert fn is not None
+        return fn(params)
+
+    ih_factory = optax.inject_hyperparams(optax.adam)
+    assert ih_factory is not None
+    for st in (
+        _call_init(optax.adam(1e-3).init),
+        _call_init(optax.lion(1e-3).init),
+        _call_init(optax.masked(optax.adam(1e-3), {"w": False}).init),
+        _call_init(optax.MultiSteps(optax.adam(1e-3), every_k_schedule=2).init),
+        _call_init(ih_factory(1e-3).init),
+        _call_init(optax.add_decayed_weights(1e-2).init),
+    ):
+        sub_dir = tmp_path / f"opt_{type(st).__name__}"
+        pt_cp.save(sub_dir, st)
+        restored_st = pt_cp.restore(sub_dir)
+        assert type(restored_st) is type(st)
+        restored_st_tmpl = pt_cp.restore(sub_dir, item=st)
+        assert type(restored_st_tmpl) is type(st)
+
+    rng_state = nnx.State(
+        {
+            "cnt": nnx.RngCount(3),
+            "key": nnx.RngKey(jnp.array([0, 7], dtype=jnp.int32)),
+            "opt_var": nnx.OptVariable(jnp.array([1.0], dtype=jnp.float32)),
+            "opt_st": nnx.OptState(jnp.array([2.0], dtype=jnp.float32)),
+        }
+    )
+    rng_dir = tmp_path / "rng_vars_ckpt"
+    pt_cp.save(rng_dir, rng_state)
+    restored_rng = pt_cp.restore(rng_dir)
+    assert isinstance(restored_rng, nnx.State)
+    assert isinstance(restored_rng["cnt"], nnx.RngCount)
+    assert isinstance(restored_rng["key"], nnx.RngKey)
+    assert isinstance(restored_rng["opt_var"], nnx.OptVariable)
+    assert isinstance(restored_rng["opt_st"], nnx.OptState)
+    assert isinstance(
+        base_h._unpack_pytree(
+            {
+                "__zero_flax_variable__": True,
+                "var_type": "RngCount",
+                "value": "bad",
+                "metadata": {},
+            },
+            None,
+        ),
+        nnx.RngCount,
+    )
+    assert isinstance(
+        base_h._unpack_pytree(
+            {"__zero_flax_variable__": True, "var_type": "RngKey", "value": 5, "metadata": {}},
+            None,
+        ),
+        nnx.RngKey,
+    )
 
     assert args.has_registered_args(grain.PyGrainCheckpointHandler)
     assert (
@@ -622,3 +710,410 @@ def test_optax_and_grain_composite_checkpointing(tmp_path: pathlib.Path) -> None
     assert in_mem_mgr.save(99, {"fallback": 1}) is True
     assert in_mem_mgr.restore(99) == {"fallback": 1}
     assert in_mem_mgr.item_metadata(99) == {"fallback": 1}
+
+
+def test_full_six_repo_ecosystem_roundtrip(tmp_path: pathlib.Path) -> None:
+    """Test comprehensive 6-repo round-trip checkpointing across jax, chex, flax, grain, optax, and orbax.
+
+    Args:
+        tmp_path: Temporary pytest directory.
+    """
+    import pytest
+    import zero_chex
+    import zero_flax.nnx as nnx
+    import zero_grain as grain
+    import zero_jax
+    from zero_jax import numpy as jnp
+    from zero_jax.sharding import Mesh, NamedSharding, PartitionSpec as JaxPSpec
+    import zero_optax as optax
+    from zero_orbax.checkpoint import (
+        ArrayRestoreArgs,
+        BasePyTreeCheckpointHandler,
+        CheckpointManager,
+        PyTreeCheckpointHandler,
+        PyTreeCheckpointer,
+        SaveArgs,
+        StandardCheckpointer,
+        args,
+    )
+
+    class SixRepoBlock(nnx.Module):
+        """Composite NNX model combining Linear, BatchNorm, MultiHeadAttention, and LoRA."""
+
+        def __init__(self, rngs: nnx.Rngs) -> None:
+            """Initialize the SixRepoBlock module.
+
+            Args:
+                rngs: NNX random number generator streams.
+            """
+            super().__init__()
+            self.linear = self.register_child("linear", nnx.Linear(4, 4, rngs=rngs))
+            self.bn = self.register_child("bn", nnx.BatchNorm(4, rngs=rngs))
+            self.mha = self.register_child(
+                "mha",
+                nnx.MultiHeadAttention(num_heads=2, in_features=4, rngs=rngs),
+            )
+            self.lora = self.register_child(
+                "lora",
+                nnx.LoRA(in_features=4, lora_rank=2, out_features=4, rngs=rngs),
+            )
+
+        def __call__(self, x: jnp.ndarray) -> PyTree:
+            """Run forward pass through Linear, BatchNorm, MultiHeadAttention, and LoRA.
+
+            Args:
+                x: Input batch array of shape ``(B, 4)``.
+
+            Returns:
+                PyTree: Output tensor of shape ``(B, 4)``.
+            """
+            h = self.linear(x)
+            h = self.bn(h, use_running_average=False)
+            h3 = jnp.reshape(h, (1, h.shape[0], h.shape[1]))
+            attn = self.mha(h3)
+            return jnp.reshape(attn, h.shape) + self.lora(x)
+
+    model = SixRepoBlock(nnx.Rngs(0))
+    tx = optax.masked(
+        optax.adamw(learning_rate=1e-2),
+        {"linear": True, "bn": False, "mha": True, "lora": True},
+    )
+    optimizer = nnx.Optimizer(model, tx)
+
+    records = [[float(i), float(i + 1), float(i + 2), float(i + 3)] for i in range(6)]
+    loader = grain.DataLoader(
+        data_source=grain.InMemoryDataSource(records),
+        sampler=grain.SequentialSampler(num_records=len(records)),
+    )
+    grain_iter = iter(loader)
+
+    for _ in range(2):
+        raw_batch = next(grain_iter)
+        batch_x = jnp.asarray([raw_batch, raw_batch], dtype=jnp.float32)
+        _ = model(batch_x)
+        _, model_state_for_grad = nnx.split(model)
+        grads = nnx.State(
+            {
+                "linear": nnx.State(
+                    {
+                        "kernel": nnx.Param(jnp.ones((4, 4), dtype=jnp.float32) * 0.05),
+                        "bias": nnx.Param(jnp.ones((4,), dtype=jnp.float32) * 0.05),
+                    }
+                ),
+                "bn": model_state_for_grad["bn"],
+                "mha": model_state_for_grad["mha"],
+                "lora": model_state_for_grad["lora"],
+            }
+        )
+        optimizer.update(grads)
+
+    graphdef, saved_model_state = nnx.split(model)
+    saved_opt_state = optimizer.opt_state
+
+    mesh = Mesh(zero_jax.devices(), ("data",))
+    named_sharding = NamedSharding(mesh, JaxPSpec("data"))
+
+    mgr_dir = tmp_path / "six_repo_mgr"
+    mgr = CheckpointManager(mgr_dir, item_names=("state", "opt_state", "dataloader"))
+    assert mgr.save(
+        1,
+        items={
+            "state": args.StandardSave(saved_model_state, check_finite=True),
+            "opt_state": args.PyTreeSave(saved_opt_state, check_finite=True),
+            "dataloader": grain_iter,
+        },
+    )
+    assert (mgr_dir / "1" / "state").exists()
+    assert (mgr_dir / "1" / "opt_state").exists()
+    assert (mgr_dir / "1" / "dataloader" / "process_0-of-1.json").exists()
+
+    expected_next_batch = next(grain_iter)
+
+    fresh_model = SixRepoBlock(nnx.Rngs(99))
+    _, fresh_model_state = nnx.split(fresh_model)
+    fresh_opt = nnx.Optimizer(fresh_model, tx)
+    fresh_loader = grain.DataLoader(
+        data_source=grain.InMemoryDataSource(records),
+        sampler=grain.SequentialSampler(num_records=len(records)),
+    )
+    fresh_grain_iter = iter(fresh_loader)
+
+    sharded_restore_args: PyTree = {
+        "linear": {
+            "kernel": ArrayRestoreArgs(sharding=named_sharding, strict=True),
+            "bias": ArrayRestoreArgs(sharding=named_sharding, strict=True),
+        },
+    }
+    restored = mgr.restore(
+        1,
+        items={
+            "state": args.StandardRestore(
+                fresh_model_state,
+                restore_args=sharded_restore_args,
+                strict=True,
+            ),
+            "opt_state": args.PyTreeRestore(fresh_opt.opt_state, strict=True),
+            "dataloader": fresh_grain_iter,
+        },
+    )
+    assert isinstance(restored, dict)
+    restored_state = restored["state"]
+    restored_opt = restored["opt_state"]
+    assert isinstance(restored_state, nnx.State)
+    linear_state = restored_state["linear"]
+    assert isinstance(linear_state, nnx.State)
+    kernel_var = linear_state["kernel"]
+    assert isinstance(kernel_var, nnx.Param)
+    zero_chex.assert_trees_all_close(restored_state, saved_model_state)
+    zero_chex.assert_trees_all_close(restored_opt, saved_opt_state)
+    zero_chex.assert_tree_is_sharded(kernel_var.value)
+    assert next(fresh_grain_iter) == expected_next_batch
+
+    # Direct nnx.Module checkpointing via StandardCheckpointer and PyTreeCheckpointer
+    mod_dir = tmp_path / "direct_module_ckpt"
+    std_cp = StandardCheckpointer()
+    std_cp.save(mod_dir, args.StandardSave(model, check_finite=True))
+    restored_mod_from_instance = std_cp.restore(mod_dir, item=SixRepoBlock(nnx.Rngs(42)))
+    assert isinstance(restored_mod_from_instance, SixRepoBlock)
+    test_x = jnp.ones((2, 4), dtype=jnp.float32)
+    zero_chex.assert_trees_all_close(restored_mod_from_instance(test_x), model(test_x))
+
+    pt_cp = PyTreeCheckpointer()
+    restored_mod_from_gdef = pt_cp.restore(mod_dir, item=graphdef)
+    assert isinstance(restored_mod_from_gdef, SixRepoBlock)
+    zero_chex.assert_trees_all_close(restored_mod_from_gdef(test_x), model(test_x))
+    assert isinstance(pt_cp.restore(mod_dir), nnx.State)
+
+    base_h = BasePyTreeCheckpointHandler()
+    assert isinstance(
+        base_h._unpack_pytree(saved_model_state, SixRepoBlock(nnx.Rngs(7))), SixRepoBlock
+    )
+    assert isinstance(base_h._unpack_pytree(saved_model_state, graphdef), SixRepoBlock)
+    assert isinstance(
+        base_h._unpack_pytree(
+            {"kernel": jnp.ones((4, 4)), "bias": jnp.zeros((4,))},
+            nnx.Linear(4, 4, rngs=nnx.Rngs(0)),
+        ),
+        nnx.Linear,
+    )
+    lin_gdef, _ = nnx.split(nnx.Linear(4, 4, rngs=nnx.Rngs(0)))
+    assert isinstance(
+        base_h._unpack_pytree({"kernel": jnp.ones((4, 4)), "bias": jnp.zeros((4,))}, lin_gdef),
+        nnx.Linear,
+    )
+    assert isinstance(
+        base_h._unpack_pytree(
+            {
+                "__zero_flax_state__": True,
+                "entries": {"kernel": jnp.ones((4, 4)), "bias": jnp.zeros((4,))},
+            },
+            nnx.Linear(4, 4, rngs=nnx.Rngs(0)),
+        ),
+        nnx.Linear,
+    )
+    assert isinstance(
+        base_h._unpack_pytree(
+            {
+                "__zero_flax_state__": True,
+                "entries": {"kernel": jnp.ones((4, 4)), "bias": jnp.zeros((4,))},
+            },
+            lin_gdef,
+        ),
+        nnx.Linear,
+    )
+
+    from ml_switcheroo_compiler import ops as compiler_ops
+    from ml_switcheroo_compiler.core.dtype import DType as CompilerDType
+    from ml_switcheroo_compiler.core.tensor import as_tensor_obj
+    from ml_switcheroo_ir import LogicalMesh as IrMesh, PartitionSpec as IrPSpec
+    from zero_orbax.checkpoint import ArrayCheckpointHandler, multihost
+    from zero_orbax.core import GlobalArraySharding, SerializedArray
+    from zero_orbax.types import array_to_nested_list
+
+    scalar_ct = as_tensor_obj(compiler_ops.asarray(7, dtype=CompilerDType.int32))
+    assert array_to_nested_list(scalar_ct) == 7
+
+    class _BareArray:
+        """Minimal ArrayProtocol without tolist or to_list."""
+
+        shape: tuple[int, ...] = (1,)
+        dtype: str = "float32"
+
+    class _UnderscoreListArray:
+        """Minimal ArrayProtocol with to_list()."""
+
+        shape: tuple[int, ...] = (2,)
+        dtype: str = "int32"
+
+        def to_list(self) -> list[int]:
+            """Return list representation.
+
+            Returns:
+                list[int]: Elements.
+            """
+            return [3, 4]
+
+    assert array_to_nested_list(_BareArray()) == []
+    assert array_to_nested_list(_UnderscoreListArray()) == [3, 4]
+
+    ser_arr = SerializedArray([[1.0, 2.0], [3.0, 4.0]], shape=(2, 2), dtype="float32")
+    assert ser_arr.ndim == 2
+    assert ser_arr.size == 4
+    leaves, treedef = zero_jax.tree_util.tree_flatten({"a": ser_arr})
+    assert zero_jax.tree_util.tree_unflatten(treedef, leaves) == {"a": ser_arr}
+    zero_chex.assert_trees_all_equal({"a": ser_arr}, {"a": ser_arr})
+
+    assert multihost.process_index() == zero_jax.process_index()
+    assert multihost.process_count() == zero_jax.process_count()
+
+    gas = GlobalArraySharding()
+    assert gas.resolve_jax_sharding(sharding=named_sharding) is named_sharding
+    ir_mesh = IrMesh(shape={"data": 1})
+    assert isinstance(
+        gas.resolve_jax_sharding(mesh=ir_mesh, mesh_axes=IrPSpec(axes=("data",))),
+        NamedSharding,
+    )
+    assert isinstance(
+        gas.resolve_jax_sharding(mesh=mesh, mesh_axes="data"),
+        NamedSharding,
+    )
+    assert isinstance(
+        gas.resolve_jax_sharding(mesh=mesh, mesh_axes=("data",)),
+        NamedSharding,
+    )
+    assert isinstance(
+        gas.resolve_jax_sharding(mesh=mesh, mesh_axes=None),
+        NamedSharding,
+    )
+    assert gas.resolve_jax_sharding(mesh=IrMesh(shape={})) is None
+    assert gas.resolve_jax_sharding(sharding="replicated") is not None
+    assert gas.apply_sharding("not_an_array", sharding=named_sharding) == "not_an_array"
+    sharded_local = gas.get_local_shard(
+        jnp.ones((2, 2), dtype=jnp.float32),
+        host_id=0,
+        num_hosts=1,
+        sharding=named_sharding,
+    )
+    zero_chex.assert_tree_is_sharded(sharded_local)
+    sharded_local_override = gas.get_local_shard(
+        jnp.ones((2, 2), dtype=jnp.float32),
+        host_id=0,
+        num_hosts=1,
+        partition_spec=JaxPSpec("data"),
+        mesh=mesh,
+        sharding=named_sharding,
+    )
+    zero_chex.assert_tree_is_sharded(sharded_local_override)
+
+    # Test _apply_restore_args_tree with SerializedArray + sharding and strict=False
+    from zero_orbax._checkpoint.transform_lib import _apply_restore_args_tree
+
+    sharded_from_ser = _apply_restore_args_tree(
+        ser_arr,
+        ArrayRestoreArgs(sharding=named_sharding, strict=False),
+    )
+    assert isinstance(sharded_from_ser, jnp.ndarray)
+
+    arr_h = ArrayCheckpointHandler()
+    arr_dir = tmp_path / "arr_sharded_ckpt"
+    arr_h.save(arr_dir, jnp.ones((2, 2), dtype=jnp.float32))
+    restored_arr_sharded = arr_h.restore(
+        arr_dir,
+        restore_args=ArrayRestoreArgs(sharding=named_sharding, strict=True),
+    )
+    zero_chex.assert_tree_is_sharded(restored_arr_sharded)
+    restored_arr_mesh = arr_h.restore(
+        arr_dir,
+        restore_args=ArrayRestoreArgs(
+            restore_type="jax",
+            mesh=mesh,
+            mesh_axes=JaxPSpec("data"),
+            strict=True,
+        ),
+    )
+    zero_chex.assert_tree_is_sharded(restored_arr_mesh)
+    arr_ser_dir = tmp_path / "arr_ser_ckpt"
+    arr_h.save(arr_ser_dir, ser_arr)
+    restored_from_ser = arr_h.restore(
+        arr_ser_dir,
+        restore_args=ArrayRestoreArgs(sharding=named_sharding, strict=True),
+    )
+    zero_chex.assert_tree_is_sharded(restored_from_ser)
+
+    # Verify check_finite and strict validation failures via zero_chex
+    pt_handler = PyTreeCheckpointHandler()
+    pt_handler.save(
+        tmp_path / "explicit_save_args_with_raw",
+        args.PyTreeSave({"a": jnp.ones((2,), dtype=jnp.float32)}),
+        save_args={"a": SaveArgs(dtype="float32")},
+    )
+    assert (
+        pt_handler.restore(
+            tmp_path / "explicit_save_args_with_raw",
+            args.PyTreeRestore(
+                {"a": jnp.zeros((2,), dtype=jnp.float32)},
+                restore_args={"a": ArrayRestoreArgs(dtype="float32", strict=False)},
+            ),
+            strict=False,
+        )
+        is not None
+    )
+    assert (
+        pt_handler.restore(
+            tmp_path / "explicit_save_args_with_raw",
+            args.StandardRestore(
+                {"a": jnp.zeros((2,), dtype=jnp.float32)},
+                restore_args={"a": ArrayRestoreArgs(dtype="float32", strict=False)},
+            ),
+            strict=False,
+        )
+        is not None
+    )
+    assert (
+        pt_handler.restore(
+            tmp_path / "explicit_save_args_with_raw",
+            item=nnx.State({"a": nnx.Param(jnp.zeros((2,), dtype=jnp.float32))}),
+            strict=False,
+        )
+        is not None
+    )
+    with pytest.raises(AssertionError):
+        pt_handler.save(
+            tmp_path / "nan_ckpt",
+            {"bad": jnp.array([float("nan")], dtype=jnp.float32)},
+            check_finite=True,
+        )
+    with pytest.raises(AssertionError):
+        pt_handler.save(
+            tmp_path / "nan_save_args",
+            {"bad": jnp.array([float("inf")], dtype=jnp.float32)},
+            save_args={"bad": SaveArgs(check_finite=True)},
+        )
+
+    valid_arr_dir = tmp_path / "valid_arr"
+    pt_handler.save(valid_arr_dir, {"a": jnp.ones((2, 2), dtype=jnp.float32)})
+    assert (
+        pt_handler.restore(
+            valid_arr_dir,
+            item={"a": jnp.zeros((2, 2), dtype=jnp.float32)},
+            strict=True,
+        )
+        is not None
+    )
+    with pytest.raises(AssertionError):
+        pt_handler.restore(
+            valid_arr_dir,
+            item={"a": jnp.zeros((3, 3), dtype=jnp.float32)},
+            strict=True,
+        )
+    valid_state_dir = tmp_path / "valid_state"
+    pt_handler.save(
+        valid_state_dir,
+        nnx.State({"a": nnx.Param(jnp.ones((2, 2), dtype=jnp.float32))}),
+    )
+    with pytest.raises(AssertionError):
+        pt_handler.restore(
+            valid_state_dir,
+            item=nnx.State({"a": nnx.Param(jnp.zeros((3, 3), dtype=jnp.float32))}),
+            strict=True,
+        )

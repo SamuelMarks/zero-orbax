@@ -7,6 +7,12 @@ from collections.abc import Mapping
 
 from ml_switcheroo_compiler.core.tensor import Tensor as CompilerTensor
 from ml_switcheroo_ir import PartitionSpec
+from zero_flax.nnx.module import (
+    GraphDef as FlaxGraphDef,
+    Module as FlaxModule,
+    merge as _flax_merge,
+    split as _flax_split,
+)
 from zero_jax import numpy as jnp
 
 from zero_orbax._checkpoint.args_lib import (
@@ -25,8 +31,6 @@ from zero_orbax._checkpoint.args_lib import (
 )
 from zero_orbax._checkpoint.future_lib import Future
 from zero_orbax._checkpoint.transform_lib import (
-    FlaxVariable,
-    _FLAX_VARIABLE_CLASSES,
     _apply_restore_args_tree,
     _apply_save_args_tree,
     _build_flax_state,
@@ -34,8 +38,11 @@ from zero_orbax._checkpoint.transform_lib import (
     _coerce_flax_metadata,
     _coerce_flax_variable_value,
     _extract_save_args_metadata,
+    _instantiate_flax_variable,
+    _pack_optax_node,
     _reconstruct_array_leaf,
     _resolve_compiler_dtype,
+    _unpack_optax_node,
     apply_transformations,
 )
 from zero_orbax._checkpoint.type_handlers_lib import ArrayRestoreArgs, RestoreArgs, SaveArgs
@@ -57,6 +64,7 @@ from zero_orbax.types import (
     GrainIteratorProtocol,
     IsPrioritizedKeyFn,
     JsonValue,
+    MaskedNodeProtocol,
     MemoryLimitOptions,
     MultiprocessingOptions,
     NamedTupleProtocol,
@@ -302,6 +310,26 @@ class ArrayCheckpointHandler(AsyncCheckpointHandler):
             if raw:
                 restored = MsgpackEngine().unpackb(raw)
                 if isinstance(active_restore_args, ArrayRestoreArgs):
+                    rtype = active_restore_args.restore_type()
+                    if (
+                        active_restore_args.sharding is not None
+                        or rtype is jnp.ndarray
+                        or rtype == "jax"
+                    ) and not isinstance(restored, jnp.ndarray):
+                        nested_sa = (
+                            restored.tolist() if isinstance(restored, SerializedArray) else restored
+                        )
+                        raw_sa = (
+                            nested_sa
+                            if isinstance(nested_sa, (int, float, bool, list, tuple))
+                            else 0.0
+                        )
+                        dt_name = (
+                            str(restored.dtype)
+                            if isinstance(restored, SerializedArray)
+                            else str(active_restore_args.dtype or "float32")
+                        )
+                        restored = jnp.asarray(raw_sa, dtype=_resolve_compiler_dtype(dt_name))
                     expected_shape = active_restore_args.shape or active_restore_args.global_shape
                     if active_restore_args.strict and expected_shape is not None:
                         actual_shape = _infer_array_shape(restored)
@@ -316,7 +344,7 @@ class ArrayCheckpointHandler(AsyncCheckpointHandler):
                     ):
                         pspec = (
                             active_restore_args.mesh_axes
-                            if isinstance(active_restore_args.mesh_axes, PartitionSpec)
+                            if not isinstance(active_restore_args.mesh_axes, (list, tuple))
                             else PartitionSpec(axes=tuple(active_restore_args.mesh_axes))
                         )
                         restored = GlobalArraySharding().get_local_shard(
@@ -325,8 +353,28 @@ class ArrayCheckpointHandler(AsyncCheckpointHandler):
                             num_hosts=1,
                             partition_spec=pspec,
                             mesh=active_restore_args.mesh,
+                            sharding=active_restore_args.sharding
+                            if not isinstance(active_restore_args.sharding, (PartitionSpec, str))
+                            else None,
                         )
-                    rtype = active_restore_args.restore_type()
+                    elif active_restore_args.sharding is not None:
+                        restored = GlobalArraySharding().apply_sharding(
+                            restored,
+                            sharding=active_restore_args.sharding,
+                            mesh=active_restore_args.mesh,
+                            mesh_axes=active_restore_args.mesh_axes,
+                        )
+                    if (
+                        active_restore_args.strict
+                        and (
+                            active_restore_args.sharding is not None
+                            or active_restore_args.mesh is not None
+                        )
+                        and isinstance(restored, jnp.ndarray)
+                    ):
+                        import zero_chex as _chex
+
+                        _chex.assert_tree_is_sharded(restored)
                     if rtype is tuple and isinstance(restored, list):
                         return tuple(restored)
                 return restored
@@ -393,11 +441,18 @@ class BasePyTreeCheckpointHandler(AsyncCheckpointHandler):
         """Pack rich ecosystem PyTree nodes into tagged serializable dictionaries.
 
         Args:
-            node: Input PyTree node (``Variable``, ``State``, ``FrozenDict``, ``OptState``, array, or container).
+            node: Input PyTree node (``Module``, ``Variable``, ``State``, ``FrozenDict``, ``OptState``, array, or container).
 
         Returns:
             PyTree: Tagged PyTree ready for MessagePack serialization.
         """
+        if isinstance(node, FlaxModule):
+            _, module_state = _flax_split(node)
+            return {
+                "__zero_flax_module__": True,
+                "module_type": type(node).__name__,
+                "state": self._pack_pytree(module_state),
+            }
         if isinstance(node, FlaxVariableProtocol):
             return {
                 "__zero_flax_variable__": True,
@@ -415,14 +470,8 @@ class BasePyTreeCheckpointHandler(AsyncCheckpointHandler):
                 "__zero_flax_frozendict__": True,
                 "entries": {str(k): self._pack_pytree(v) for k, v in node.items()},
             }
-        if isinstance(node, NamedTupleProtocol):
-            field_dict = node._asdict()
-            return {
-                "__zero_optax_opt_state__": True,
-                "state_type": type(node).__name__,
-                "fields": [str(f) for f in node._fields],
-                "values": {str(f): self._pack_pytree(field_dict.get(f)) for f in node._fields},
-            }
+        if isinstance(node, (MaskedNodeProtocol, NamedTupleProtocol)):
+            return _pack_optax_node(node, self._pack_pytree)
         if is_array_protocol(node):
             array_kind = (
                 "tensor"
@@ -444,6 +493,33 @@ class BasePyTreeCheckpointHandler(AsyncCheckpointHandler):
             return {str(k): self._pack_pytree(v) for k, v in node.items()}
         return node
 
+    def _merge_flax_template(
+        self,
+        entries: Mapping[str, PyTree],
+        template: FlaxModule | FlaxGraphDef[FlaxModule],
+    ) -> PyTree:
+        """Unpack state entries and merge into a ``FlaxModule`` or ``FlaxGraphDef`` template.
+
+        Args:
+            entries: Raw or unpacked state entries dictionary.
+            template: Target ``FlaxModule`` or ``FlaxGraphDef`` blueprint.
+
+        Returns:
+            PyTree: Reconstructed ``FlaxModule`` instance.
+        """
+        if isinstance(template, FlaxModule):
+            gdef, tmpl_state = _flax_split(template)
+            tmpl_map = dict(tmpl_state.items())
+            ordered = [*tmpl_map.keys(), *(k for k in entries if k not in tmpl_map)]
+            unpacked = {
+                str(k): self._unpack_pytree(entries[k], tmpl_map.get(str(k)))
+                for k in ordered
+                if k in entries
+            }
+            return _flax_merge(gdef, _build_flax_state(unpacked, tmpl_state))
+        unpacked_gdef = {str(k): self._unpack_pytree(v, None) for k, v in entries.items()}
+        return _flax_merge(template, _build_flax_state(unpacked_gdef, None))
+
     def _unpack_pytree(self, node: PyTree, template: PyTree = None) -> PyTree:
         """Unpack tagged PyTree dictionaries back into rich ecosystem containers and arrays.
 
@@ -455,6 +531,8 @@ class BasePyTreeCheckpointHandler(AsyncCheckpointHandler):
             PyTree: Reconstructed ecosystem PyTree.
         """
         if isinstance(node, FlaxStateProtocol):
+            if isinstance(template, (FlaxModule, FlaxGraphDef)):
+                return self._merge_flax_template(dict(node.items()), template)
             tmpl_map = (
                 dict(template.items())
                 if isinstance(template, FlaxStateProtocol)
@@ -465,6 +543,8 @@ class BasePyTreeCheckpointHandler(AsyncCheckpointHandler):
                 template,
             )
         if is_pytree_dict(node):
+            if node.get("__zero_flax_module__") is True:
+                return self._unpack_pytree(node.get("state"), template)
             if (
                 node.get("__zero_flax_variable__") is True
                 or node.get("__ztype__") == "flax_variable"
@@ -476,13 +556,13 @@ class BasePyTreeCheckpointHandler(AsyncCheckpointHandler):
                 coerced_val = _coerce_flax_variable_value(val)
                 coerced_meta = _coerce_flax_metadata(raw_meta)
                 if isinstance(template, FlaxVariableProtocol):
-                    template.value = coerced_val
                     return template.replace(value=coerced_val, **coerced_meta)
-                var_cls = _FLAX_VARIABLE_CLASSES.get(var_type, FlaxVariable)
-                return var_cls(coerced_val, **coerced_meta)
+                return _instantiate_flax_variable(var_type, coerced_val, coerced_meta)
             if node.get("__zero_flax_state__") is True or node.get("__ztype__") == "flax_state":
                 raw_entries = node.get("entries")
                 entries_map = raw_entries if is_pytree_dict(raw_entries) else {}
+                if isinstance(template, (FlaxModule, FlaxGraphDef)):
+                    return self._merge_flax_template(entries_map, template)
                 tmpl_map = (
                     dict(template.items())
                     if isinstance(template, FlaxStateProtocol)
@@ -514,26 +594,12 @@ class BasePyTreeCheckpointHandler(AsyncCheckpointHandler):
                 }
                 return _build_frozen_dict(unpacked_entries)
             if (
-                node.get("__zero_optax_opt_state__") is True
+                node.get("__optax_masked_node__") is True
+                or isinstance(node.get("__optax_state_cls__"), str)
+                or node.get("__zero_optax_opt_state__") is True
                 or node.get("__ztype__") == "optax_opt_state"
             ):
-                raw_fields = node.get("fields")
-                raw_values = node.get("values")
-                field_names = (
-                    [str(f) for f in raw_fields] if isinstance(raw_fields, (list, tuple)) else []
-                )
-                values_map = raw_values if is_pytree_dict(raw_values) else {}
-                tmpl_fields = (
-                    dict(template._asdict())
-                    if isinstance(template, NamedTupleProtocol)
-                    else (template if is_pytree_dict(template) else {})
-                )
-                unpacked_vals = [
-                    self._unpack_pytree(values_map.get(f), tmpl_fields.get(f)) for f in field_names
-                ]
-                if isinstance(template, NamedTupleProtocol):
-                    return template._make(unpacked_vals)
-                return {f: v for f, v in zip(field_names, unpacked_vals)}
+                return _unpack_optax_node(node, template, self._unpack_pytree)
             if node.get("__zero_orbax_array__") is True or node.get("__ztype__") == "array":
                 raw_shape = node.get("shape")
                 shape_tuple = (
@@ -550,6 +616,8 @@ class BasePyTreeCheckpointHandler(AsyncCheckpointHandler):
                     array_kind,
                     template,
                 )
+            if isinstance(template, (FlaxModule, FlaxGraphDef)):
+                return self._merge_flax_template(node, template)
             if isinstance(template, FlaxStateProtocol):
                 tmpl_map = dict(template.items())
                 unpacked_s = {
@@ -839,19 +907,26 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
             item: PyTree or ``args.PyTreeSave`` / ``args.StandardSave`` wrapper to save. Defaults to None.
             *pos_args: Additional positional save arguments.
             save_args: Optional PyTree of ``SaveArgs``. Defaults to None.
-            **kwargs: Additional keyword save arguments.
+            **kwargs: Additional keyword save arguments (including optional ``check_finite``).
         """
         if self.handler_impl is not None:
             self.handler_impl.save(directory, item, *pos_args, **kwargs)
             return
         active_save_args = save_args
+        active_check_finite: bool = kwargs.get("check_finite") is True
         raw_arg = item if isinstance(item, _CheckpointArgsBase) else kwargs.get("args")
-        if (
-            isinstance(raw_arg, (_PyTreeSaveArgsCls, _StandardSaveArgsCls))
-            and active_save_args is None
-        ):
-            active_save_args = raw_arg.save_args
+        if isinstance(raw_arg, (_PyTreeSaveArgsCls, _StandardSaveArgsCls)):
+            if active_save_args is None:
+                active_save_args = raw_arg.save_args
+            active_check_finite = active_check_finite or raw_arg.check_finite
         payload = _unwrap_checkpoint_arg(item, kwargs)
+        if active_check_finite:
+            import zero_chex as _chex
+
+            check_target: PyTree = (
+                _flax_split(payload)[1] if isinstance(payload, FlaxModule) else payload
+            )
+            _chex.assert_trees_all_finite(check_target)
         if active_save_args is not None:
             payload = _apply_save_args_tree(payload, active_save_args)
         payload = self._order_prioritized_keys(payload)
@@ -904,7 +979,7 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
             transforms: Optional transformation rules PyTree. Defaults to None.
             transforms_default_to_original: Whether untransformed fields fall back to original values. Defaults to True.
             restore_args: Optional tree of ``RestoreArgs``. Defaults to None.
-            **kwargs: Additional keyword restore arguments.
+            **kwargs: Additional keyword restore arguments (including optional ``strict``).
 
         Returns:
             PyTree: The restored (and optionally transformed) PyTree.
@@ -913,6 +988,10 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
             return self.handler_impl.restore(directory, item, *pos_args, **kwargs)
         default_orig = bool(transforms_default_to_original)
         active_restore_args = restore_args
+        kw_strict = kwargs.get("strict")
+        strict_override: bool | None = kw_strict if isinstance(kw_strict, bool) else None
+        explicit_strict: bool = strict_override is True
+        active_strict: bool = True if strict_override is None else strict_override
         raw_arg = item if isinstance(item, _CheckpointArgsBase) else kwargs.get("args")
         if isinstance(raw_arg, _PyTreeRestoreArgsCls):
             transforms = raw_arg.transforms if transforms is None else transforms
@@ -920,12 +999,17 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
             active_restore_args = (
                 raw_arg.restore_args if active_restore_args is None else active_restore_args
             )
+            if strict_override is None:
+                active_strict = raw_arg.strict
             target_item = raw_arg.item
         elif isinstance(raw_arg, _StandardRestoreArgsCls):
             active_restore_args = (
                 raw_arg.restore_args if active_restore_args is None else active_restore_args
             )
+            if strict_override is None:
+                active_strict = raw_arg.strict
             target_item = raw_arg.item
+            explicit_strict = active_strict
         else:
             target_item = _unwrap_checkpoint_arg(item, kwargs)
 
@@ -950,12 +1034,34 @@ class PyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
             )
         if (
             transforms is None
-            and isinstance(target_item, (FlaxStateProtocol, FrozenDictProtocol, NamedTupleProtocol))
-            and isinstance(restored, (FlaxStateProtocol, FrozenDictProtocol, NamedTupleProtocol))
+            and active_strict
+            and isinstance(
+                target_item,
+                (FlaxStateProtocol, FrozenDictProtocol, NamedTupleProtocol),
+            )
+            and isinstance(
+                restored,
+                (FlaxStateProtocol, FrozenDictProtocol, NamedTupleProtocol),
+            )
         ):
-            import zero_chex.trees as _chex_trees
+            import zero_chex as _chex
 
-            _chex_trees.assert_trees_all_equal_structs(restored, target_item)
+            _chex.assert_trees_all_equal_structs(restored, target_item)
+            if explicit_strict and active_restore_args is None:
+                _chex.assert_trees_all_equal_shapes_and_dtypes(restored, target_item)
+        elif (
+            transforms is None
+            and explicit_strict
+            and active_restore_args is None
+            and target_item is not None
+            and restored is not None
+            and not isinstance(target_item, (FlaxModule, FlaxGraphDef))
+        ):
+            import zero_chex as _chex
+
+            _chex.assert_trees_all_equal_shapes_and_dtypes(restored, target_item)
+        if isinstance(target_item, FlaxStateProtocol) and isinstance(restored, FlaxStateProtocol):
+            target_item.update(restored)
         return restored
 
 

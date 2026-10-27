@@ -395,18 +395,14 @@ def test_update_badges(tmp_path: pathlib.Path) -> None:
 
 
 def test_requirements_txt_contains_griffe() -> None:
-    """Verify requirements.txt pins griffelib, griffecli, and sibling zero-* dependencies."""
+    """Verify requirements.txt excludes griffelib/griffecli and pins sibling zero-* dependencies."""
+    from scripts import check_api_parity, check_docstring_coverage, check_no_any
+
     root_dir = pathlib.Path(__file__).resolve().parent.parent
     req_path = root_dir / "requirements.txt"
     req_txt = req_path.read_text(encoding="utf-8")
-    assert (
-        "griffelib @ git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffelib"
-        in req_txt
-    )
-    assert (
-        "griffecli @ git+https://github.com/SamuelMarks/griffe.git@rest#subdirectory=packages/griffecli"
-        in req_txt
-    )
+    assert "griffelib" not in req_txt
+    assert "griffecli" not in req_txt
     assert (
         "ml-switcheroo-ir @ https://github.com/SamuelMarks/ml-switcheroo-ir/releases/download/v0.0.4/ml_switcheroo_ir-0.0.4-py3-none-any.whl"
         in req_txt
@@ -426,3 +422,6 @@ def test_requirements_txt_contains_griffe() -> None:
     ci_txt = (root_dir / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "pip install --no-deps" in ci_txt
     assert "pip install --no-deps -e ." in ci_txt
+    assert check_api_parity.main() == 0
+    assert check_docstring_coverage.main(target_dirs=("src/zero_orbax",)) == 0
+    assert check_no_any.main(argv=["src/zero_orbax/__init__.py"]) == 0

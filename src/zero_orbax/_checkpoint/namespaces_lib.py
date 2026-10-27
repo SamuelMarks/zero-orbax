@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import pathlib
 
+import zero_jax
+
 from zero_orbax._checkpoint.handlers_lib import PyTreeCheckpointHandler
 from zero_orbax._checkpoint.transform_lib import apply_transformations, merge_trees
-from zero_orbax.core import AtomicityTemporaryPath, BarrierSync, MsgpackEngine
+from zero_orbax.core import AtomicityTemporaryPath, BarrierSync, MsgpackEngine, SyncBarrier
 from zero_orbax.types import (
     AbstractLoggerProtocol,
     ArrayMetadataValidatorProtocol,
@@ -88,23 +90,26 @@ class msgpack_utils:
 class multihost:
     """Namespace for multi-host process indices and barrier synchronization."""
 
+    SyncBarrier = SyncBarrier
+    BarrierSync = BarrierSync
+
     @staticmethod
     def process_index() -> int:
-        """Return the current host process index (0 in single-process mode).
+        """Return the current host process index via ``zero_jax.process_index()``.
 
         Returns:
             int: Current host process index.
         """
-        return 0
+        return zero_jax.process_index()
 
     @staticmethod
     def process_count() -> int:
-        """Return the total number of host processes (1 in single-process mode).
+        """Return the total number of host processes via ``zero_jax.process_count()``.
 
         Returns:
             int: Total process count.
         """
-        return 1
+        return zero_jax.process_count()
 
     @staticmethod
     def sync_global_processes(name: str) -> None:
