@@ -186,11 +186,11 @@ class FlaxStateProtocol(Protocol):
         """
         ...
 
-    def update(self, other: FlaxStateProtocol) -> None:
+    def update(self, other: FlaxStateProtocol | Mapping[str, PyTree]) -> None:
         """Update this state in-place from another state mapping.
 
         Args:
-            other: Source ``State`` mapping.
+            other: Source ``State`` or key-value PyTree mapping.
         """
         ...
 
@@ -278,19 +278,30 @@ class GrainIteratorProtocol(Protocol):
 class MaskedNodeProtocol(Protocol):
     """Protocol matching ``zero_optax.MaskedNode`` sentinel leaves."""
 
-    def __chex_field_names__(self) -> tuple[str, ...]:
-        """Return empty tuple of field names for ``zero_chex`` traversal.
+    @property
+    def __orbax_state_type__(self) -> str:
+        """Return the canonical Orbax state type identifier for ``MaskedNode``.
 
         Returns:
-            tuple[str, ...]: Empty tuple.
+            str: Class name string ``'MaskedNode'``.
         """
         ...
 
-    def __chex_field_values__(self) -> tuple[PyTree, ...]:
-        """Return empty tuple of field values for ``zero_chex`` traversal.
+    def index(
+        self,
+        value: PyTree,
+        start: int = 0,
+        stop: int = 0,
+    ) -> int:
+        """Return first index of ``value`` in the empty tuple sentinel.
+
+        Args:
+            value: Element to search for.
+            start: Start index. Defaults to 0.
+            stop: Stop index. Defaults to 0.
 
         Returns:
-            tuple[PyTree, ...]: Empty tuple.
+            int: Index of ``value``.
         """
         ...
 

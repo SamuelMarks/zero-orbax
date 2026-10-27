@@ -318,15 +318,18 @@ def _build_flax_state(entries: Mapping[str, PyTree], template: PyTree = None) ->
     Returns:
         FlaxState: Reconstructed ``zero_flax.nnx.State`` instance.
     """
-    from zero_flax.nnx.state import StateEntry
-
-    typed_entries: dict[str, StateEntry] = {}
+    state_obj = FlaxState()
+    state_tree: PyTree = state_obj
+    assert isinstance(state_tree, FlaxStateProtocol)
+    coerced_entries: dict[str, PyTree] = {}
     for k, v in entries.items():
-        if isinstance(v, (FlaxState, FlaxVariable)):
-            typed_entries[str(k)] = v
+        if isinstance(
+            v, (FlaxState, FlaxVariable, VariableBase, MaskedNodeProtocol)
+        ) or is_pytree_dict(v):
+            coerced_entries[str(k)] = v
         else:
-            typed_entries[str(k)] = _coerce_flax_variable_value(v)
-    state_obj = FlaxState(typed_entries)
+            coerced_entries[str(k)] = _coerce_flax_variable_value(v)
+    state_tree.update(coerced_entries)
     _ = template
     return state_obj
 
