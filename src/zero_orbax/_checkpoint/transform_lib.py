@@ -36,6 +36,7 @@ from zero_orbax.core import (
     resolve_compiler_dtype as _resolve_compiler_dtype,
 )
 from zero_orbax.types import (
+    ArrayProtocol,
     FlaxStateProtocol,
     FlaxVariableProtocol,
     FrozenDictProtocol,
@@ -484,38 +485,39 @@ def _apply_restore_args_tree(restored: PyTree, restore_args_tree: PyTree) -> PyT
             assert_type as _chex_assert_type,
         )
 
+        restored_arr: ArrayProtocol = restored
         expected_shape = (
             restore_args_tree.shape
             if restore_args_tree.shape is not None
             else restore_args_tree.global_shape
         )
         if restore_args_tree.strict and expected_shape is not None:
-            _chex_assert_shape(restored, expected_shape)
+            _chex_assert_shape(restored_arr, expected_shape)
         if restore_args_tree.dtype is not None:
             resolved_dt = _resolve_compiler_dtype(str(restore_args_tree.dtype))
-            nested_data = array_to_nested_list(restored)
+            nested_data = array_to_nested_list(restored_arr)
             raw_in = (
                 nested_data if isinstance(nested_data, (int, float, bool, list, tuple)) else 0.0
             )
-            restored = jnp.reshape(jnp.asarray(raw_in, dtype=resolved_dt), restored.shape)
+            restored_arr = jnp.reshape(jnp.asarray(raw_in, dtype=resolved_dt), restored_arr.shape)
             if restore_args_tree.strict:
-                _chex_assert_type(restored, resolved_dt)
+                _chex_assert_type(restored_arr, resolved_dt)
         if (
             restore_args_tree.sharding is not None
             or restore_args_tree.mesh is not None
             or restore_args_tree.mesh_axes is not None
         ):
-            if not isinstance(restored, jnp.ndarray):
-                nested_arr = array_to_nested_list(restored)
+            if not isinstance(restored_arr, jnp.ndarray):
+                nested_arr = array_to_nested_list(restored_arr)
                 raw_arr = (
                     nested_arr if isinstance(nested_arr, (int, float, bool, list, tuple)) else 0.0
                 )
-                restored = jnp.reshape(
-                    jnp.asarray(raw_arr, dtype=_resolve_compiler_dtype(str(restored.dtype))),
-                    restored.shape,
+                restored_arr = jnp.reshape(
+                    jnp.asarray(raw_arr, dtype=_resolve_compiler_dtype(str(restored_arr.dtype))),
+                    restored_arr.shape,
                 )
-            restored = GlobalArraySharding().apply_sharding(
-                restored,
+            sharded_restored = GlobalArraySharding().apply_sharding(
+                restored_arr,
                 sharding=restore_args_tree.sharding,
                 mesh=restore_args_tree.mesh,
                 mesh_axes=restore_args_tree.mesh_axes,
@@ -523,8 +525,9 @@ def _apply_restore_args_tree(restored: PyTree, restore_args_tree: PyTree) -> PyT
             if restore_args_tree.strict:
                 import zero_chex as _chex
 
-                _chex.assert_tree_is_sharded(restored)
-        return restored
+                _chex.assert_tree_is_sharded(sharded_restored)
+            return sharded_restored
+        return restored_arr
     target_type: type | str | None = (
         restore_args_tree.restore_type
         if isinstance(restore_args_tree, RestoreArgs)
